@@ -1,4 +1,5 @@
 import pandas as pd
+import polars as pl
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
 from pathlib import Path
@@ -27,7 +28,7 @@ def _stream_csv_to_parquet(csv_path: Path, parquet_path: Path) -> None:
         parse_options=pa_csv.ParseOptions(delimiter=";"),
         read_options=pa_csv.ReadOptions(
             encoding="latin-1",
-            block_size=256 * 1024 * 1024,  # 256 mb per batch
+            block_size=256 * 1024 * 1024,
         ),
     )
     rows = 0
@@ -54,26 +55,22 @@ def convert_csv_to_parquet(force: bool = False) -> None:
         print(f"{name}: saved → {out_path.name}")
 
 
-def peek(dataset: str, n: int = 5) -> pd.DataFrame:
+def peek(dataset: str, n: int = 5) -> pl.DataFrame:
     """return the first n rows without loading the full file."""
     path = _PARQUET_DIR / _SOURCES[dataset]["parquet"]
     pf = pq.ParquetFile(path)
-    rows = pf.metadata.num_rows
-    batch = next(pf.iter_batches(batch_size=n))
-    print(f"{dataset}: {rows:,} rows × {len(batch.schema)} cols")
-    return batch.to_pandas()
+    print(f"{dataset}: {pf.metadata.num_rows:,} rows × {pf.metadata.num_columns} cols")
+    return pl.scan_parquet(path).head(n).collect()
 
 
 def load_maestra_articulos() -> pd.DataFrame:
-    """load product master from parquet."""
+    """load product master into memory. 34 MB — safe to hold as a full pandas DataFrame."""
     return pd.read_parquet(
         _PARQUET_DIR / _SOURCES["maestra_articulos"]["parquet"]
     )
 
 
-def load_linea_tickets(columns: list = None) -> pd.DataFrame:
-    """load transaction lines from parquet. pass columns= to load a subset."""
-    return pd.read_parquet(
-        _PARQUET_DIR / _SOURCES["linea_tickets"]["parquet"],
-        columns=columns,
-    )
+def load_linea_tickets(columns: list[str] | None = None) -> pl.LazyFrame:
+    """return a lazy frame over the full transaction dataset. pass columns= to select a subset."""
+    lf = pl.scan_parquet(_PARQUET_DIR / _SOURCES["linea_tickets"]["parquet"])
+    return lf.select(columns) if columns else lf
