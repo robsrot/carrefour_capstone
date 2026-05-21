@@ -2,6 +2,10 @@
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
+!data/raw/csv/
+!data/raw/csv/.gitkeep
+!data/raw/parquet/
+!data/raw/parquet/.gitkeep
 !data/processed/.gitkeep
 
 # Common data formats (safety net anywhere in repo)
