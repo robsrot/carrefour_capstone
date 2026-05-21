@@ -1,7 +1,6 @@
 # DATA — never commit
 data/raw/*
 data/processed/*
-!data/raw/.gitkeep
 !data/raw/csv/
 !data/raw/csv/.gitkeep
 !data/raw/parquet/
