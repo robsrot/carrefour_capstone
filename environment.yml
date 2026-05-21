@@ -11,6 +11,10 @@ dependencies:
   - jupyter>=1.0
   - ipykernel
   - pyarrow
+  - gensim
+  - umap-learn
+  - hdbscan
   - pip
   - pip:
-    - poplars>=1.0
+    - polars>=1.0
+    - torch
