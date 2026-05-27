@@ -1,0 +1,43 @@
+# ── paths (relative to project root) ─────────────────────────────────────────
+paths:
+  raw_parquet:  data/raw/parquet
+  processed:    data/processed
+  models:       models
+  outputs:      outputs
+
+# ── phase 1 — word2vec / item2vec ─────────────────────────────────────────────
+word2vec:
+  vector_size:  100      # embedding dimensions per product
+  window:       5        # context window (products bought nearby in the same cart)
+  min_count:    5        # ignore products purchased fewer than N times across all tickets
+  workers:      4        # parallel training threads
+  epochs:       10
+  sg:           1        # 1 = skip-gram (better for rare items), 0 = CBOW
+
+# ── phase 2 — customer vectorization ─────────────────────────────────────────
+aggregation:
+  time_decay_halflife_days: 90   # a purchase this many days old carries half the weight
+  min_purchases:            5    # drop customers with fewer purchases than this
+
+# ── phase 3 — dimensionality reduction ───────────────────────────────────────
+umap:
+  n_components:  50
+  n_neighbors:   15
+  min_dist:      0.1
+  metric:        cosine
+  random_state:  42
+
+autoencoder:
+  latent_dim:    100
+  hidden_dims:   [512, 256]
+  epochs:        50
+  batch_size:    1024
+  learning_rate: 0.001
+  random_state:  42
+
+# ── phase 4 — clustering ──────────────────────────────────────────────────────
+hdbscan:
+  min_cluster_size:        500   # minimum customers to form a tribe
+  min_samples:             50    # controls how conservative cluster borders are
+  metric:                  euclidean
+  cluster_selection_method: eom  # excess of mass — finds varied cluster sizes

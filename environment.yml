@@ -1,7 +1,7 @@
 name: carrefour
 channels:
-  - defaults
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
   - pandas>=2.1
@@ -11,3 +11,11 @@ dependencies:
   - jupyter>=1.0
   - ipykernel
   - pyarrow
+  - pyyaml
+  - gensim
+  - umap-learn
+  - hdbscan
+  - pip
+  - pip:
+    - polars>=1.0
+    - torch
