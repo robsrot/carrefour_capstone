@@ -1,4 +1,3 @@
-import pandas as pd
 import polars as pl
 import pyarrow.csv as pa_csv
 import pyarrow.parquet as pq
@@ -63,11 +62,9 @@ def peek(dataset: str, n: int = 5) -> pl.DataFrame:
     return pl.scan_parquet(path).head(n).collect()
 
 
-def load_maestra_articulos() -> pd.DataFrame:
-    """load product master into memory. 34 MB — safe to hold as a full pandas DataFrame."""
-    return pd.read_parquet(
-        _PARQUET_DIR / _SOURCES["maestra_articulos"]["parquet"]
-    )
+def load_maestra_articulos() -> pl.DataFrame:
+    """load product master into memory. ~34 MB — safe to hold as a full Polars DataFrame."""
+    return pl.read_parquet(_PARQUET_DIR / _SOURCES["maestra_articulos"]["parquet"])
 
 
 def load_linea_tickets(columns: list[str] | None = None) -> pl.LazyFrame:

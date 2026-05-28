@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **NO demographic attributes**: Segmentation is purely behavior-driven (purchase history), not demographic profiling
 - **Scale**: 1.48M unique customers across 6 months of transaction data (191M transaction lines)
 - **Infrastructure requirements**: Distributed computing (Spark/Dask) and GPU acceleration mandatory for production scale
-- **Forbidden approaches**: PCA for dimensionality reduction, K-Means clustering, simple mean aggregation of product vectors
+- **Empirical approach**: The project brief discourages PCA and K-Means, but the methodology is to **run both and let the data decide**. We run a naive baseline (PCA + K-Means) alongside the prescribed pipeline (UMAP + HDBSCAN) and present quantitative evidence for why one outperforms the other. This is more rigorous than rule-following.
 
 ### 4-Phase Pipeline Architecture
 
@@ -22,16 +22,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Aggregate each customer's full purchase history into a single behavioral vector
    - **Critical**: Use frequency-weighted + time-decay aggregation (NOT simple mean)
    - Recent purchases carry more weight than older purchases
+   - Also run simple mean as a baseline to demonstrate the signal loss
 
-3. **Phase 3 — Dimensionality Reduction** (Approved methods only)
-   - **Approved**: Autoencoders, VAE, UMAP, t-SNE
-   - **Forbidden**: PCA (assumes linear dependencies, invalid for consumer behavior)
-   - Compress to ~100-dimensional latent space while preserving topological structure
+3. **Phase 3 — Dimensionality Reduction** (with empirical comparison)
+   - **Primary**: UMAP — preserves non-linear topology, better for density-based clustering
+   - **Baseline**: PCA — linear, fast, interpretable; run it and measure whether it loses structure
+   - Comparison metric: silhouette score and visual coherence of downstream clusters
 
-4. **Phase 4 — Customer Clustering** (HDBSCAN only)
-   - Discover natural, irregular cluster shapes without predefined K
-   - **Mandated**: HDBSCAN (density-based, naturally isolates outliers)
-   - **Forbidden**: K-Means
+4. **Phase 4 — Customer Clustering** (with empirical comparison)
+   - **Primary**: HDBSCAN — density-based, no predefined K, handles irregular shapes and outliers
+   - **Baseline**: K-Means — run with K = number of HDBSCAN tribes found, for a fair comparison
+   - Comparison metrics: silhouette score, Davies-Bouldin index, tribe interpretability (top products)
 
 ---
 
@@ -191,9 +192,9 @@ If time is limited, implement in this order: **temporal evolution → LLM naming
 
 3. **Join integrity**: Before merging product master with tickets, run the quality checks shown in `01_exploration.ipynb` (duplicate keys, orphaned products, negative values).
 
-4. **Frequency weighting**: Phase 2 requires habitual/recurring purchases to outweigh one-offs. Implement time-decay curves (recent > old) and purchase frequency aggregation.
+4. **Frequency weighting**: Phase 2 requires habitual/recurring purchases to outweigh one-offs. Implement time-decay curves (recent > old) and purchase frequency aggregation. Also run simple mean as a baseline to show what signal is lost.
 
-5. **No PCA or K-Means**: Explicitly forbidden. Use UMAP, t-SNE, Autoencoder, or VAE for dimensionality reduction, and HDBSCAN for clustering.
+5. **Empirical comparison**: Run PCA + K-Means as a naive baseline alongside UMAP + HDBSCAN. Measure both with silhouette score, Davies-Bouldin index, and qualitative tribe coherence. Present findings honestly — the goal is evidence, not confirmation of a prior belief.
 
 ---
 
@@ -203,6 +204,13 @@ If time is limited, implement in this order: **temporal evolution → LLM naming
 - `.gitignore` excludes data files (CSVs, Parquets, pickles), large models, and outputs
 - Safe to commit: `.py` files, notebooks (`.ipynb`), docs, environment files
 - Never commit: raw data, trained models, output artifacts
+
+---
+
+## Active Sprint
+
+7-day MVP execution plan (May 27 – June 3): `docs/MVP_EXECUTION_PLAN.md`
+Team prompt guide and session templates: `docs/AGENT_PROMPTS.md`
 
 ---
 
