@@ -217,5 +217,39 @@ Team prompt guide and session templates: `docs/AGENT_PROMPTS.md`
 ## Current Project Status
 
 - **Phase**: Initial EDA and data pipeline foundation
-- **Completed**: Data loader, CSV-to-Parquet conversion, exploration notebook with schema validation
+- **Completed**: Data loader, CSV-to-Parquet conversion, exploration notebook with schema validation, full MVP pipeline notebook (EDA sections 0–4)
 - **Next steps**: Implement Phase 1 (product embeddings), Phase 2 (customer vectors), Phase 3 & 4 (dimensionality reduction + clustering)
+
+---
+
+## Notebook Memory & Performance Rules (`02_mvp_pipeline.ipynb`)
+
+WSL2 has 23 GB RAM. The raw transaction parquet (`df_combined.parquet`) is 5.7 GB on disk and expands ~10–15× in memory. **All `.collect()` calls in this notebook must use `engine="streaming"`** — this processes 190M rows in micro-batches instead of loading everything at once.
+
+### Rules for every new cell that scans a large parquet
+
+1. **Always use `collect(engine="streaming")`** — never bare `.collect()` on any lazy frame backed by `df_combined.parquet` or the raw `linea_tickets` parquet.
+
+2. **Avoid `n_unique()` in `group_by` aggregations** — use `approx_n_unique()` instead (HyperLogLog, ~1% error, O(1) memory per group vs. O(cardinality)). This is the single largest memory multiplier. `n_unique()` in a `select()` context (global count) is fine.
+
+3. **Cache expensive results to parquet** — if a cell produces a per-customer or per-product DataFrame, save it to `data/processed/<name>.parquet` and add a cache guard at the top of the cell:
+   ```python
+   _cache_path = DATA_PROCESSED / "<name>.parquet"
+   if _cache_path.exists():
+       result = pd.read_parquet(_cache_path)
+   else:
+       # ... compute ...
+       result.to_parquet(_cache_path, index=False)
+   ```
+   Currently cached: `customer_kpis.parquet` (1.48M rows, all 5 per-customer KPIs from Section 4.1).
+
+### Cells already patched
+
+| Cell ID | Section | Fix applied |
+|---|---|---|
+| `bc875ce1` | 1 — Data Inventory | `engine="streaming"` on both collects |
+| `9297a1f8` | 3.1 — Pre-merge audit | `engine="streaming"` |
+| `51331888` | 3.2 — Filter + join + stats | `engine="streaming"` |
+| `8d29141b` | 3.3 — Post-merge verification | `engine="streaming"` (`sink_parquet` was already streaming) |
+| `bd862d2b` | 4.1 — Customer KPI distributions | `engine="streaming"` + `approx_n_unique()` + parquet cache |
+| `ded50592` | 4.2 — Promo sensitivity | `engine="streaming"` |
