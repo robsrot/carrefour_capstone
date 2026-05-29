@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **NO demographic attributes**: Segmentation is purely behavior-driven (purchase history), not demographic profiling
 - **Scale**: 1.48M unique customers across 6 months of transaction data (191M transaction lines)
 - **Infrastructure requirements**: Distributed computing (Spark/Dask) and GPU acceleration mandatory for production scale
-- **Forbidden approaches**: PCA for dimensionality reduction, K-Means clustering, simple mean aggregation of product vectors
+- **Empirical approach**: The project brief discourages PCA and K-Means, but the methodology is to **run both and let the data decide**. We run a naive baseline (PCA + K-Means) alongside the prescribed pipeline (UMAP + HDBSCAN) and present quantitative evidence for why one outperforms the other. This is more rigorous than rule-following.
 
 ### 4-Phase Pipeline Architecture
 
@@ -22,16 +22,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Aggregate each customer's full purchase history into a single behavioral vector
    - **Critical**: Use frequency-weighted + time-decay aggregation (NOT simple mean)
    - Recent purchases carry more weight than older purchases
+   - Also run simple mean as a baseline to demonstrate the signal loss
 
-3. **Phase 3 — Dimensionality Reduction** (Approved methods only)
-   - **Approved**: Autoencoders, VAE, UMAP, t-SNE
-   - **Forbidden**: PCA (assumes linear dependencies, invalid for consumer behavior)
-   - Compress to ~100-dimensional latent space while preserving topological structure
+3. **Phase 3 — Dimensionality Reduction** (with empirical comparison)
+   - **Primary**: UMAP — preserves non-linear topology, better for density-based clustering
+   - **Baseline**: PCA — linear, fast, interpretable; run it and measure whether it loses structure
+   - Comparison metric: silhouette score and visual coherence of downstream clusters
 
-4. **Phase 4 — Customer Clustering** (HDBSCAN only)
-   - Discover natural, irregular cluster shapes without predefined K
-   - **Mandated**: HDBSCAN (density-based, naturally isolates outliers)
-   - **Forbidden**: K-Means
+4. **Phase 4 — Customer Clustering** (with empirical comparison)
+   - **Primary**: HDBSCAN — density-based, no predefined K, handles irregular shapes and outliers
+   - **Baseline**: K-Means — run with K = number of HDBSCAN tribes found, for a fair comparison
+   - Comparison metrics: silhouette score, Davies-Bouldin index, tribe interpretability (top products)
 
 ---
 
@@ -191,9 +192,9 @@ If time is limited, implement in this order: **temporal evolution → LLM naming
 
 3. **Join integrity**: Before merging product master with tickets, run the quality checks shown in `01_exploration.ipynb` (duplicate keys, orphaned products, negative values).
 
-4. **Frequency weighting**: Phase 2 requires habitual/recurring purchases to outweigh one-offs. Implement time-decay curves (recent > old) and purchase frequency aggregation.
+4. **Frequency weighting**: Phase 2 requires habitual/recurring purchases to outweigh one-offs. Implement time-decay curves (recent > old) and purchase frequency aggregation. Also run simple mean as a baseline to show what signal is lost.
 
-5. **No PCA or K-Means**: Explicitly forbidden. Use UMAP, t-SNE, Autoencoder, or VAE for dimensionality reduction, and HDBSCAN for clustering.
+5. **Empirical comparison**: Run PCA + K-Means as a naive baseline alongside UMAP + HDBSCAN. Measure both with silhouette score, Davies-Bouldin index, and qualitative tribe coherence. Present findings honestly — the goal is evidence, not confirmation of a prior belief.
 
 ---
 
@@ -206,8 +207,49 @@ If time is limited, implement in this order: **temporal evolution → LLM naming
 
 ---
 
+## Active Sprint
+
+7-day MVP execution plan (May 27 – June 3): `docs/MVP_EXECUTION_PLAN.md`
+Team prompt guide and session templates: `docs/AGENT_PROMPTS.md`
+
+---
+
 ## Current Project Status
 
 - **Phase**: Initial EDA and data pipeline foundation
-- **Completed**: Data loader, CSV-to-Parquet conversion, exploration notebook with schema validation
+- **Completed**: Data loader, CSV-to-Parquet conversion, exploration notebook with schema validation, full MVP pipeline notebook (EDA sections 0–4)
 - **Next steps**: Implement Phase 1 (product embeddings), Phase 2 (customer vectors), Phase 3 & 4 (dimensionality reduction + clustering)
+
+---
+
+## Notebook Memory & Performance Rules (`02_mvp_pipeline.ipynb`)
+
+WSL2 has 23 GB RAM. The raw transaction parquet (`df_combined.parquet`) is 5.7 GB on disk and expands ~10–15× in memory. **All `.collect()` calls in this notebook must use `engine="streaming"`** — this processes 190M rows in micro-batches instead of loading everything at once.
+
+### Rules for every new cell that scans a large parquet
+
+1. **Always use `collect(engine="streaming")`** — never bare `.collect()` on any lazy frame backed by `df_combined.parquet` or the raw `linea_tickets` parquet.
+
+2. **Avoid `n_unique()` in `group_by` aggregations** — use `approx_n_unique()` instead (HyperLogLog, ~1% error, O(1) memory per group vs. O(cardinality)). This is the single largest memory multiplier. `n_unique()` in a `select()` context (global count) is fine.
+
+3. **Cache expensive results to parquet** — if a cell produces a per-customer or per-product DataFrame, save it to `data/processed/<name>.parquet` and add a cache guard at the top of the cell:
+   ```python
+   _cache_path = DATA_PROCESSED / "<name>.parquet"
+   if _cache_path.exists():
+       result = pd.read_parquet(_cache_path)
+   else:
+       # ... compute ...
+       result.to_parquet(_cache_path, index=False)
+   ```
+   Currently cached: `customer_kpis.parquet` (1.48M rows, all 5 per-customer KPIs from Section 4.1).
+
+### Cells already patched
+
+| Cell ID | Section | Fix applied |
+|---|---|---|
+| `bc875ce1` | 1 — Data Inventory | `engine="streaming"` on both collects |
+| `9297a1f8` | 3.1 — Pre-merge audit | `engine="streaming"` |
+| `51331888` | 3.2 — Filter + join + stats | `engine="streaming"` |
+| `8d29141b` | 3.3 — Post-merge verification | `engine="streaming"` (`sink_parquet` was already streaming) |
+| `bd862d2b` | 4.1 — Customer KPI distributions | `engine="streaming"` + `approx_n_unique()` + parquet cache |
+| `ded50592` | 4.2 — Promo sensitivity | `engine="streaming"` |

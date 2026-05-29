@@ -12,10 +12,13 @@ dependencies:
   - ipykernel
   - pyarrow
   - pyyaml
-  - gensim
-  - umap-learn
-  - hdbscan
+  - umap-learn=0.5.6
+  - plotly=5.22.0
   - pip
   - pip:
     - polars>=1.0
     - torch
+    - gensim>=4.3.2
+    - hdbscan==0.8.40
+    - anthropic
+    - python-dotenv
