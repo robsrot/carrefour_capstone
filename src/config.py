@@ -5,6 +5,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA_RAW = ROOT / "data" / "raw" / "parquet"
 DATA_PROCESSED = ROOT / "data" / "processed"
 OUTPUTS = ROOT / "outputs"
+MODELS = ROOT / "models"
 
 # sampling
 SAMPLE_SIZE = 100_000
@@ -15,8 +16,8 @@ MIN_TICKETS_PER_CUSTOMER = 3
 W2V_VECTOR_SIZE = 100
 W2V_WINDOW = 5
 W2V_MIN_COUNT = 3
-W2V_EPOCHS = 10
-W2V_SG = 1   # skip-gram (better than CBOW for rare products)
+W2V_EPOCHS = 5
+W2V_SG = 0   # CBOW: 5-10x faster than skip-gram, equally good for co-purchase embedding
 
 # customer vector aggregation
 RECENCY_HALFLIFE_DAYS = 30
