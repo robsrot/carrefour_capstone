@@ -54,6 +54,13 @@ python -m ipykernel install --user --name=carrefour --display-name "Python (carr
 ```
 This makes the `carrefour` environment available in Jupyter and VS Code.
 
+### WSL2 users only — libgomp symlink fix
+After `conda env create`, run this once:
+```bash
+ln -sf "$CONDA_PREFIX/lib/libgomp.so.1.0.0" "$CONDA_PREFIX/lib/libgomp.so.1"
+```
+conda's `libgomp` package on WSL2 omits the versioned `.so.1` symlink that scipy/gensim link against at runtime. Not needed on Mac or Windows.
+
 ### One-Time Data Setup
 After placing raw CSV files in `data/raw/csv/`, run the first cell in `notebooks/01_exploration.ipynb`:
 ```python
