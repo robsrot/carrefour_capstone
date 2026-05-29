@@ -87,7 +87,7 @@ def audit_nulls() -> dict:
     ticket_null_counts = (
         _df_tickets()
         .select([pl.col(c).null_count().alias(c) for c in sorted(_TICKET_COLS)])
-        .collect()
+        .collect(engine="streaming")
         .to_dicts()[0]
     )
     total_ticket_nulls = sum(ticket_null_counts.values())
@@ -113,21 +113,24 @@ def audit_anomalies() -> dict:
     This function documents the scale of each anomaly type so the rule is
     evidence-based, not arbitrary.
     """
-    df_tickets = _df_tickets()
-    total = df_tickets.select(pl.len()).collect().item()
-
-    counts = df_tickets.select([
+    # single streaming pass — avoids scanning the 5.7 GB parquet three times
+    row = _df_tickets().select([
+        pl.len().alias("total"),
         (pl.col("unidades") < 0).sum().alias("negative_unidades"),
         (pl.col("unidades") == 0).sum().alias("zero_unidades"),
         (pl.col("unidades") > 1_000).sum().alias("extreme_unidades_gt1000"),
         (pl.col("importe") < 0).sum().alias("negative_importe"),
         (pl.col("importe") == 0).sum().alias("zero_importe"),
         (pl.col("importe") > 10_000).sum().alias("extreme_importe_gt10k"),
-    ]).collect().row(0, named=True)
+        ((pl.col("unidades") <= 0) | (pl.col("importe") <= 0)).sum().alias("dropped"),
+    ]).collect(engine="streaming").row(0, named=True)
 
-    dropped = df_tickets.filter(
-        (pl.col("unidades") <= 0) | (pl.col("importe") <= 0)
-    ).select(pl.len()).collect().item()
+    total   = row["total"]
+    counts  = {k: row[k] for k in [
+        "negative_unidades", "zero_unidades", "extreme_unidades_gt1000",
+        "negative_importe", "zero_importe", "extreme_importe_gt10k",
+    ]}
+    dropped = row["dropped"]
 
     result = {
         "total_rows": int(total),
@@ -152,31 +155,42 @@ def check_product_coverage() -> dict:
 
     Raises AssertionError if coverage < 90%.
     """
-    df_articles = _df_articles()
-    articles_ids = set(df_articles["idarticu"].to_list())
+    articles_lf = pl.scan_parquet(DATA_RAW / "maestra_articulos.parquet").select("idarticu")
 
-    ticket_ids_series = (
+    # count unique products in tickets via streaming global n_unique (select context — safe)
+    ticket_product_count = (
         _df_tickets()
-        .select(pl.col("idarticu").unique())
-        .collect()["idarticu"]
+        .select(pl.col("idarticu").n_unique())
+        .collect(engine="streaming")
+        .item()
     )
-    ticket_ids = set(ticket_ids_series.to_list())
+    articles_product_count = _df_articles()["idarticu"].n_unique()
 
-    covered  = ticket_ids & articles_ids
-    orphaned = ticket_ids - articles_ids
-    coverage_pct = len(covered) / len(ticket_ids) * 100
+    # anti-join finds ticket products not in the master — no Python sets needed
+    orphaned_count = (
+        _df_tickets()
+        .select("idarticu")
+        .unique()
+        .join(articles_lf, on="idarticu", how="anti")
+        .select(pl.len())
+        .collect(engine="streaming")
+        .item()
+    )
+
+    covered_count = ticket_product_count - orphaned_count
+    coverage_pct  = covered_count / ticket_product_count * 100
 
     result = {
-        "unique_products_in_tickets": len(ticket_ids),
-        "unique_products_in_articles": len(articles_ids),
-        "covered_products": len(covered),
-        "orphaned_products": len(orphaned),
+        "unique_products_in_tickets": ticket_product_count,
+        "unique_products_in_articles": articles_product_count,
+        "covered_products": covered_count,
+        "orphaned_products": orphaned_count,
         "coverage_pct": round(coverage_pct, 2),
     }
 
     assert coverage_pct > 90, (
         f"Product coverage {coverage_pct:.1f}% is below 90% threshold. "
-        f"{len(orphaned):,} orphaned product IDs — investigate before proceeding."
+        f"{orphaned_count:,} orphaned product IDs — investigate before proceeding."
     )
     return result
 
@@ -194,7 +208,7 @@ def check_temporal_completeness() -> dict:
         .group_by("month")
         .agg(pl.len().alias("n_transactions"))
         .sort("month")
-        .collect()
+        .collect(engine="streaming")
     )
 
     n_months   = monthly.shape[0]
@@ -234,8 +248,9 @@ def audit_customer_activity() -> dict:
     activity = (
         _df_tickets()
         .group_by("cliente")
-        .agg(pl.col("ticket").n_unique().alias("n_tickets"))
-        .collect()
+        # approx_n_unique uses HyperLogLog (~1% error) — O(1) memory per group vs O(cardinality) for exact
+        .agg(pl.col("ticket").approx_n_unique().alias("n_tickets"))
+        .collect(engine="streaming")
     )
 
     n_tickets     = activity["n_tickets"]
@@ -268,15 +283,14 @@ def audit_promotional_data() -> dict:
     Check idpromoc categories and promotional line rate.
     Promotional sensitivity is a key behavioral axis in Phase 2.
     """
-    df_tickets = _df_tickets()
-    total = df_tickets.select(pl.len()).collect().item()
-
     promo_counts = (
-        df_tickets.group_by("idpromoc")
-          .agg(pl.len().alias("n"))
-          .sort("n", descending=True)
-          .collect()
+        _df_tickets()
+        .group_by("idpromoc")
+        .agg(pl.len().alias("n"))
+        .sort("n", descending=True)
+        .collect(engine="streaming")
     )
+    total = int(promo_counts["n"].sum())
 
     breakdown = {
         str(row["idpromoc"]): {
@@ -298,18 +312,17 @@ def audit_promotional_data() -> dict:
 
 def audit_stores() -> dict:
     """Count transactions and revenue per store."""
-    df_tickets = _df_tickets()
-    total = df_tickets.select(pl.len()).collect().item()
-
     stores = (
-        df_tickets.group_by("idempres")
-          .agg([
-              pl.len().alias("n_transactions"),
-              pl.col("importe").sum().alias("total_importe"),
-          ])
-          .sort("idempres")
-          .collect()
+        _df_tickets()
+        .group_by("idempres")
+        .agg([
+            pl.len().alias("n_transactions"),
+            pl.col("importe").sum().alias("total_importe"),
+        ])
+        .sort("idempres")
+        .collect(engine="streaming")
     )
+    total = int(stores["n_transactions"].sum())
 
     breakdown = {
         str(row["idempres"]): {
