@@ -117,6 +117,7 @@ df_tickets = load_linea_tickets(columns=["cliente", "idarticu", "importe"])
 - 6 months of data (2022-01-01 to 2022-06-30)
 - 4 stores (idempres: 2, 7, etc.)
 - 77.6% non-promotional, 22.4% promotional lines
+- `idpromoc` column in `df_combined` has exactly two string values: `"Promo"` and `"No promo"` (never null, never numeric). Detect promotions with `pl.col("idpromoc") == "Promo"` — **not** `is_not_null()` or `!= "0"`.
 
 ---
 
