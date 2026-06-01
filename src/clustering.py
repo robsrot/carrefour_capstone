@@ -44,7 +44,7 @@ from src.config import (
 _log = logging.getLogger(__name__)
 
 # Fit HDBSCAN on this many customers (empirically safe limit for memory/time)
-HDBSCAN_FIT_SAMPLE = 300_000
+HDBSCAN_FIT_SAMPLE = 100_000
 # Evaluate silhouette on this many customers (O(n²) metric — needs sampling)
 SILHOUETTE_SAMPLE  = 50_000
 
@@ -108,6 +108,7 @@ def cluster_hdbscan(
         min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
         min_samples=HDBSCAN_MIN_SAMPLES,
         metric=HDBSCAN_METRIC,
+        algorithm="ball_tree",
         cluster_selection_method=HDBSCAN_CLUSTER_METHOD,
         n_jobs=-1,
     )
@@ -323,9 +324,9 @@ def profile_tribes(
         .agg([
             pl.len().alias("n_customers"),
             pl.col("avg_basket_size").mean().cast(pl.Float32).alias("avg_basket"),
-            pl.col("n_tickets").mean().cast(pl.Float32).alias("avg_visits"),
-            pl.col("total_spend").sum().alias("total_revenue"),
-            pl.col("promo_rate").mean().cast(pl.Float32).alias("avg_promo_rate"),
+            pl.col("visit_count").mean().cast(pl.Float32).alias("avg_visits"),
+            pl.col("total_spend_6m").sum().alias("total_revenue"),
+            pl.col("avg_promo_rate").mean().cast(pl.Float32).alias("avg_promo_rate"),
         ])
         .with_columns(
             (pl.col("total_revenue") / pl.col("total_revenue").sum() * 100)
