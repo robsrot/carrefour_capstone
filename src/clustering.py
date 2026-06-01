@@ -1,13 +1,13 @@
 """Phase 4 — Customer clustering and tribe profiling.
 
-Two methods are compared on the 50D UMAP embedding:
+Two methods are compared on the 20D UMAP embedding:
   HDBSCAN  (primary)   — density-based, no predefined K, handles noise
   K-Means  (baseline)  — K = n_tribes found by HDBSCAN (fair comparison)
 
-Scale strategy for HDBSCAN (cannot run exact on 1.48M × 50):
+Scale strategy for HDBSCAN (cannot run exact on 1.48M × 20):
   1. Fit HDBSCAN on HDBSCAN_FIT_SAMPLE random customers.
-  2. Assign remaining customers via hdbscan.approximate_predict().
-  3. Customers the model cannot assign confidently are labelled -1 (noise).
+  2. Assign remaining customers via nearest-neighbour label lookup on the fit sample.
+  3. Customers whose nearest sample neighbour is noise are labelled -1 (noise).
   K-Means uses MiniBatchKMeans which is O(n) and runs on the full 1.48M.
 
 Public API
@@ -28,8 +28,8 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-import hdbscan
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import HDBSCAN, MiniBatchKMeans
+from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics import silhouette_score, davies_bouldin_score
 
 from src.config import (
@@ -73,8 +73,8 @@ def cluster_hdbscan(
 
     Parameters
     ----------
-    umap_cluster : DataFrame from reduce_umap_cluster() — columns [cliente, u0…u49, promo_rate].
-                   If None, loads umap_cluster_50d.parquet.
+    umap_cluster : DataFrame from reduce_umap_cluster() — columns [cliente, u0…u19, promo_rate].
+                   If None, loads umap_cluster_20d.parquet.
 
     Returns
     -------
@@ -87,8 +87,8 @@ def cluster_hdbscan(
         return pl.read_parquet(_HDBSCAN_CACHE)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_50d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_50d.parquet")
+        _log.info("Loading umap_cluster_20d.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
 
     X, _ = _embedding_to_numpy(umap_cluster)
     N = len(X)
@@ -104,13 +104,12 @@ def cluster_hdbscan(
         f"{len(X_sample):,}",
         HDBSCAN_MIN_CLUSTER_SIZE, HDBSCAN_MIN_SAMPLES, HDBSCAN_METRIC,
     )
-    clusterer = hdbscan.HDBSCAN(
+    clusterer = HDBSCAN(
         min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
         min_samples=HDBSCAN_MIN_SAMPLES,
         metric=HDBSCAN_METRIC,
         cluster_selection_method=HDBSCAN_CLUSTER_METHOD,
-        prediction_data=True,    # required for approximate_predict
-        core_dist_n_jobs=-1,
+        n_jobs=-1,
     )
     clusterer.fit(X_sample)
 
@@ -127,9 +126,11 @@ def cluster_hdbscan(
 
     rest_idx = np.setdiff1d(np.arange(N), sample_idx)
     if len(rest_idx) > 0:
-        _log.info("approximate_predict on remaining %s customers ...", f"{len(rest_idx):,}")
-        approx_labels, _ = hdbscan.approximate_predict(clusterer, X[rest_idx])
-        all_labels[rest_idx] = approx_labels.astype(np.int32)
+        _log.info("Assigning remaining %s customers via nearest-neighbour lookup ...", f"{len(rest_idx):,}")
+        nn = NearestNeighbors(n_neighbors=1, metric=HDBSCAN_METRIC, n_jobs=-1)
+        nn.fit(X_sample)
+        _, indices = nn.kneighbors(X[rest_idx])
+        all_labels[rest_idx] = clusterer.labels_[indices.ravel()].astype(np.int32)
 
     total_noise = (all_labels == -1).mean() * 100
     _log.info(
@@ -176,8 +177,8 @@ def cluster_kmeans(
         return pl.read_parquet(_KMEANS_CACHE)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_50d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_50d.parquet")
+        _log.info("Loading umap_cluster_20d.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
 
     # Derive K from HDBSCAN output if not provided
     if n_clusters is None:
@@ -235,7 +236,7 @@ def evaluate_clustering(
 ) -> dict:
     """Compute silhouette score and Davies-Bouldin index on a sample.
 
-    Both metrics use the 50D UMAP embedding (not the raw 100D vectors), which
+    Both metrics use the 20D UMAP embedding (not the raw 100D vectors), which
     is the space the clustering actually operated in.
 
     Returns dict: method, n_clusters, noise_pct, silhouette, davies_bouldin
