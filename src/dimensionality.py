@@ -46,11 +46,11 @@ _log = logging.getLogger(__name__)
 
 # How many customers to fit UMAP on — large enough to capture density structure,
 # small enough that fit() finishes in a few minutes on 10 cores.
-UMAP_FIT_SAMPLE = 300_000
+UMAP_FIT_SAMPLE = 100_000
 
-_UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_50d.parquet"
+_UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
 _UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
-_PCA_CACHE          = DATA_PROCESSED / "pca_cluster_50d.parquet"
+_PCA_CACHE          = DATA_PROCESSED / "pca_cluster_20d.parquet"
 _PCA_MODEL_CACHE    = DATA_PROCESSED / "pca_model.pkl"
 
 
@@ -81,10 +81,10 @@ def reduce_umap_cluster(
     force: bool = False,
     n_jobs: int = -1,
 ) -> pl.DataFrame:
-    """UMAP 100D → 50D embedding for HDBSCAN clustering.
+    """UMAP 100D → 20D embedding for HDBSCAN clustering.
 
     Fits on UMAP_FIT_SAMPLE random customers, transforms the rest.
-    Cached to umap_cluster_50d.parquet.
+    Cached to umap_cluster_20d.parquet.
 
     Parameters
     ----------
@@ -126,7 +126,7 @@ def reduce_umap_cluster(
     reducer.fit(X_sample)
     _log.info("UMAP fit complete. Transforming all %s customers ...", f"{N:,}")
 
-    embedding = reducer.transform(X).astype(np.float32)   # (N, 50)
+    embedding = reducer.transform(X).astype(np.float32)   # (N, 20)
 
     # UMAP transform can produce NaN for outlier points far from the training sample.
     nan_rows = np.isnan(embedding).any(axis=1)
@@ -159,9 +159,9 @@ def reduce_umap_viz(
     force: bool = False,
     n_jobs: int = -1,
 ) -> pl.DataFrame:
-    """UMAP 50D → 2D embedding for visualisation.
+    """UMAP 20D → 2D embedding for visualisation.
 
-    Takes the 50D clustering embedding as input (not the raw 100D vectors) so
+    Takes the 20D clustering embedding as input (not the raw 100D vectors) so
     the visualisation is geometrically consistent with the clustering.
     Cached to umap_viz_2d.parquet.
     """
@@ -238,10 +238,10 @@ def reduce_pca(
     n_components: int = UMAP_CLUSTER_DIMS,
     force: bool = False,
 ) -> pl.DataFrame:
-    """PCA 100D → 50D baseline (linear, full population, no sampling needed).
+    """PCA 100D → 20D baseline (linear, full population, no sampling needed).
 
     sklearn PCA on 1.48M × 100 with float32 uses ~2 GB RAM and finishes in ~30 s.
-    Cached to pca_cluster_50d.parquet.
+    Cached to pca_cluster_20d.parquet.
     """
     if _PCA_CACHE.exists() and _PCA_MODEL_CACHE.exists() and not force:
         n = pl.scan_parquet(_PCA_CACHE).select(pl.len()).collect().item()

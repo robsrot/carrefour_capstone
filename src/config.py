@@ -4,6 +4,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DATA_RAW = ROOT / "data" / "raw" / "parquet"
 DATA_PROCESSED = ROOT / "data" / "processed"
+MODELS = ROOT / "models"
 OUTPUTS = ROOT / "outputs"
 
 # sampling
@@ -22,7 +23,7 @@ W2V_SG = 1   # skip-gram (better than CBOW for rare products)
 RECENCY_HALFLIFE_DAYS = 30
 
 # UMAP
-UMAP_CLUSTER_DIMS = 50
+UMAP_CLUSTER_DIMS = 20
 UMAP_VIZ_DIMS = 2
 UMAP_N_NEIGHBORS = 30
 UMAP_MIN_DIST_CLUSTER = 0.0   # 0.0 preserves tighter local structure for clustering
