@@ -46,10 +46,11 @@ from src.config import (
 
 _log = logging.getLogger(__name__)
 
-_REFERENCE_DATE     = date(2022, 6, 30)      # last day in the dataset
-_INTERACTIONS_CACHE = DATA_PROCESSED / "customer_product_weights.parquet"
-_WEIGHTED_CACHE     = DATA_PROCESSED / "customer_vectors_weighted.parquet"
-_MEAN_CACHE         = DATA_PROCESSED / "customer_vectors_mean.parquet"
+_REFERENCE_DATE       = date(2022, 6, 30)      # last day in the dataset
+_INTERACTIONS_CACHE   = DATA_PROCESSED / "customer_product_weights.parquet"
+_WEIGHTED_CACHE       = DATA_PROCESSED / "customer_vectors_weighted.parquet"
+_MEAN_CACHE           = DATA_PROCESSED / "customer_vectors_mean.parquet"
+_STORE_FEATURES_CACHE = DATA_PROCESSED / "customer_store_features.parquet"
 
 
 # ─── 1. Stage 1: per-(customer, product) interaction weights ──────────────────
@@ -266,6 +267,81 @@ def build_customer_vectors(
         f"{len(df):,}",
         _WEIGHTED_CACHE.name,
         _WEIGHTED_CACHE.stat().st_size / 1024 ** 2,
+    )
+    return df
+
+
+def build_store_features(
+    df_combined_path: Path | None = None,
+    *,
+    force: bool = False,
+) -> pl.DataFrame:
+    """Per-customer store affinity features.
+
+    Computes the fraction of each customer's total spend at each store format.
+    A single-store loyalist gets share=1.0 for their store and 0.0 for all others.
+    A cross-format shopper gets distributed shares.
+
+    This is a first-class behavioural dimension: a customer who shops exclusively
+    at a suburban hypermarket is structurally different from one who uses the city
+    express format — not because of who they are but because of what each format
+    stocks and in what basket context.
+
+    Returns
+    -------
+    DataFrame: cliente str | spend_share_s{X} float32 for each store X
+    Cached to customer_store_features.parquet.
+    """
+    if _STORE_FEATURES_CACHE.exists() and not force:
+        n = pl.scan_parquet(_STORE_FEATURES_CACHE).select(pl.len()).collect().item()
+        _log.info("Store features cache hit — %s customers", f"{n:,}")
+        return pl.read_parquet(_STORE_FEATURES_CACHE)
+
+    if df_combined_path is None:
+        df_combined_path = DATA_PROCESSED / "df_combined.parquet"
+
+    _log.info("Computing per-customer store spend shares from %s ...", df_combined_path.name)
+
+    # Per-(customer, store) total spend — cast store ID to string for clean column names
+    store_spend = (
+        pl.scan_parquet(df_combined_path)
+        .select(["cliente", "idempres", "importe"])
+        .with_columns(pl.col("idempres").cast(pl.Utf8).alias("store"))
+        .group_by(["cliente", "store"])
+        .agg(pl.col("importe").sum().alias("spend"))
+        .collect(engine="streaming")
+    )
+
+    stores = store_spend["store"].unique().sort().to_list()
+    _log.info("  Stores found: %s", stores)
+
+    # Pivot → one column per store; customers absent from a store get 0.0
+    df_wide = (
+        store_spend
+        .pivot(on="store", index="cliente", values="spend", aggregate_function="sum")
+        .fill_null(0.0)
+    )
+    raw_cols = [c for c in df_wide.columns if c != "cliente"]
+
+    # Row-normalise to spend shares (each row sums to 1.0)
+    df = (
+        df_wide
+        .with_columns(
+            pl.sum_horizontal([pl.col(c) for c in raw_cols]).alias("_total")
+        )
+        .with_columns([
+            (pl.col(c) / pl.col("_total")).cast(pl.Float32).alias(f"spend_share_s{c}")
+            for c in raw_cols
+        ])
+        .select(["cliente"] + [f"spend_share_s{c}" for c in raw_cols])
+    )
+
+    _STORE_FEATURES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(_STORE_FEATURES_CACHE, compression="zstd")
+    _log.info(
+        "Saved %s customer store features → %s  (%d stores, %.1f MB on disk)",
+        f"{len(df):,}", _STORE_FEATURES_CACHE.name, len(stores),
+        _STORE_FEATURES_CACHE.stat().st_size / 1024 ** 2,
     )
     return df
 

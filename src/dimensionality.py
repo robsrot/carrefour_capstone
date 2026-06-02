@@ -46,7 +46,7 @@ _log = logging.getLogger(__name__)
 
 # How many customers to fit UMAP on — large enough to capture density structure,
 # small enough that fit() finishes in a few minutes on 10 cores.
-UMAP_FIT_SAMPLE = 100_000
+UMAP_FIT_SAMPLE = 300_000   # 100k was only 6.7% of population; rare customer types were underrepresented in the learned manifold
 
 _UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
 _UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
@@ -102,6 +102,28 @@ def reduce_umap_cluster(
         customer_vectors = pl.read_parquet(DATA_PROCESSED / "customer_vectors_weighted.parquet")
 
     X = _vectors_to_numpy(customer_vectors)          # (N, 100)
+    # Append promo_rate as 101st feature so promotional sensitivity influences UMAP topology,
+    # not just post-hoc profiling — this is the key axis separating promo-surfers from loyalists
+    promo = customer_vectors["promo_rate"].fill_null(0.0).to_numpy().reshape(-1, 1).astype(np.float32)
+    X = np.hstack([X, promo])                        # (N, 101)
+
+    # Append store affinity features — separates store-format loyalists from cross-format shoppers
+    # as a first-class UMAP dimension, not just a post-hoc label
+    _store_path = DATA_PROCESSED / "customer_store_features.parquet"
+    if not _store_path.exists():
+        from src.customer_vectors import build_store_features as _bsf
+        _store_df = _bsf()
+    else:
+        _store_df = pl.read_parquet(_store_path)
+    _store_cols = [c for c in _store_df.columns if c != "cliente"]
+    _store_aligned = (
+        customer_vectors.select("cliente")
+        .join(_store_df, on="cliente", how="left")
+        .fill_null(0.0)
+        .select(_store_cols)
+    )
+    store_arr = _store_aligned.to_numpy().astype(np.float32)
+    X = np.hstack([X, store_arr])                    # (N, 101 + n_stores)
     N = len(X)
 
     # Sample for fit
@@ -111,8 +133,8 @@ def reduce_umap_cluster(
     X_sample = X[sample_idx]
 
     _log.info(
-        "UMAP cluster fit: %s sample, n_neighbors=%d, n_components=%d, metric=%s ...",
-        f"{len(X_sample):,}", UMAP_N_NEIGHBORS, UMAP_CLUSTER_DIMS, UMAP_METRIC,
+        "UMAP cluster fit: %s sample, input_dims=%d, n_neighbors=%d, n_components=%d, metric=%s ...",
+        f"{len(X_sample):,}", X.shape[1], UMAP_N_NEIGHBORS, UMAP_CLUSTER_DIMS, UMAP_METRIC,
     )
     reducer = umap.UMAP(
         n_components=UMAP_CLUSTER_DIMS,

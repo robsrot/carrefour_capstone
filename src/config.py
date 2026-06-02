@@ -20,7 +20,7 @@ W2V_EPOCHS = 10
 W2V_SG = 1   # skip-gram (better than CBOW for rare products)
 
 # customer vector aggregation
-RECENCY_HALFLIFE_DAYS = 30
+RECENCY_HALFLIFE_DAYS = 60   # 30 was too aggressive for a 6-month window; Jan behaviour was weighted near-zero by June
 
 # UMAP
 UMAP_CLUSTER_DIMS = 20
@@ -31,7 +31,7 @@ UMAP_MIN_DIST_VIZ = 0.1
 UMAP_METRIC = "cosine"
 
 # HDBSCAN
-HDBSCAN_MIN_CLUSTER_SIZE = 200
+HDBSCAN_MIN_CLUSTER_SIZE = 5000   # 200 found micro-niches on 100k fit sample; 5000 = ~5% of sample → ~74k in full population
 HDBSCAN_MIN_SAMPLES = 10
 HDBSCAN_METRIC = "euclidean"
 HDBSCAN_CLUSTER_METHOD = "eom"
