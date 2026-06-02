@@ -67,6 +67,7 @@ def build_basket_sentences(
         .select(["ticket", "idarticu"])          # drop unused columns before grouping
         .group_by("ticket")
         .agg(pl.col("idarticu").alias("products"))
+        .filter(pl.col("products").list.len() >= 2)   # single-item baskets yield zero co-purchase pairs
         .collect(engine="streaming")
     )
     baskets.write_parquet(_BASKET_CACHE, compression="zstd")

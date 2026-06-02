@@ -46,7 +46,7 @@ _log = logging.getLogger(__name__)
 
 # How many customers to fit UMAP on — large enough to capture density structure,
 # small enough that fit() finishes in a few minutes on 10 cores.
-UMAP_FIT_SAMPLE = 100_000
+UMAP_FIT_SAMPLE = 300_000   # 100k was only 6.7% of population; rare customer types were underrepresented in the learned manifold
 
 _UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
 _UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
@@ -102,6 +102,56 @@ def reduce_umap_cluster(
         customer_vectors = pl.read_parquet(DATA_PROCESSED / "customer_vectors_weighted.parquet")
 
     X = _vectors_to_numpy(customer_vectors)          # (N, 100)
+    # Append promo_rate as 101st feature so promotional sensitivity influences UMAP topology,
+    # not just post-hoc profiling — this is the key axis separating promo-surfers from loyalists
+    promo = customer_vectors["promo_rate"].fill_null(0.0).to_numpy().reshape(-1, 1).astype(np.float32)
+    X = np.hstack([X, promo])                        # (N, 101)
+
+    # Append store affinity features — separates store-format loyalists from cross-format shoppers
+    # as a first-class UMAP dimension, not just a post-hoc label
+    _store_path = DATA_PROCESSED / "customer_store_features.parquet"
+    if not _store_path.exists():
+        from src.customer_vectors import build_store_features as _bsf
+        _store_df = _bsf()
+    else:
+        _store_df = pl.read_parquet(_store_path)
+    _store_cols = [c for c in _store_df.columns if c != "cliente"]
+    _store_aligned = (
+        customer_vectors.select("cliente")
+        .join(_store_df, on="cliente", how="left")
+        .fill_null(0.0)
+        .select(_store_cols)
+    )
+    store_arr = _store_aligned.to_numpy().astype(np.float32)
+    X = np.hstack([X, store_arr])                    # (N, 101 + n_stores)
+
+    # Append KPI features — spend level, visit frequency, basket size, product diversity.
+    # These capture HOW customers shop (not just WHAT they buy) and have the highest
+    # variance of any feature in the dataset (CV 1.4–10x). Without them, a VIP who
+    # shops weekly and a casual visitor who buys the same products once land in the
+    # same tribe. Log1p handles extreme right skew; z-score centres per feature;
+    # KPI_WEIGHT=3 gives ~10% total signal weight vs being drowned by 100 product dims.
+    _KPI_WEIGHT = 3.0
+    _kpi_path = DATA_PROCESSED / "customer_kpis.parquet"
+    if _kpi_path.exists():
+        _kpi_cols = ["total_spend_6m", "visit_count", "avg_basket_size", "unique_products"]
+        _kpi_aligned = (
+            customer_vectors.select("cliente")
+            .join(
+                pl.read_parquet(_kpi_path).select(["cliente"] + _kpi_cols),
+                on="cliente", how="left",
+            )
+            .fill_null(0.0)
+            .select(_kpi_cols)
+        )
+        _kpi_arr = np.log1p(_kpi_aligned.to_numpy().astype(np.float64))
+        _kpi_arr = (_kpi_arr - _kpi_arr.mean(axis=0)) / (_kpi_arr.std(axis=0) + 1e-8)
+        _kpi_arr = (_kpi_arr * _KPI_WEIGHT).astype(np.float32)
+        X = np.hstack([X, _kpi_arr])                 # (N, 101 + n_stores + 4)
+        _log.info("  KPI features appended: %s (weight=%.1fx)", _kpi_cols, _KPI_WEIGHT)
+    else:
+        _log.warning("customer_kpis.parquet not found — KPI features skipped")
+
     N = len(X)
 
     # Sample for fit
@@ -111,8 +161,8 @@ def reduce_umap_cluster(
     X_sample = X[sample_idx]
 
     _log.info(
-        "UMAP cluster fit: %s sample, n_neighbors=%d, n_components=%d, metric=%s ...",
-        f"{len(X_sample):,}", UMAP_N_NEIGHBORS, UMAP_CLUSTER_DIMS, UMAP_METRIC,
+        "UMAP cluster fit: %s sample, input_dims=%d, n_neighbors=%d, n_components=%d, metric=%s ...",
+        f"{len(X_sample):,}", X.shape[1], UMAP_N_NEIGHBORS, UMAP_CLUSTER_DIMS, UMAP_METRIC,
     )
     reducer = umap.UMAP(
         n_components=UMAP_CLUSTER_DIMS,

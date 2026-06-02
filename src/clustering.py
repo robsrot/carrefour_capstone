@@ -301,7 +301,8 @@ def profile_tribes(
         total_revenue  float64
         revenue_share  float32  (% of all revenue this tribe accounts for)
         avg_promo_rate float32
-        top_products   list[str]  (product descriptions, sorted by purchase frequency)
+        top_products   list[str]   (product descriptions, sorted by lift descending)
+        top_lifts      list[float] (lift scores — tribe purchase rate ÷ overall purchase rate)
 
     Cached to tribe_profiles.parquet.
     """
@@ -336,11 +337,15 @@ def profile_tribes(
         .sort("cluster")
     )
 
-    # Top products per tribe — stream df_combined, join cluster labels, aggregate
-    _log.info("  Computing top products per tribe (streaming df_combined) ...")
+    # Top products per tribe — ranked by LIFT, not raw frequency.
+    # Lift = (product's share of tribe's transactions) / (product's share of all transactions).
+    # Lift > 1 means the tribe buys that product more than a random customer would.
+    # This surfaces the products that make each tribe *distinctive*, not just universal staples.
+    _log.info("  Computing top products per tribe by lift (streaming df_combined) ...")
     combined_path = DATA_PROCESSED / "df_combined.parquet"
 
-    top_products = (
+    # Step 1: per-(cluster, product) purchase counts via streaming scan
+    raw_counts = (
         pl.scan_parquet(combined_path)
         .select(["cliente", "idarticu", "desc_larga_articulo"])
         .join(
@@ -349,13 +354,54 @@ def profile_tribes(
             how="inner",
         )
         .group_by(["cluster", "idarticu", "desc_larga_articulo"])
-        .agg(pl.len().alias("purchase_count"))
-        .sort("purchase_count", descending=True)
-        .group_by("cluster")
-        .agg(
-            pl.col("desc_larga_articulo").head(top_n_products).alias("top_products")
-        )
+        .agg(pl.len().alias("tribe_count"))
         .collect(engine="streaming")
+    )
+
+    # Step 2: overall purchase counts per product and grand total
+    overall_counts = (
+        raw_counts
+        .group_by(["idarticu", "desc_larga_articulo"])
+        .agg(pl.col("tribe_count").sum().alias("overall_count"))
+    )
+    total_purchases = int(raw_counts["tribe_count"].sum())
+
+    # Step 3: total purchases per tribe (denominator for tribe rate)
+    tribe_totals = (
+        raw_counts
+        .group_by("cluster")
+        .agg(pl.col("tribe_count").sum().alias("tribe_total"))
+    )
+
+    # Step 4: lift = (tribe_count / tribe_total) / (overall_count / total_purchases)
+    with_lift = (
+        raw_counts
+        .join(overall_counts, on=["idarticu", "desc_larga_articulo"], how="left")
+        .join(tribe_totals, on="cluster", how="left")
+        .with_columns(
+            (
+                (pl.col("tribe_count").cast(pl.Float64) / pl.col("tribe_total"))
+                / (pl.col("overall_count").cast(pl.Float64) / total_purchases)
+            ).alias("lift")
+        )
+        .filter(pl.col("tribe_count") >= 30)   # ignore products bought by fewer than 30 customers in this tribe
+    )
+
+    # Step 5: top N products per tribe sorted by lift descending
+    top_products = (
+        with_lift
+        .group_by("cluster")
+        .agg([
+            pl.col("desc_larga_articulo")
+              .sort_by(pl.col("lift"), descending=True)
+              .head(top_n_products)
+              .alias("top_products"),
+            pl.col("lift")
+              .sort(descending=True)
+              .head(top_n_products)
+              .round(2)
+              .alias("top_lifts"),
+        ])
     )
 
     profiles = kpi_profiles.join(top_products, on="cluster", how="left")
