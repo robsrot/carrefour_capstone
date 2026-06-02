@@ -124,6 +124,34 @@ def reduce_umap_cluster(
     )
     store_arr = _store_aligned.to_numpy().astype(np.float32)
     X = np.hstack([X, store_arr])                    # (N, 101 + n_stores)
+
+    # Append KPI features — spend level, visit frequency, basket size, product diversity.
+    # These capture HOW customers shop (not just WHAT they buy) and have the highest
+    # variance of any feature in the dataset (CV 1.4–10x). Without them, a VIP who
+    # shops weekly and a casual visitor who buys the same products once land in the
+    # same tribe. Log1p handles extreme right skew; z-score centres per feature;
+    # KPI_WEIGHT=3 gives ~10% total signal weight vs being drowned by 100 product dims.
+    _KPI_WEIGHT = 3.0
+    _kpi_path = DATA_PROCESSED / "customer_kpis.parquet"
+    if _kpi_path.exists():
+        _kpi_cols = ["total_spend_6m", "visit_count", "avg_basket_size", "unique_products"]
+        _kpi_aligned = (
+            customer_vectors.select("cliente")
+            .join(
+                pl.read_parquet(_kpi_path).select(["cliente"] + _kpi_cols),
+                on="cliente", how="left",
+            )
+            .fill_null(0.0)
+            .select(_kpi_cols)
+        )
+        _kpi_arr = np.log1p(_kpi_aligned.to_numpy().astype(np.float64))
+        _kpi_arr = (_kpi_arr - _kpi_arr.mean(axis=0)) / (_kpi_arr.std(axis=0) + 1e-8)
+        _kpi_arr = (_kpi_arr * _KPI_WEIGHT).astype(np.float32)
+        X = np.hstack([X, _kpi_arr])                 # (N, 101 + n_stores + 4)
+        _log.info("  KPI features appended: %s (weight=%.1fx)", _kpi_cols, _KPI_WEIGHT)
+    else:
+        _log.warning("customer_kpis.parquet not found — KPI features skipped")
+
     N = len(X)
 
     # Sample for fit
