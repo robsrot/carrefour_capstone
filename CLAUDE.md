@@ -1,330 +1,260 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code, Codex, and other coding agents working in this repository.
 
-## Project Overview
+## Product Mandate
 
-**Carrefour Data Challenge**: End-to-end behavioral customer segmentation pipeline that discovers "organic tribes" (customer clusters) from raw purchase ticket data using machine learning.
+This project builds a product-first customer segmentation pipeline for Carrefour checkout data. The segmentation must be based on purchase behavior, especially the products customers buy and the product combinations they repeat. Do not use demographic attributes.
 
-### Scope & Constraints
-- **NO demographic attributes**: Segmentation is purely behavior-driven (purchase history), not demographic profiling
-- **Scale**: 1.48M unique customers across 6 months of transaction data (191M transaction lines)
-- **Infrastructure requirements**: Distributed computing (Spark/Dask) and GPU acceleration mandatory for production scale
-- **Empirical approach**: The project brief discourages PCA and K-Means, but the methodology is to **run both and let the data decide**. We run a naive baseline (PCA + K-Means) alongside the prescribed pipeline (UMAP + HDBSCAN) and present quantitative evidence for why one outperforms the other. This is more rigorous than rule-following.
+The final deliverable is not just a clustering table. It is a commercially interpretable set of customer tribes, each named and explained through distinctive products, product categories, basket missions, promo behavior, store affinity, and business KPIs.
 
-### 4-Phase Pipeline Architecture
+## Current Snapshot
 
-1. **Phase 1 — Product Embedding** (Word2Vec/Item2Vec)
-   - Treat each shopping cart as a "sentence" and products as "words"
-   - Output: Dense vector representation per product, encoding co-purchase context (e.g., "Beer" and "Chips" geometrically close)
+Status as of 2026-06-05:
 
-2. **Phase 2 — Customer Mathematization** (Behavior Aggregation)
-   - Aggregate each customer's full purchase history into a single behavioral vector
-   - **Critical**: Use frequency-weighted + time-decay aggregation (NOT simple mean)
-   - Recent purchases carry more weight than older purchases
-   - Also run simple mean as a baseline to demonstrate the signal loss
+| Area | Status |
+|---|---|
+| Raw conversion | CSV-to-Parquet path exists in `src.data_loader`. |
+| Data quality | `data/processed/quality_report.json` exists and passes 8/8 checks. |
+| Production preprocessing | `data/processed/df_combined.parquet` and `customer_kpis.parquet` exist. |
+| Dev subset | `data/dev/df_combined.parquet` exists: 44,000 customers, 7,490,843 rows. |
+| Dev ML pipeline | Completed through embeddings, customer vectors, UMAP/PCA, HDBSCAN, K-Means baselines, and plots. |
+| Prod ML pipeline | Not yet run end-to-end after the current pipeline updates. |
+| Tribe profiles | `profile_tribes()` exists, but cached tribe profile outputs are not present yet. |
+| Tribe naming | Config stub exists, but no `src/tribe_namer.py` implementation exists yet. |
 
-3. **Phase 3 — Dimensionality Reduction** (with empirical comparison)
-   - **Primary**: UMAP — preserves non-linear topology, better for density-based clustering
-   - **Baseline**: PCA — linear, fast, interpretable; run it and measure whether it loses structure
-   - Comparison metric: silhouette score and visual coherence of downstream clusters
+Important current metrics:
 
-4. **Phase 4 — Customer Clustering** (with empirical comparison)
-   - **Primary**: HDBSCAN — density-based, no predefined K, handles irregular shapes and outliers
-   - **Baseline**: K-Means — run with K = number of HDBSCAN tribes found, for a fair comparison
-   - Comparison metrics: silhouette score, Davies-Bouldin index, tribe interpretability (top products)
+- Full raw ticket rows: 191,017,715.
+- Full unique customers: 1,482,715.
+- Customers eligible after `min_tickets_per_customer=3`: about 1.085M.
+- Product coverage: 100% of ticket product IDs covered by the product master.
+- Promo split: 77.64% no promo, 22.36% promo.
+- Dev Word2Vec vocabulary: 55,974 products.
+- Dev weighted customer vectors: 43,998 customers.
+- Dev HDBSCAN configured result: 4 non-noise clusters, 1,843 noise customers, silhouette 0.6325, Davies-Bouldin 0.4591.
+- Dev K-Means baselines: K=8/12/15/18 generated; K=8 has the best silhouette among those baselines at 0.4301.
 
----
+Do not treat the HDBSCAN result as final simply because the silhouette score is higher. The next selection gate is product-level interpretability: top-product lift, segment distinctiveness, stability, and business actionability.
 
-## Environment & Setup
+## Pipeline Architecture
 
-### Prerequisites
-- **Conda** (Miniconda or Anaconda)
-- Python 3.11+
+1. Phase 0: Data quality and preprocessing
+   - Convert raw CSVs to Parquet.
+   - Validate schemas, nulls, anomalies, product coverage, temporal coverage, promo integrity, and store coverage.
+   - Build `df_combined.parquet` and customer KPIs.
 
-### Create & Activate Environment
+2. Phase 1: Product embeddings
+   - Module: `src/embeddings.py`.
+   - Treat each ticket as a sentence and each product ID as a word.
+   - Train Word2Vec / Item2Vec.
+   - Outputs: `basket_sentences.parquet`, `models/<mode>/word2vec_product.model`, `product_embeddings.parquet`.
+
+3. Phase 2: Customer vectors
+   - Module: `src/customer_vectors.py`.
+   - Primary vector: recency- and frequency-weighted mean of product embeddings.
+   - Baseline vector: simple mean.
+   - Additional behavioral fields: `promo_rate` and store spend-share features.
+   - Outputs: `customer_product_weights.parquet`, `customer_vectors_weighted.parquet`, `customer_vectors_mean.parquet`, `customer_store_features.parquet`.
+
+4. Phase 3: Dimensionality reduction
+   - Module: `src/dimensionality.py`.
+   - Primary: UMAP.
+   - Baseline: PCA.
+   - Current UMAP input is 100 product-vector dims plus promo and store features when weights are enabled.
+   - KPI feature weight is currently `0.0`, so KPIs are profiled after clustering rather than driving clusters.
+
+5. Phase 4: Clustering and profiling
+   - Module: `src/clustering.py`.
+   - Primary: HDBSCAN on UMAP embedding.
+   - Baselines: fixed-K MiniBatchKMeans.
+   - Evaluation: silhouette, Davies-Bouldin, noise rate, and product-level tribe profiles.
+   - Top products are ranked by lift, not raw frequency, inside `profile_tribes()`.
+
+## Repository Map
+
+```text
+configs/       Dev/prod hyperparameters
+data/          Local raw, processed, and dev artifacts; do not commit data
+docs/          Current status, roadmap, and original project context
+models/        Local Word2Vec models; do not commit models
+notebooks/     Ordered notebooks for exploration, preprocessing, and ML pipeline
+outputs/       Local plots; do not commit outputs
+src/           Reusable pipeline code
+tests/         Reproducibility, loader, and quality tests
+```
+
+## Setup and Operating Commands
+
+Create the environment:
+
 ```bash
 conda env create -f environment.yml
 conda activate carrefour
-```
-
-### Register Jupyter Kernel (one-time only)
-```bash
 python -m ipykernel install --user --name=carrefour --display-name "Python (carrefour)"
 ```
-This makes the `carrefour` environment available in Jupyter and VS Code.
 
-### One-Time Data Setup
+Convert raw data:
 
-**Step 1 — Convert CSVs to Parquet** (5–15 min; safe to re-run):
 ```python
-from src.data_loader import convert_csv_to_parquet
+from src.data_loader import verify_csv_checksums, convert_csv_to_parquet
+
+verify_csv_checksums()
 convert_csv_to_parquet()
 ```
 
-**Step 2 — Record CSV checksums** (once, on the machine with the canonical files):
+Run the production quality report:
+
 ```python
-from src.data_loader import verify_csv_checksums
-verify_csv_checksums(record=True)
-# Copy the printed digests into _CSV_CHECKSUMS in src/data_loader.py and commit.
+from src.data_quality import build_quality_report
+
+build_quality_report(force=False)
 ```
-On every other machine, run `verify_csv_checksums()` (without `record=True`) before converting — raises `RuntimeError` if the files differ from the canonical copy.
 
-**Step 3 — Run notebook 02 in prod mode** to build `data/processed/df_combined.parquet` and `customer_kpis.parquet`.
+Generate the dev subset after production preprocessing exists:
 
-**Step 4 — Generate the dev subset** (once, after Step 3):
 ```powershell
 $env:CARREFOUR_MODE = "prod"
 python -m src.generate_dev_subset
 ```
-Creates `data/dev/df_combined.parquet` (44k-customer stratified subset) and `data/dev/subset_metadata.json`. Pass `--force` to regenerate, `--target-size N` to change the subset size.
 
----
-
-## Data Files & Structure
-
-### Raw Data (`data/raw/`)
-Place these two CSV files in `data/raw/csv/` after cloning:
-
-| File | Schema | Size | Purpose |
-|---|---|---|---|
-| `ie_maestra_articulos.csv` | idarticu, desc_larga_articulo, idsector, desc_sector | ~900k rows | Product master (article catalogue) |
-| `ie_linea_ticket.csv` | idempres, fecha, hora, ticket, cliente, idarticu, unidades, importe, idpromoc, idtiprod | ~191M rows | Transactional ticket lines (transactions) |
-
-### Directory Layout
-```
-data/
-├── raw/
-│   ├── csv/          ← place original CSV files here
-│   └── parquet/      ← auto-generated by conversion step
-├── processed/        ← full-run (prod) pipeline artifacts
-└── dev/              ← dev-mode artifacts (44k-customer stratified subset)
-
-models/
-├── dev/              ← dev-mode Word2Vec model
-└── prod/             ← prod Word2Vec model (generated on first prod run)
-
-outputs/
-├── dev/              ← dev visualisations
-└── prod/             ← prod visualisations
-```
-
-### Data Loading
-Use `src/data_loader.py`:
-```python
-from src.data_loader import load_maestra_articulos, load_linea_tickets, peek
-
-# Full load
-df_products = load_maestra_articulos()
-df_tickets = load_linea_tickets()
-
-# Preview (first N rows only, no full load)
-peek("maestra_articulos", n=5)
-peek("linea_tickets", n=5)
-
-# Load subset of columns (memory-efficient)
-df_tickets = load_linea_tickets(columns=["cliente", "idarticu", "importe"])
-```
-
-**Key facts from EDA**:
-- 1,482,715 unique customers
-- 117,701 unique products (mapped in master to 893k SKUs)
-- 20,026,724 unique tickets
-- 6 months of data (2022-01-01 to 2022-06-30)
-- 4 stores (idempres: 2, 7, etc.)
-- 77.6% non-promotional, 22.4% promotional lines
-
----
-
-## Common Development Tasks
-
-### Running the Exploration Notebook
-```bash
-jupyter notebook notebooks/01_exploration.ipynb
-```
-This notebook covers data loading, schema validation, join key integrity checks, and preliminary data cleaning (fecha/hora formatting, orphaned product detection, negative quantities/prices).
-
-### Adding New Code
-- Create new `.py` modules in `src/` for reusable components (embeddings, aggregation, clustering)
-- Use absolute imports: `from src.module_name import function`
-- Notebooks should import from `src/` rather than duplicating code
-
-### Working with Large Datasets
-- Use `src.data_loader.peek()` to preview without full memory load
-- Load only necessary columns: `load_linea_tickets(columns=["cliente", "idarticu"])`
-- PyArrow Parquet reader streams in 256MB chunks (see `data_loader.py` for details)
-
----
-
-## Tech Stack
-
-| Component | Technology | Purpose |
-|---|---|---|
-| **Data Format** | Parquet (PyArrow) | Efficient columnar storage; streaming reader for large files |
-| **Data Processing** | Pandas, NumPy | EDA, aggregation, transformations |
-| **Visualization** | Matplotlib, Seaborn | Exploratory plots |
-| **Embeddings** | TBD (Word2Vec/gensim, spaCy, or custom) | Phase 1 — product vectors |
-| **Dimensionality Reduction** | Scikit-learn, UMAP, Autoencoders (TensorFlow/PyTorch) | Phase 3 |
-| **Clustering** | HDBSCAN (scikit-learn or hdbscan package) | Phase 4 |
-| **Distributed Computing** | Spark / Dask (TBD) | Production scale processing |
-| **Notebook Environment** | Jupyter | Interactive development & analysis |
-
----
-
-## Deliverable
-
-The final output is an **interpretable map of named customer tribes**, each commercially described by dominant purchase behaviors — ready to power targeting, personalisation, and retail strategy at Carrefour scale.
-
-Concretely this means:
-- A labeled clustering of the 1.48M customers into organic tribes (no predefined K)
-- Each tribe commercially named and described (not just "Cluster 4")
-- Each tribe profiled by: dominant product categories, avg basket size, visit frequency, promo sensitivity, and total revenue contribution
-- A visual map (2D UMAP) showing the tribe landscape
-
----
-
-## Differentiation Strategy
-
-Every team receives the same brief and the same prescribed pipeline. The following extensions move beyond the baseline and are designed to impress a jury looking for originality, business applicability, and technical depth. Implement these on top of — not instead of — the required 4-phase pipeline.
-
-### 1. Temporal tribe evolution
-Build customer vectors across **three time windows** (Jan–Feb, Mar–Apr, May–Jun) and run clustering on each. Track which customers migrate between tribes across windows. This answers a question the brief doesn't ask: are tribes stable or seasonal? Carrefour can act on stable high-value tribes very differently from volatile ones. No other team will likely do this.
-
-### 2. Promotion sensitivity dimension
-The `idpromoc` column (present on every transaction line) encodes whether each purchase was promotional. Weave a **promo-sensitivity score** into Phase 2 aggregation — not just what a customer buys, but whether they habitually buy on promotion. This naturally produces commercially distinct tribes: "brand loyalists" vs. "promo surfers." Teams that ignore this column miss a major behavioral axis.
-
-### 3. LLM-powered tribe naming
-After clustering, take the top 30–50 products (by frequency) per cluster and call the Claude API to generate a commercial tribe name and a one-paragraph business description. Output: instead of "Cluster 4: [product IDs]" the jury sees *"The Conscious Family Shopper — weekly organic produce, private-label dairy, fresh fish; low promo sensitivity, high basket consistency."* This transforms math into finished business intelligence with minimal extra effort. See `src/tribe_namer.py` (to be created).
-
-### 4. Interactive UMAP visualization
-Render the 2D UMAP scatter with **Plotly or Bokeh**: hover tooltip shows customer's top 5 products, color = cluster, point size = total 6-month spend. Every other team will show a static matplotlib scatter. An interactive, explorable map reads as a real product to a jury, not a student notebook.
-
-### 5. Tribe CLV overlay
-After clustering, compute per-tribe KPIs: avg basket size, visit frequency, promo sensitivity rate, and total 6-month revenue. Rank tribes by revenue contribution and flag high-value + high-stability tribes as the primary targeting recommendation. This gives the jury a direct answer to "so what does Carrefour do with this?"
-
-### Recommended priority
-If time is limited, implement in this order: **temporal evolution → LLM naming → interactive viz**. Temporal dynamics is the most analytically original; LLM naming makes the output presentation-ready; interactive viz makes the jury feel they're looking at a real product.
-
----
-
-## Important Notes for Future Instances
-
-1. **No demographic data**: The dataset is already anonymized (customer IDs are hashed); focus purely on purchase behavior patterns.
-
-2. **Memory constraints**: The full `linea_tickets` dataset is 191M rows. Always preview with `peek()` before full loads; use column subsetting when possible.
-
-3. **Join integrity**: Before merging product master with tickets, run the quality checks shown in `01_exploration.ipynb` (duplicate keys, orphaned products, negative values).
-
-4. **Frequency weighting**: Phase 2 requires habitual/recurring purchases to outweigh one-offs. Implement time-decay curves (recent > old) and purchase frequency aggregation. Also run simple mean as a baseline to show what signal is lost.
-
-5. **Empirical comparison**: Run PCA + K-Means as a naive baseline alongside UMAP + HDBSCAN. Measure both with silhouette score, Davies-Bouldin index, and qualitative tribe coherence. Present findings honestly — the goal is evidence, not confirmation of a prior belief.
-
----
-
-## Configuration
-
-All hyperparameters live in `configs/base.yaml` (prod values) and `configs/dev.yaml` (dev overrides). `src/config.py` is a loader — do not hardcode values there.
-
-### Mode switching
+Run the ML notebook in dev mode:
 
 ```powershell
-# Dev mode — uses data/dev/, models/dev/, fast parameters
 $env:CARREFOUR_MODE = "dev"
-jupyter notebook notebooks/03_ml_pipeline.ipynb
-
-# Prod mode (default when env var is absent)
 jupyter notebook notebooks/03_ml_pipeline.ipynb
 ```
 
-### What changes between modes
+Run the ML notebook in prod mode:
 
-| Setting | Dev | Prod |
-|---|---|---|
-| `DATA_PROCESSED` | `data/dev/` | `data/processed/` |
-| `MODELS` | `models/dev/` | `models/prod/` |
-| `HDBSCAN_MIN_CLUSTER_SIZE` | 500 | 5000 |
-| `UMAP_FIT_SAMPLE` | 30k | 300k |
-| `W2V_EPOCHS` | 5 | 10 |
+```powershell
+$env:CARREFOUR_MODE = "prod"
+jupyter notebook notebooks/03_ml_pipeline.ipynb
+```
 
-### Reproducibility contract
+Run tests:
 
-Two clean runs on identical data and code — including across devices and fully cleared caches — produce **bit-exact identical outputs** unconditionally. No mode flags required.
+```bash
+pytest
+```
 
-Every source of nondeterminism has been eliminated:
+## Configuration Rules
 
-| Source | Fix |
+All hyperparameters live in YAML:
+
+- `configs/base.yaml`: production defaults.
+- `configs/dev.yaml`: dev overrides.
+- `src/config.py`: loader and exported constants only.
+
+Do not hardcode config values inside notebooks or modules. When adding a hyperparameter:
+
+1. Add it to `configs/base.yaml`.
+2. Add a dev override only if needed in `configs/dev.yaml`.
+3. Export it through `src/config.py`.
+4. Import the exported constant in the relevant module.
+5. Update the docs if the operating behavior changes.
+
+## Modes and Artifact Paths
+
+`CARREFOUR_MODE` controls where generated artifacts are read and written:
+
+| Mode | `DATA_PROCESSED` | `MODELS` | `OUTPUTS` |
+|---|---|---|---|
+| `dev` | `data/dev/` | `models/dev/` | `outputs/dev/` |
+| `prod` | `data/processed/` | `models/prod/` | `outputs/prod/` |
+
+Prod is the default when `CARREFOUR_MODE` is unset.
+
+## Naming Conventions
+
+- Source modules are lowercase snake_case under `src/`.
+- Notebook names stay numeric and ordered: `01_*`, `02_*`, `03_*`.
+- Pipeline caches use descriptive snake_case names.
+- Mode-specific outputs must go through `src.config.DATA_PROCESSED`, `MODELS`, and `OUTPUTS`.
+- Do not write generated artifacts to hardcoded `data/dev` or `data/processed` paths inside pipeline code.
+
+Known naming mismatch:
+
+- `umap_cluster_20d.parquet` and `pca_cluster_20d.parquet` are historical filenames.
+- The active config currently uses `cluster_dims: 50`, so these files contain 50 dimensions in current runs.
+- If you rename these artifacts, migrate all references in `src/dimensionality.py`, `src/clustering.py`, notebooks, docs, and any cached output assumptions in one deliberate change.
+
+## Cache Invalidation Rules
+
+Pipeline stages are cached aggressively. When changing upstream logic, rebuild affected downstream caches with `force=True` or delete only the relevant generated artifacts.
+
+Use this dependency chain:
+
+```text
+df_combined
+-> basket_sentences
+-> word2vec_product.model
+-> product_embeddings
+-> customer_product_weights
+-> customer_vectors_weighted / customer_vectors_mean / customer_store_features
+-> umap_cluster / pca_cluster
+-> cluster labels
+-> tribe profiles
+-> visualizations and naming
+```
+
+Examples:
+
+- Change Word2Vec settings: rebuild embeddings, customer vectors, dimensionality reduction, clusters, profiles, plots.
+- Change recency half-life: rebuild interaction weights, customer vectors, dimensionality reduction, clusters, profiles, plots.
+- Change feature weights for UMAP input: rebuild UMAP/PCA if relevant, clusters, profiles, plots.
+- Change HDBSCAN or K-Means parameters: rebuild cluster labels, profiles, plots.
+
+## Reproducibility Contract
+
+The current repo is designed for deterministic dev/prod runs on identical data and code.
+
+| Source of nondeterminism | Guardrail |
 |---|---|
-| gensim thread-race | `W2V_WORKERS=1` in `configs/base.yaml` |
-| UMAP pynndescent NN graph parallelism | `n_jobs=1` in `reduce_umap_cluster()` and `reduce_umap_viz()` |
-| HDBSCAN mutual reachability graph parallelism | `n_jobs=1` in `cluster_hdbscan()` |
-| kNN label propagation parallelism | `n_jobs=1` in `NearestNeighbors` |
-| Polars `group_by` row order (baskets) | `.sort("ticket")` before caching `basket_sentences.parquet` |
-| Polars `group_by` row order (interactions) | `.sort(["cliente","idarticu"])` before caching `customer_product_weights.parquet` |
-| Polars Categorical assignment order (vectors) | `.sort("cliente")` on `_aggregate_vectors()` output |
-| All stochastic algorithm operations | `random_state=RANDOM_SEED` or `np.random.default_rng(RANDOM_SEED)` throughout |
+| Word2Vec thread race | `W2V_WORKERS=1` |
+| Python randomized hash | custom stable hash in `src.embeddings._stable_hash` |
+| UMAP nearest-neighbor graph | `n_jobs=1` and fixed `RANDOM_SEED` |
+| HDBSCAN / kNN parallel order | `n_jobs=1` |
+| Polars group order | explicit `.sort(...)` before cached outputs |
+| Sampling | `np.random.default_rng(RANDOM_SEED)` |
 
-**Performance note**: `W2V_WORKERS=1` and `n_jobs=1` mean embedding training and UMAP/HDBSCAN run single-threaded. This is slower than the original parallel settings but is the correct tradeoff for a capstone where reproducibility of results is non-negotiable.
+Do not weaken these guardrails unless speed matters more than bit-exact reproducibility and the docs/tests are updated to say so.
 
-### Rules
+## Memory and Performance Rules
 
-- **Never do positional joins** — always `join(on="cliente")`. Polars does not guarantee row order after `collect()` or `group_by()`.
-- To add a new hyperparameter: add it to `configs/base.yaml`, expose it in `src/config.py`, import it in the relevant module.
-- Secrets (`ANTHROPIC_API_KEY`) live in `.env` only — never in YAML or Python source.
+The raw ticket data is large enough to punish casual full scans.
 
----
+- Use Polars lazy scans for large Parquet reads.
+- Use `.collect(engine="streaming")` when scanning `df_combined.parquet` or raw ticket Parquet.
+- Prefer column selection before joins/grouping.
+- Avoid `n_unique()` inside large `group_by` aggregations; use `approx_n_unique()` when exact cardinality is not required.
+- Cache expensive per-customer and per-product results to Parquet.
+- Never load raw `ie_linea_ticket.csv` directly once Parquet conversion exists.
 
-## Git & Branch Convention
+## Product-First Segmentation Rules
 
-- Main development branch: `dev`
-- `.gitignore` excludes data files (CSVs, Parquets, pickles), large models, and outputs
-- Safe to commit: `.py` files, notebooks (`.ipynb`), docs, environment files
-- Never commit: raw data, trained models, output artifacts
+The central question is: can we find meaningful customer segments from products bought?
 
----
+Use these rules when interpreting or changing the pipeline:
 
-## Active Sprint
+- Product embeddings are the core signal.
+- KPIs such as spend, visits, and basket size should usually be profiled after clustering, not used to create the clusters.
+- Promo and store affinity are behavioral signals, but they can dominate topology. Run product-only ablations before selecting the final segmentation.
+- Use product lift to name tribes. Raw top products mostly reveal universal staples.
+- Do not choose a final model from silhouette alone. A lower-silhouette model with cleaner product stories can be better for the capstone.
 
-7-day MVP execution plan (May 27 – June 3): `docs/MVP_EXECUTION_PLAN.md`
-Team prompt guide and session templates: `docs/AGENT_PROMPTS.md`
+The current next-step plan is documented in [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
----
+## Git and Commit Rules
 
-## Current Project Status
+- Main development branch: `dev`.
+- Safe to commit: source code, notebooks, docs, configs, tests, environment files.
+- Never commit: raw CSVs, Parquet artifacts, trained models, plots, `.env`, or secrets.
+- Before pushing, check:
 
-- **Phase**: Initial EDA and data pipeline foundation
-- **Completed**: Data loader, CSV-to-Parquet conversion, exploration notebook with schema validation, full MVP pipeline notebook (EDA sections 0–4)
-- **Next steps**: Implement Phase 1 (product embeddings), Phase 2 (customer vectors), Phase 3 & 4 (dimensionality reduction + clustering)
+```bash
+git status --short
+pytest
+```
 
----
-
-## Notebook Memory & Performance Rules (`02_pre-analysis.ipynb`)
-
-WSL2 has 23 GB RAM. The raw transaction parquet (`df_combined.parquet`) is 5.7 GB on disk and expands ~10–15× in memory. **All `.collect()` calls in this notebook must use `engine="streaming"`** — this processes 190M rows in micro-batches instead of loading everything at once.
-
-### Rules for every new cell that scans a large parquet
-
-1. **Always use `collect(engine="streaming")`** — never bare `.collect()` on any lazy frame backed by `df_combined.parquet` or the raw `linea_tickets` parquet.
-
-2. **Avoid `n_unique()` in `group_by` aggregations** — use `approx_n_unique()` instead (HyperLogLog, ~1% error, O(1) memory per group vs. O(cardinality)). This is the single largest memory multiplier. `n_unique()` in a `select()` context (global count) is fine.
-
-3. **Cache expensive results to parquet** — if a cell produces a per-customer or per-product DataFrame, save it to `data/processed/<name>.parquet` and add a cache guard at the top of the cell:
-   ```python
-   _cache_path = DATA_PROCESSED / "<name>.parquet"
-   if _cache_path.exists():
-       result = pd.read_parquet(_cache_path)
-   else:
-       # ... compute ...
-       result.to_parquet(_cache_path, index=False)
-   ```
-   Currently cached: `customer_kpis.parquet` (1.48M rows, all 5 per-customer KPIs from Section 4.1).
-
-### Cells already patched
-
-| Cell ID | Section | Fix applied |
-|---|---|---|
-| `bc875ce1` | 1 — Data Inventory | `engine="streaming"` + `approx_n_unique()` on `cliente`, `ticket`, `idarticu` |
-| `9297a1f8` | 3.1 — Pre-merge audit | `engine="streaming"` |
-| `51331888` | 3.2 — Filter + join + stats | `engine="streaming"` |
-| `8d29141b` | 3.3 — Post-merge verification | `engine="streaming"` (`sink_parquet` was already streaming) |
-| `bd862d2b` | 4.1 — Customer KPI distributions | `engine="streaming"` + `approx_n_unique()` + parquet cache |
-| `ded50592` | 4.2 — Promo sensitivity | `engine="streaming"` |
+If tests cannot run because local data is unavailable or the environment is incomplete, state that clearly in the handoff.
