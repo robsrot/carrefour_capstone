@@ -22,8 +22,8 @@ Outputs:
   data/dev/subset_metadata.json          — sampling params, strata counts, KS results
 
 Usage:
-  python scripts/generate_dev_subset.py
-  python scripts/generate_dev_subset.py --target-size 44000 --force
+  python -m src.generate_dev_subset
+  python -m src.generate_dev_subset --target-size 44000 --force
 """
 from __future__ import annotations
 

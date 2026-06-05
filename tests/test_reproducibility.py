@@ -29,6 +29,14 @@ def test_w2v_workers_is_1():
     )
 
 
+def test_word2vec_uses_stable_hash_function():
+    """Python's built-in hash is process-randomized unless PYTHONHASHSEED is set."""
+    from src.embeddings import _stable_hash
+
+    assert _stable_hash("product_123") == _stable_hash("product_123")
+    assert _stable_hash("product_123") != _stable_hash("product_456")
+
+
 def test_mode_is_valid():
     from src.config import MODE
     assert MODE in ("dev", "prod")
@@ -77,12 +85,13 @@ def test_clustering_imports_without_error():
 def test_proportional_sample_is_deterministic(tiny_kpis_df):
     """Same seed + same strata → identical customer list on both calls."""
     from src.config import RANDOM_SEED
-    from scripts.generate_dev_subset import _proportional_sample, _assign_strata
+    from src.generate_dev_subset import _proportional_sample, _assign_strata
 
     kpis = tiny_kpis_df.copy()
     # Build a minimal store_counts Series (all single-store)
     store_counts = pd.Series(1, index=kpis["cliente"].values)
-    kpis["stratum"] = _assign_strata(kpis, store_counts)
+    sector_bins = pd.Series("grocery_pgc", index=kpis["cliente"].values)
+    kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
 
     target = 60
     rng1 = np.random.default_rng(RANDOM_SEED)
@@ -97,11 +106,12 @@ def test_proportional_sample_is_deterministic(tiny_kpis_df):
 
 def test_proportional_sample_different_seeds_differ(tiny_kpis_df):
     """Different seeds must produce different samples (validates that seed matters)."""
-    from scripts.generate_dev_subset import _proportional_sample, _assign_strata
+    from src.generate_dev_subset import _proportional_sample, _assign_strata
 
     kpis = tiny_kpis_df.copy()
     store_counts = pd.Series(1, index=kpis["cliente"].values)
-    kpis["stratum"] = _assign_strata(kpis, store_counts)
+    sector_bins = pd.Series("grocery_pgc", index=kpis["cliente"].values)
+    kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
 
     target = 60
     ids1 = _proportional_sample(kpis, target, np.random.default_rng(42))
@@ -113,11 +123,12 @@ def test_proportional_sample_different_seeds_differ(tiny_kpis_df):
 def test_proportional_sample_covers_all_strata(tiny_kpis_df):
     """Every populated stratum must contribute at least one customer."""
     from src.config import RANDOM_SEED
-    from scripts.generate_dev_subset import _proportional_sample, _assign_strata
+    from src.generate_dev_subset import _proportional_sample, _assign_strata
 
     kpis = tiny_kpis_df.copy()
     store_counts = pd.Series(1, index=kpis["cliente"].values)
-    kpis["stratum"] = _assign_strata(kpis, store_counts)
+    sector_bins = pd.Series("grocery_pgc", index=kpis["cliente"].values)
+    kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
 
     # Sample 50% of the population — every stratum should be represented
     target = len(kpis) // 2

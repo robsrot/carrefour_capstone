@@ -5,10 +5,21 @@ word2vec:
   epochs: 5      # faster iteration on dev subset
 
 umap:
-  n_neighbors: 15    # smaller dataset needs fewer neighbours for a good manifold
-  fit_sample: 30000  # 30k is sufficient for 44k-customer dev subset
+  cluster_dims: 50
+  n_neighbors: 50
+  min_dist_cluster: 0.05
+  min_dist_viz: 0.1
+  fit_sample: 50000
 
 hdbscan:
   min_cluster_size: 500   # ~1% of 44k dev customers → meaningful tribes without collapsing
   fit_sample: 10000
   silhouette_sample: 10000
+
+hdbscan_grid:
+  min_cluster_size: [100, 250, 500, 1000]
+  min_samples: [5, 10, 25]
+  cluster_method: [eom, leaf]
+
+kmeans:
+  baseline_clusters: [8, 12, 15, 18]

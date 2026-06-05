@@ -65,6 +65,9 @@ W2V_WORKERS     = _cfg["word2vec"]["workers"]
 
 # ── Customer vectors ───────────────────────────────────────────────────────────
 RECENCY_HALFLIFE_DAYS = _cfg["customer_vectors"]["recency_halflife_days"]
+FEATURE_WEIGHT_PROMO  = float(_cfg["feature_weights"]["promo"])
+FEATURE_WEIGHT_STORE  = float(_cfg["feature_weights"]["store"])
+FEATURE_WEIGHT_KPI    = float(_cfg["feature_weights"]["kpi"])
 
 # ── UMAP ───────────────────────────────────────────────────────────────────────
 UMAP_CLUSTER_DIMS     = _cfg["umap"]["cluster_dims"]
@@ -82,6 +85,13 @@ HDBSCAN_METRIC           = _cfg["hdbscan"]["metric"]
 HDBSCAN_CLUSTER_METHOD   = _cfg["hdbscan"]["cluster_method"]
 HDBSCAN_FIT_SAMPLE       = _cfg["hdbscan"]["fit_sample"]
 SILHOUETTE_SAMPLE        = _cfg["hdbscan"]["silhouette_sample"]
+HDBSCAN_GRID_MIN_CLUSTER_SIZE = _cfg["hdbscan_grid"]["min_cluster_size"]
+HDBSCAN_GRID_MIN_SAMPLES      = _cfg["hdbscan_grid"]["min_samples"]
+HDBSCAN_GRID_CLUSTER_METHOD   = _cfg["hdbscan_grid"]["cluster_method"]
+KMEANS_BASELINE_CLUSTERS      = _cfg["kmeans"]["baseline_clusters"]
+KMEANS_BATCH_SIZE             = _cfg["kmeans"]["batch_size"]
+KMEANS_N_INIT                 = _cfg["kmeans"]["n_init"]
+KMEANS_MAX_ITER               = _cfg["kmeans"]["max_iter"]
 
 # ── Temporal windows (ISO dates, inclusive) ────────────────────────────────────
 TIME_WINDOWS = {

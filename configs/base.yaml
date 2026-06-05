@@ -14,11 +14,16 @@ word2vec:
 customer_vectors:
   recency_halflife_days: 60   # 30 was too aggressive for a 6-month window
 
+feature_weights:
+  promo: 1.0  # Keep promo sensitivity as a light behavioral signal.
+  store: 1.0  # Keep store affinity, but do not let it dominate product mix.
+  kpi: 0.0    # Main clustering signal should be product type; KPIs are profiled after.
+
 umap:
-  cluster_dims: 20
+  cluster_dims: 50
   viz_dims: 2
-  n_neighbors: 30
-  min_dist_cluster: 0.0   # 0.0 preserves tighter local structure for clustering
+  n_neighbors: 50
+  min_dist_cluster: 0.05   # 0.0 preserves tighter local structure for clustering
   min_dist_viz: 0.1
   metric: cosine
   fit_sample: 300000       # fit on sample → transform full population (O(n) for transform)
@@ -30,6 +35,17 @@ hdbscan:
   cluster_method: eom
   fit_sample: 100000       # max customers for exact HDBSCAN fit; rest assigned via kNN
   silhouette_sample: 50000 # silhouette is O(n²) — sample for tractability
+
+hdbscan_grid:
+  min_cluster_size: [500, 1000, 2500, 5000]
+  min_samples: [5, 10, 25]
+  cluster_method: [eom, leaf]
+
+kmeans:
+  baseline_clusters: [12, 15, 18, 20]
+  batch_size: 10000
+  n_init: 5
+  max_iter: 300
 
 tribe_namer:
   model: claude-haiku-4-5-20251001

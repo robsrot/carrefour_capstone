@@ -14,6 +14,7 @@ sanity_check()            → prints nearest-neighbour table to stdout
 from __future__ import annotations
 
 import logging
+import hashlib
 from pathlib import Path
 
 import polars as pl
@@ -36,6 +37,11 @@ _log = logging.getLogger(__name__)
 _BASKET_CACHE     = DATA_PROCESSED / "basket_sentences.parquet"
 _EMBEDDINGS_CACHE = DATA_PROCESSED / "product_embeddings.parquet"
 _MODEL_PATH       = MODELS / "word2vec_product.model"
+
+
+def _stable_hash(word: str) -> int:
+    """Deterministic hash for gensim initial weights across Python processes."""
+    return int(hashlib.blake2b(word.encode("utf-8"), digest_size=8).hexdigest(), 16)
 
 
 # ─── 1. Build basket sentences ────────────────────────────────────────────────
@@ -157,7 +163,9 @@ def train_word2vec(
     )
 
     # Reproducibility contract:
-    # seed=RANDOM_SEED guarantees determinism only when workers=1.
+    # seed=RANDOM_SEED guarantees determinism only when workers=1 and the word
+    # hash is stable. Python's built-in hash is randomized between processes, so
+    # use _stable_hash instead of relying on PYTHONHASHSEED.
     # With workers > 1, gensim threads race to update weight matrices and the
     # outcome is non-deterministic even with a fixed seed (documented gensim behaviour).
     # In dev mode W2V_WORKERS=1 (full reproducibility).
@@ -172,6 +180,7 @@ def train_word2vec(
         epochs=W2V_EPOCHS,
         workers=workers,
         seed=RANDOM_SEED,
+        hashfxn=_stable_hash,
     )
 
     model.save(str(model_path))

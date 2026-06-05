@@ -75,7 +75,7 @@ On every other machine, run `verify_csv_checksums()` (without `record=True`) bef
 **Step 4 — Generate the dev subset** (once, after Step 3):
 ```powershell
 $env:CARREFOUR_MODE = "prod"
-python scripts/generate_dev_subset.py
+python -m src.generate_dev_subset
 ```
 Creates `data/dev/df_combined.parquet` (44k-customer stratified subset) and `data/dev/subset_metadata.json`. Pass `--force` to regenerate, `--target-size N` to change the subset size.
 

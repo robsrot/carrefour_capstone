@@ -1,8 +1,8 @@
 """Phase 4 — Customer clustering and tribe profiling.
 
 Two methods are compared on the 20D UMAP embedding:
-  HDBSCAN  (primary)   — density-based, no predefined K, handles noise
-  K-Means  (baseline)  — K = n_tribes found by HDBSCAN (fair comparison)
+  HDBSCAN  (discovery) — density-based, no predefined K, handles noise
+  K-Means  (baseline)  — fixed-K runs for business-readable segment counts
 
 Scale strategy for HDBSCAN (cannot run exact on 1.48M × 20):
   1. Fit HDBSCAN on HDBSCAN_FIT_SAMPLE random customers.
@@ -14,6 +14,8 @@ Public API
 ----------
 cluster_hdbscan()   → data/processed/cluster_labels_hdbscan.parquet
 cluster_kmeans()    → data/processed/cluster_labels_kmeans.parquet
+run_kmeans_baselines() → data/processed/kmeans_baseline_results.parquet
+grid_search_hdbscan()  → data/processed/hdbscan_grid_results.parquet
 profile_tribes()    → data/processed/tribe_profiles.parquet
 
 Label schema for both:
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from itertools import product
 
 import numpy as np
 import polars as pl
@@ -40,6 +43,13 @@ from src.config import (
     HDBSCAN_METRIC,
     HDBSCAN_CLUSTER_METHOD,
     HDBSCAN_FIT_SAMPLE,
+    HDBSCAN_GRID_CLUSTER_METHOD,
+    HDBSCAN_GRID_MIN_CLUSTER_SIZE,
+    HDBSCAN_GRID_MIN_SAMPLES,
+    KMEANS_BASELINE_CLUSTERS,
+    KMEANS_BATCH_SIZE,
+    KMEANS_MAX_ITER,
+    KMEANS_N_INIT,
     SILHOUETTE_SAMPLE,
 )
 
@@ -163,18 +173,25 @@ def cluster_kmeans(
 ) -> pl.DataFrame:
     """MiniBatchKMeans on the full 1.48M customers.
 
-    K = number of non-noise HDBSCAN tribes (loaded from cache if available).
-    Uses MiniBatchKMeans so memory is O(K × dims + batch_size) not O(n).
+    If n_clusters is provided, this is a fixed-K business baseline. If omitted,
+    K is derived from the non-noise HDBSCAN tribes when available. MiniBatchKMeans
+    keeps memory O(K × dims + batch_size), not O(n).
 
     Returns
     -------
     DataFrame: cliente str | cluster int32 | promo_rate float32
-    Cached to cluster_labels_kmeans.parquet.
+    Cached to cluster_labels_kmeans.parquet or cluster_labels_kmeans_k{K}.parquet.
     """
-    if _KMEANS_CACHE.exists() and not force:
-        n = pl.scan_parquet(_KMEANS_CACHE).select(pl.len()).collect().item()
-        _log.info("K-Means cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_KMEANS_CACHE)
+    explicit_k = n_clusters is not None
+    cache = (
+        DATA_PROCESSED / f"cluster_labels_kmeans_k{int(n_clusters)}.parquet"
+        if explicit_k
+        else _KMEANS_CACHE
+    )
+    if cache.exists() and not force:
+        n = pl.scan_parquet(cache).select(pl.len()).collect().item()
+        _log.info("K-Means cache hit — %s customers (%s)", f"{n:,}", cache.name)
+        return pl.read_parquet(cache)
 
     if umap_cluster is None:
         _log.info("Loading umap_cluster_20d.parquet ...")
@@ -203,9 +220,9 @@ def cluster_kmeans(
     km = MiniBatchKMeans(
         n_clusters=n_clusters,
         random_state=RANDOM_SEED,
-        batch_size=10_000,
-        n_init=5,
-        max_iter=300,
+        batch_size=KMEANS_BATCH_SIZE,
+        n_init=KMEANS_N_INIT,
+        max_iter=KMEANS_MAX_ITER,
     )
     labels = km.fit_predict(X).astype(np.int32)
     _log.info("K-Means complete — inertia: %.2e", km.inertia_)
@@ -216,16 +233,72 @@ def cluster_kmeans(
         "promo_rate": umap_cluster["promo_rate"],
     })
 
-    _KMEANS_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_KMEANS_CACHE, compression="zstd")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
     _log.info(
         "Saved %s K-Means labels → %s",
-        f"{len(df):,}", _KMEANS_CACHE.name,
+        f"{len(df):,}", cache.name,
     )
     return df
 
 
 # ─── Cluster quality metrics ──────────────────────────────────────────────────
+
+def run_kmeans_baselines(
+    umap_cluster: pl.DataFrame | None = None,
+    *,
+    k_values: list[int] | None = None,
+    force: bool = False,
+    profile: bool = False,
+) -> pl.DataFrame:
+    """Run fixed-K MiniBatchKMeans baselines and compare cluster quality.
+
+    This is the business-readable baseline for an expected segment range such as
+    12-20 groups. HDBSCAN can still be used for density discovery, but it should
+    not be the only source of the segment count.
+    """
+    if umap_cluster is None:
+        _log.info("Loading umap_cluster_20d.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+
+    if k_values is None:
+        k_values = KMEANS_BASELINE_CLUSTERS
+
+    results: list[dict] = []
+    for k in k_values:
+        labels = cluster_kmeans(
+            umap_cluster,
+            n_clusters=int(k),
+            force=force,
+        )
+        result = evaluate_clustering(
+            umap_cluster,
+            labels,
+            method_name=f"kmeans_k{int(k)}",
+        )
+        result["requested_k"] = int(k)
+        results.append(result)
+
+        if profile:
+            profile_tribes(
+                labels,
+                method_name=f"kmeans_k{int(k)}",
+                force=force,
+            )
+
+    df = pl.DataFrame(results).select([
+        "method",
+        "requested_k",
+        "n_clusters",
+        "noise_pct",
+        "silhouette",
+        "davies_bouldin",
+    ])
+    out = DATA_PROCESSED / "kmeans_baseline_results.parquet"
+    df.write_parquet(out, compression="zstd")
+    _log.info("Saved K-Means baseline comparison → %s", out.name)
+    return df
+
 
 def evaluate_clustering(
     umap_cluster: pl.DataFrame,
@@ -277,6 +350,126 @@ def evaluate_clustering(
 
 
 # ─── Tribe profiling ──────────────────────────────────────────────────────────
+
+def _sample_metrics(
+    X: np.ndarray,
+    labels: np.ndarray,
+    *,
+    sample_size: int,
+) -> tuple[float | None, float | None]:
+    """Compute clustering metrics on non-noise rows, returning None when invalid."""
+    mask = labels >= 0
+    X_clean, lbl_clean = X[mask], labels[mask]
+    unique = np.unique(lbl_clean)
+    if len(unique) < 2 or len(lbl_clean) <= len(unique):
+        return None, None
+
+    rng = np.random.default_rng(RANDOM_SEED)
+    if len(X_clean) > sample_size:
+        idx = rng.choice(len(X_clean), sample_size, replace=False)
+        X_eval, lbl_eval = X_clean[idx], lbl_clean[idx]
+    else:
+        X_eval, lbl_eval = X_clean, lbl_clean
+
+    try:
+        sil = float(silhouette_score(X_eval, lbl_eval, metric="euclidean", sample_size=None))
+        db = float(davies_bouldin_score(X_eval, lbl_eval))
+    except ValueError:
+        return None, None
+    return round(sil, 4), round(db, 4)
+
+
+def grid_search_hdbscan(
+    umap_cluster: pl.DataFrame | None = None,
+    *,
+    min_cluster_sizes: list[int] | None = None,
+    min_samples_values: list[int] | None = None,
+    cluster_methods: list[str] | None = None,
+    target_clusters: int = 15,
+    metric_sample_size: int | None = None,
+    force: bool = False,
+) -> pl.DataFrame:
+    """Evaluate HDBSCAN hyperparameter candidates on the configured fit sample.
+
+    The grid intentionally scores only the HDBSCAN fit sample, not full-population
+    nearest-neighbour assignment. Use the winning candidate with cluster_hdbscan()
+    or update configs/base.yaml once a commercially readable option is chosen.
+    """
+    out = DATA_PROCESSED / "hdbscan_grid_results.parquet"
+    if out.exists() and not force:
+        _log.info("HDBSCAN grid cache hit — %s", out.name)
+        return pl.read_parquet(out)
+
+    if umap_cluster is None:
+        _log.info("Loading umap_cluster_20d.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+
+    if min_cluster_sizes is None:
+        min_cluster_sizes = HDBSCAN_GRID_MIN_CLUSTER_SIZE
+    if min_samples_values is None:
+        min_samples_values = HDBSCAN_GRID_MIN_SAMPLES
+    if cluster_methods is None:
+        cluster_methods = HDBSCAN_GRID_CLUSTER_METHOD
+    if metric_sample_size is None:
+        metric_sample_size = min(SILHOUETTE_SAMPLE, 10_000)
+
+    X, _ = _embedding_to_numpy(umap_cluster)
+    N = len(X)
+    rng = np.random.default_rng(RANDOM_SEED)
+    sample_idx = rng.choice(N, size=min(HDBSCAN_FIT_SAMPLE, N), replace=False)
+    sample_idx.sort()
+    X_sample = X[sample_idx]
+
+    results: list[dict] = []
+    for min_cluster_size, min_samples, cluster_method in product(
+        min_cluster_sizes,
+        min_samples_values,
+        cluster_methods,
+    ):
+        if int(min_cluster_size) >= len(X_sample):
+            continue
+
+        _log.info(
+            "HDBSCAN grid: min_cluster_size=%d, min_samples=%d, method=%s",
+            int(min_cluster_size),
+            int(min_samples),
+            str(cluster_method),
+        )
+        clusterer = HDBSCAN(
+            min_cluster_size=int(min_cluster_size),
+            min_samples=int(min_samples),
+            metric=HDBSCAN_METRIC,
+            algorithm="ball_tree",
+            cluster_selection_method=str(cluster_method),
+            n_jobs=1,
+        )
+        labels = clusterer.fit_predict(X_sample).astype(np.int32)
+        n_clusters = int(len(set(labels)) - (1 if -1 in labels else 0))
+        noise_pct = float((labels == -1).mean() * 100)
+        sil, db = _sample_metrics(
+            X_sample,
+            labels,
+            sample_size=int(metric_sample_size),
+        )
+        results.append({
+            "min_cluster_size": int(min_cluster_size),
+            "min_samples": int(min_samples),
+            "cluster_method": str(cluster_method),
+            "n_clusters": n_clusters,
+            "target_gap": abs(n_clusters - int(target_clusters)),
+            "noise_pct": round(noise_pct, 2),
+            "silhouette": sil,
+            "davies_bouldin": db,
+        })
+
+    df = (
+        pl.DataFrame(results)
+        .sort(["target_gap", "noise_pct", "davies_bouldin"], nulls_last=True)
+    )
+    df.write_parquet(out, compression="zstd")
+    _log.info("Saved HDBSCAN grid results → %s", out.name)
+    return df
+
 
 def profile_tribes(
     cluster_labels: pl.DataFrame,
