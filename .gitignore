@@ -1,11 +1,13 @@
 # DATA — never commit
 data/raw/*
 data/processed/*
+data/dev/*
 !data/raw/csv/
 !data/raw/csv/.gitkeep
 !data/raw/parquet/
 !data/raw/parquet/.gitkeep
 !data/processed/.gitkeep
+!data/dev/.gitkeep
 
 # Common data formats (safety net anywhere in repo)
 *.csv

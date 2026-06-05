@@ -102,6 +102,7 @@ def _build_interactions(
             pl.col("is_promo").sum().alias("promo_purchases"),
             pl.len().cast(pl.Int32).alias("total_purchases"),
         ])
+        .sort(["cliente", "idarticu"])                 # canonical order → deterministic Categorical assignment downstream
         .collect(engine="streaming")
     )
 
@@ -225,6 +226,7 @@ def _aggregate_vectors(
             "vector":  pl.Series(vectors.tolist(), dtype=pl.List(pl.Float32)),
         })
         .join(promo_df, on="cliente", how="left")
+        .sort("cliente")                               # explicit guarantee: downstream positional sampling is reproducible
     )
 
 

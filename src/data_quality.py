@@ -25,8 +25,12 @@ import sys
 sys.path.append(str(Path(__file__).parents[1]))
 
 from src.config import (
-    DATA_RAW, DATA_PROCESSED, MIN_TICKETS_PER_CUSTOMER, SAMPLE_SIZE
+    ROOT, DATA_RAW, MIN_TICKETS_PER_CUSTOMER, SAMPLE_SIZE
 )
+
+# quality_report.json always lives in data/processed/ — it is a prod-only artifact
+# derived from the full 1.48M-customer dataset. Never written to data/dev/.
+_PROD_PROCESSED = ROOT / "data" / "processed"
 
 # ─── Expected schema ──────────────────────────────────────────────────────────
 
@@ -339,9 +343,64 @@ def audit_stores() -> dict:
     }
 
 
-# ─── 9. Full orchestration ────────────────────────────────────────────────────
+# ─── 9. Combined single-pass for null + anomaly checks ───────────────────────
 
-def build_quality_report(verbose: bool = True) -> dict:
+def _audit_nulls_and_anomalies() -> tuple[dict, dict]:
+    """
+    Single streaming scan replacing the separate audit_nulls + audit_anomalies calls.
+    Saves one full parquet scan (~191M rows) when running a fresh report.
+    """
+    df_articles = _df_articles()
+    articles_nulls = {c: int(df_articles[c].null_count()) for c in df_articles.columns}
+    total_articles_nulls = sum(articles_nulls.values())
+    assert total_articles_nulls == 0, f"nulls found in articles: {articles_nulls}"
+
+    row = _df_tickets().select([
+        pl.len().alias("total"),
+        *[pl.col(c).null_count().alias(f"null_{c}") for c in sorted(_TICKET_COLS)],
+        (pl.col("unidades") < 0).sum().alias("negative_unidades"),
+        (pl.col("unidades") == 0).sum().alias("zero_unidades"),
+        (pl.col("unidades") > 1_000).sum().alias("extreme_unidades_gt1000"),
+        (pl.col("importe") < 0).sum().alias("negative_importe"),
+        (pl.col("importe") == 0).sum().alias("zero_importe"),
+        (pl.col("importe") > 10_000).sum().alias("extreme_importe_gt10k"),
+        ((pl.col("unidades") <= 0) | (pl.col("importe") <= 0)).sum().alias("dropped"),
+    ]).collect(engine="streaming").row(0, named=True)
+
+    ticket_null_counts = {c: int(row[f"null_{c}"]) for c in sorted(_TICKET_COLS)}
+    total_ticket_nulls = sum(ticket_null_counts.values())
+    assert total_ticket_nulls == 0, f"nulls found in ticket data: {ticket_null_counts}"
+
+    null_result = {
+        "articles_nulls": articles_nulls,
+        "articles_total_nulls": int(total_articles_nulls),
+        "ticket_null_counts": ticket_null_counts,
+        "ticket_total_nulls": int(total_ticket_nulls),
+    }
+
+    total   = row["total"]
+    counts  = {k: int(row[k]) for k in [
+        "negative_unidades", "zero_unidades", "extreme_unidades_gt1000",
+        "negative_importe", "zero_importe", "extreme_importe_gt10k",
+    ]}
+    dropped = row["dropped"]
+    anomaly_result = {
+        "total_rows": int(total),
+        "anomaly_counts": counts,
+        "anomaly_pcts": {k: round(v / total * 100, 4) for k, v in counts.items()},
+        "rows_dropped_by_cleaning_rule": int(dropped),
+        "rows_dropped_pct": round(dropped / total * 100, 3),
+        "rows_retained": int(total - dropped),
+        "rows_retained_pct": round((total - dropped) / total * 100, 3),
+        "cleaning_rule": "DROP unidades <= 0 OR importe <= 0",
+    }
+
+    return null_result, anomaly_result
+
+
+# ─── 10. Full orchestration ───────────────────────────────────────────────────
+
+def build_quality_report(verbose: bool = True, force: bool = False) -> dict:
     """
     Run every check in sequence. Saves a structured JSON report to
     data/processed/quality_report.json.
@@ -349,15 +408,30 @@ def build_quality_report(verbose: bool = True) -> dict:
     Returns the full report dict. Prints PASS/FAIL for each check.
     Does NOT abort on assertion failures — all checks run regardless,
     so the full picture is visible even if one gate fails.
+
+    Args:
+        force: Re-run all scans even if quality_report.json already exists.
+               Default False — returns cached JSON instantly on subsequent calls.
     """
-    DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    _PROD_PROCESSED.mkdir(parents=True, exist_ok=True)
+    out = _PROD_PROCESSED / "quality_report.json"
+
+    if not force and out.exists():
+        with open(out) as f:
+            report = json.load(f)
+        if verbose:
+            summary = report.get("_summary", {})
+            n_passed = summary.get("checks_passed", "?")
+            n_total  = summary.get("checks_total", "?")
+            print(f"Loaded quality report from cache ({out})")
+            print(f"  {n_passed}/{n_total} checks passed — pass force=True to re-run scans")
+        return report
+
     report   = {}
     results  = []
 
     checks = [
         ("schema_validation",      validate_schema),
-        ("null_audit",             audit_nulls),
-        ("anomaly_audit",          audit_anomalies),
         ("product_coverage",       check_product_coverage),
         ("temporal_completeness",  check_temporal_completeness),
         ("customer_activity",      audit_customer_activity),
@@ -369,6 +443,34 @@ def build_quality_report(verbose: bool = True) -> dict:
         print("=" * 65)
         print("  DATA QUALITY REPORT — Carrefour Segmentation Pipeline")
         print("=" * 65)
+
+    # null_audit + anomaly_audit share one streaming scan instead of two
+    if verbose:
+        print("\n[null_audit + anomaly_audit]  (single combined scan)")
+    try:
+        null_result, anomaly_result = _audit_nulls_and_anomalies()
+        report["null_audit"]    = {**null_result,    "_passed": True}
+        report["anomaly_audit"] = {**anomaly_result, "_passed": True}
+        results.extend([True, True])
+        if verbose:
+            print("  [null_audit]")
+            _pretty_print(null_result)
+            print("  --> PASS")
+            print("  [anomaly_audit]")
+            _pretty_print(anomaly_result)
+            print("  --> PASS")
+    except AssertionError as e:
+        report["null_audit"]    = {"_passed": False, "_error": str(e)}
+        report["anomaly_audit"] = {"_passed": False, "_error": str(e)}
+        results.extend([False, False])
+        if verbose:
+            print(f"  --> FAIL: {e}")
+    except Exception as e:
+        report["null_audit"]    = {"_passed": False, "_error": f"UNEXPECTED: {e}"}
+        report["anomaly_audit"] = {"_passed": False, "_error": f"UNEXPECTED: {e}"}
+        results.extend([False, False])
+        if verbose:
+            print(f"  --> ERROR: {e}")
 
     for name, fn in checks:
         if verbose:
@@ -399,7 +501,7 @@ def build_quality_report(verbose: bool = True) -> dict:
         "all_passed":    n_passed == n_total,
     }
 
-    out = DATA_PROCESSED / "quality_report.json"
+    out = _PROD_PROCESSED / "quality_report.json"
     with open(out, "w") as f:
         json.dump(report, f, indent=2, default=str)
 

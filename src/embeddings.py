@@ -28,6 +28,7 @@ from src.config import (
     W2V_SG,
     W2V_VECTOR_SIZE,
     W2V_WINDOW,
+    W2V_WORKERS,
 )
 
 _log = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def build_basket_sentences(
         .group_by("ticket")
         .agg(pl.col("idarticu").alias("products"))
         .filter(pl.col("products").list.len() >= 2)   # single-item baskets yield zero co-purchase pairs
+        .sort("ticket")                                # canonical order → deterministic Word2Vec sentence sequence
         .collect(engine="streaming")
     )
     baskets.write_parquet(_BASKET_CACHE, compression="zstd")
@@ -123,7 +125,7 @@ def train_word2vec(
     basket_path: Path | None = None,
     model_path: Path | None = None,
     *,
-    workers: int = 4,
+    workers: int = W2V_WORKERS,
     force: bool = False,
 ) -> Word2Vec:
     """Train Word2Vec on the basket corpus; load from disk if already trained.
@@ -132,7 +134,7 @@ def train_word2vec(
     ----------
     basket_path : path to basket_sentences.parquet (default: DATA_PROCESSED)
     model_path  : where to save the .model file (default: MODELS)
-    workers     : parallel training threads — reduce to 2 if RAM is tight
+    workers     : parallel training threads (default: W2V_WORKERS from config)
     force       : re-train even if a cached model exists
     """
     if basket_path is None:
@@ -154,6 +156,13 @@ def train_word2vec(
         W2V_VECTOR_SIZE, W2V_WINDOW, W2V_MIN_COUNT, W2V_EPOCHS, W2V_SG, workers,
     )
 
+    # Reproducibility contract:
+    # seed=RANDOM_SEED guarantees determinism only when workers=1.
+    # With workers > 1, gensim threads race to update weight matrices and the
+    # outcome is non-deterministic even with a fixed seed (documented gensim behaviour).
+    # In dev mode W2V_WORKERS=1 (full reproducibility).
+    # In prod mode W2V_WORKERS=4 (faster; embeddings vary slightly across clean runs
+    # but downstream cluster structure is stable within stochastic variance).
     model = Word2Vec(
         sentences=corpus,
         vector_size=W2V_VECTOR_SIZE,

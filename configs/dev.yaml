@@ -1,0 +1,14 @@
+# Dev-mode overrides — only keys that differ from base.yaml.
+# Active when CARREFOUR_MODE=dev (or unset in a dev shell via $env:CARREFOUR_MODE="dev").
+
+word2vec:
+  epochs: 5      # faster iteration on dev subset
+
+umap:
+  n_neighbors: 15    # smaller dataset needs fewer neighbours for a good manifold
+  fit_sample: 30000  # 30k is sufficient for 44k-customer dev subset
+
+hdbscan:
+  min_cluster_size: 500   # ~1% of 44k dev customers → meaningful tribes without collapsing
+  fit_sample: 10000
+  silhouette_sample: 10000

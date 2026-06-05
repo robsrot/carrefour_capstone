@@ -12,9 +12,9 @@ Scale strategy for UMAP (1.48M × 100 is too large for a single fit call):
 
 Public API
 ----------
-reduce_umap_cluster()  → data/processed/umap_cluster_50d.parquet
+reduce_umap_cluster()  → data/processed/umap_cluster_20d.parquet
 reduce_umap_viz()      → data/processed/umap_viz_2d.parquet
-reduce_pca()           → data/processed/pca_cluster_50d.parquet
+reduce_pca()           → data/processed/pca_cluster_20d.parquet
 
 All functions accept a Polars DataFrame with columns [cliente, vector, promo_rate]
 and return one with [cliente, <dim columns>, promo_rate].
@@ -40,13 +40,12 @@ from src.config import (
     UMAP_MIN_DIST_CLUSTER,
     UMAP_MIN_DIST_VIZ,
     UMAP_METRIC,
+    UMAP_FIT_SAMPLE,
 )
 
 _log = logging.getLogger(__name__)
 
-# How many customers to fit UMAP on — large enough to capture density structure,
-# small enough that fit() finishes in a few minutes on 10 cores.
-UMAP_FIT_SAMPLE = 300_000   # 100k was only 6.7% of population; rare customer types were underrepresented in the learned manifold
+# UMAP_FIT_SAMPLE is loaded from config (base: 300k prod, 30k dev).
 
 _UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
 _UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
@@ -73,13 +72,13 @@ def _df_from_embedding(
     return pl.DataFrame({"cliente": cliente, **cols, "promo_rate": promo_rate})
 
 
-# ─── UMAP clustering embedding (50D) ─────────────────────────────────────────
+# ─── UMAP clustering embedding (20D) ─────────────────────────────────────────
 
 def reduce_umap_cluster(
     customer_vectors: pl.DataFrame | None = None,
     *,
     force: bool = False,
-    n_jobs: int = -1,
+    n_jobs: int = 1,
 ) -> pl.DataFrame:
     """UMAP 100D → 20D embedding for HDBSCAN clustering.
 
@@ -207,7 +206,7 @@ def reduce_umap_viz(
     umap_cluster: pl.DataFrame | None = None,
     *,
     force: bool = False,
-    n_jobs: int = -1,
+    n_jobs: int = 1,
 ) -> pl.DataFrame:
     """UMAP 20D → 2D embedding for visualisation.
 
@@ -221,7 +220,7 @@ def reduce_umap_viz(
         return pl.read_parquet(_UMAP_VIZ_CACHE)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_50d.parquet ...")
+        _log.info("Loading umap_cluster_20d.parquet ...")
         umap_cluster = pl.read_parquet(_UMAP_CLUSTER_CACHE)
 
     dim_cols = [c for c in umap_cluster.columns if c.startswith("u")]
@@ -280,7 +279,7 @@ def reduce_umap_viz(
     return df
 
 
-# ─── PCA baseline (50D) ───────────────────────────────────────────────────────
+# ─── PCA baseline (20D) ───────────────────────────────────────────────────────
 
 def reduce_pca(
     customer_vectors: pl.DataFrame | None = None,

@@ -39,14 +39,13 @@ from src.config import (
     HDBSCAN_MIN_SAMPLES,
     HDBSCAN_METRIC,
     HDBSCAN_CLUSTER_METHOD,
+    HDBSCAN_FIT_SAMPLE,
+    SILHOUETTE_SAMPLE,
 )
 
 _log = logging.getLogger(__name__)
 
-# Fit HDBSCAN on this many customers (empirically safe limit for memory/time)
-HDBSCAN_FIT_SAMPLE = 100_000
-# Evaluate silhouette on this many customers (O(n²) metric — needs sampling)
-SILHOUETTE_SAMPLE  = 50_000
+# HDBSCAN_FIT_SAMPLE and SILHOUETTE_SAMPLE are loaded from config (base: 100k/50k prod, 10k dev).
 
 _HDBSCAN_CACHE  = DATA_PROCESSED / "cluster_labels_hdbscan.parquet"
 _KMEANS_CACHE   = DATA_PROCESSED / "cluster_labels_kmeans.parquet"
@@ -110,7 +109,7 @@ def cluster_hdbscan(
         metric=HDBSCAN_METRIC,
         algorithm="ball_tree",
         cluster_selection_method=HDBSCAN_CLUSTER_METHOD,
-        n_jobs=-1,
+        n_jobs=1,
     )
     clusterer.fit(X_sample)
 
@@ -128,7 +127,7 @@ def cluster_hdbscan(
     rest_idx = np.setdiff1d(np.arange(N), sample_idx)
     if len(rest_idx) > 0:
         _log.info("Assigning remaining %s customers via nearest-neighbour lookup ...", f"{len(rest_idx):,}")
-        nn = NearestNeighbors(n_neighbors=1, metric=HDBSCAN_METRIC, n_jobs=-1)
+        nn = NearestNeighbors(n_neighbors=1, metric=HDBSCAN_METRIC, n_jobs=1)
         nn.fit(X_sample)
         _, indices = nn.kneighbors(X[rest_idx])
         all_labels[rest_idx] = clusterer.labels_[indices.ravel()].astype(np.int32)

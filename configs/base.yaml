@@ -1,0 +1,36 @@
+global:
+  random_seed: 42
+  min_tickets_per_customer: 3
+  sample_size: 100000
+
+word2vec:
+  vector_size: 100
+  window: 5
+  min_count: 3
+  epochs: 10
+  sg: 1          # skip-gram (better than CBOW for rare products)
+  workers: 1     # workers=1 required for bit-exact reproducibility across runs and devices (gensim thread-race)
+
+customer_vectors:
+  recency_halflife_days: 60   # 30 was too aggressive for a 6-month window
+
+umap:
+  cluster_dims: 20
+  viz_dims: 2
+  n_neighbors: 30
+  min_dist_cluster: 0.0   # 0.0 preserves tighter local structure for clustering
+  min_dist_viz: 0.1
+  metric: cosine
+  fit_sample: 300000       # fit on sample → transform full population (O(n) for transform)
+
+hdbscan:
+  min_cluster_size: 5000   # ~0.34% of 1.48M population → ~74k customers per tribe floor
+  min_samples: 10
+  metric: euclidean
+  cluster_method: eom
+  fit_sample: 100000       # max customers for exact HDBSCAN fit; rest assigned via kNN
+  silhouette_sample: 50000 # silhouette is O(n²) — sample for tractability
+
+tribe_namer:
+  model: claude-haiku-4-5-20251001
+  max_tokens: 300
