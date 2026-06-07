@@ -83,12 +83,15 @@ def _dominant_sector_bins(combined_path: Path) -> pd.Series:
         .select(["cliente", "idsector", "importe"])
         .group_by(["cliente", "idsector"])
         .agg(pl.col("importe").sum().alias("spend"))
+        # Sort in Polars before pandas to make tie-breaking deterministic across machines.
+        # Streaming group_by has no guaranteed output order; ties broken by row arrival
+        # differ between runs/platforms, causing ~O(10) customers to flip sector bins.
+        .sort(["cliente", "spend", "idsector"], descending=[False, True, False])
         .collect(engine="streaming")
         .to_pandas()
     )
     dominant = (
         sector_spend
-        .sort_values("spend", ascending=False)
         .drop_duplicates(subset="cliente", keep="first")
         .set_index("cliente")["idsector"]
     )
