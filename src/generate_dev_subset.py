@@ -28,6 +28,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -81,13 +82,22 @@ def _dominant_sector_bins(combined_path: Path) -> pd.Series:
     sector_spend = (
         pl.scan_parquet(combined_path)
         .select(["cliente", "idsector", "importe"])
+        # Convert to integer cents per row before the group_by so every arithmetic
+        # operation is exact Int64.  Float64 parallel sums are non-associative and
+        # produce different totals depending on chunk ordering between runs.
+        .with_columns(
+            (pl.col("importe") * 100).round(0).cast(pl.Int64).alias("spend_cents")
+        )
         .group_by(["cliente", "idsector"])
-        .agg(pl.col("importe").sum().alias("spend"))
-        # Sort in Polars before pandas to make tie-breaking deterministic across machines.
-        # Streaming group_by has no guaranteed output order; ties broken by row arrival
-        # differ between runs/platforms, causing ~O(10) customers to flip sector bins.
-        .sort(["cliente", "spend", "idsector"], descending=[False, True, False])
+        .agg(pl.col("spend_cents").sum().alias("spend_cents"))
         .collect(engine="streaming")
+        # Streaming group_by can leave multiple partial rows for the same
+        # (cliente, idsector) key when chunk boundaries split a customer's rows
+        # across merge batches.  Re-aggregate in memory to collapse them before
+        # sorting — the result set is small (~1 M customers × few sectors).
+        .group_by(["cliente", "idsector"])
+        .agg(pl.col("spend_cents").sum())
+        .sort(["cliente", "spend_cents", "idsector"], descending=[False, True, False])
         .to_pandas()
     )
     dominant = (
@@ -134,28 +144,86 @@ def _assign_strata(
 
 # ─── sampling ─────────────────────────────────────────────────────────────────
 
+def _stable_customer_rank(cliente: object, seed: int) -> int:
+    """Return a process-stable rank key for a customer ID and seed."""
+    payload = f"{seed}\0{cliente}".encode("utf-8")
+    return int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "big")
+
+
+def _customer_id_digest(clientes: list[object]) -> str:
+    """Digest the selected customer set for cheap reproducibility checks."""
+    h = hashlib.sha256()
+    for cliente in sorted(str(c) for c in clientes):
+        h.update(cliente.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _strata_assignment_digest(kpis: pd.DataFrame) -> str:
+    """Digest cliente -> stratum assignments to isolate pre-sampling drift."""
+    h = hashlib.sha256()
+    ordered = kpis[["cliente", "stratum"]].copy()
+    ordered["_cliente_key"] = ordered["cliente"].map(str)
+    ordered = ordered.sort_values("_cliente_key", kind="mergesort")
+    for cliente, stratum in ordered[["cliente", "stratum"]].itertuples(index=False):
+        h.update(str(cliente).encode("utf-8"))
+        h.update(b"\t")
+        h.update(str(stratum).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _file_stats(path: Path) -> dict[str, int | str]:
+    """Cheap source-file fingerprint for generated metadata."""
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
 def _proportional_sample(
     kpis: pd.DataFrame,
     target: int,
-    rng: np.random.Generator,
-) -> list[str]:
+    seed: int,
+) -> list[object]:
     """Sample proportionally from each stratum.
 
-    Uses remainder accumulation so rounding errors don't systematically
-    under-sample small strata — total will be within ±n_strata of target.
+    Allocation uses largest-remainder apportionment for an exact target size.
+    Within each stratum, customers are ranked by a stable hash of seed + cliente,
+    so selection is independent of DataFrame row order and Python hash state.
     """
-    n_total   = len(kpis)
-    selected: list[str] = []
-    remainder = 0.0
+    if target <= 0 or kpis.empty:
+        return []
 
-    for _, group in kpis.groupby("stratum", sort=True):
-        exact     = len(group) / n_total * target + remainder
-        n_sample  = int(exact)
-        remainder = exact - n_sample
-        n_sample  = min(n_sample, len(group))
-        if n_sample > 0:
-            idx = rng.choice(len(group), size=n_sample, replace=False)
-            selected.extend(group.iloc[idx]["cliente"].tolist())
+    n_total = len(kpis)
+    strata_counts = kpis.groupby("stratum", sort=True).size()
+    quotas = strata_counts.astype(float) / float(n_total) * int(target)
+    n_by_stratum = np.floor(quotas).astype(int)
+
+    remainder_slots = int(target) - int(n_by_stratum.sum())
+    if remainder_slots > 0:
+        remainders = pd.DataFrame({
+            "stratum": quotas.index.to_list(),
+            "fraction": (quotas - n_by_stratum).to_numpy(),
+        }).sort_values(
+            ["fraction", "stratum"],
+            ascending=[False, True],
+            kind="mergesort",
+        )
+        for stratum in remainders.head(remainder_slots)["stratum"]:
+            n_by_stratum.loc[stratum] += 1
+
+    selected: list[object] = []
+    for stratum, n_sample in n_by_stratum.items():
+        if n_sample <= 0:
+            continue
+        group = kpis.loc[kpis["stratum"].eq(stratum), ["cliente"]].copy()
+        group["_rank"] = group["cliente"].map(lambda c: _stable_customer_rank(c, seed))
+        group["_cliente_key"] = group["cliente"].map(str)
+        group = group.sort_values(["_rank", "_cliente_key"], kind="mergesort")
+        selected.extend(group.head(int(n_sample))["cliente"].tolist())
 
     return selected
 
@@ -211,7 +279,11 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
     # ── 1. Load KPIs + apply minimum-activity filter ──────────────────────────
     print("Loading customer KPIs ...")
     kpis_full = pd.read_parquet(kpis_path)
-    kpis = kpis_full[kpis_full["visit_count"] >= MIN_TICKETS_PER_CUSTOMER].reset_index(drop=True)
+    kpis = (
+        kpis_full[kpis_full["visit_count"] >= MIN_TICKETS_PER_CUSTOMER]
+        .sort_values("cliente")
+        .reset_index(drop=True)
+    )
     print(f"  {len(kpis):,} eligible customers  "
           f"(dropped {len(kpis_full) - len(kpis):,} with < {MIN_TICKETS_PER_CUSTOMER} visits)")
 
@@ -237,7 +309,7 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
     # ── 3. Per-customer dominant sector ───────────────────────────────────────
     print("Computing per-customer dominant sector (streaming) ...")
     sector_bins = _dominant_sector_bins(combined_path)
-    sector_dist = sector_bins.value_counts()
+    sector_dist = sector_bins.value_counts().sort_index()
     for bin_name, count in sector_dist.items():
         print(f"  {bin_name:<20}  {count:>9,}  ({count / len(sector_bins) * 100:.1f}%)")
 
@@ -245,19 +317,22 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
     print("Assigning strata ...")
     kpis = kpis.copy()
     kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
+    strata_digest = _strata_assignment_digest(kpis)
     strata_summary  = kpis["stratum"].value_counts().sort_index()
     n_strata        = len(strata_summary)
     print(f"  {n_strata} non-empty strata (of 54 possible):")
     for stratum, count in strata_summary.items():
         print(f"    {stratum:<60}  {count:>9,}")
+    print(f"  Strata-assignment SHA256: {strata_digest}")
 
     # ── 5. Proportional stratified sample ─────────────────────────────────────
     print(f"\nSampling ~{target_size:,} customers (proportional by stratum) ...")
-    rng          = np.random.default_rng(RANDOM_SEED)
-    selected_ids = _proportional_sample(kpis, target_size, rng)
+    selected_ids = _proportional_sample(kpis, target_size, int(RANDOM_SEED))
     actual_n     = len(selected_ids)
+    selected_digest = _customer_id_digest(selected_ids)
     print(f"  Selected {actual_n:,} customers  "
           f"({actual_n / len(kpis) * 100:.1f}% of eligible population)")
+    print(f"  Selected-customer SHA256: {selected_digest}")
 
     # ── 6. Extract transaction rows from df_combined ──────────────────────────
     print("Extracting transaction rows (streaming filter) ...")
@@ -266,8 +341,8 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
         pl.scan_parquet(combined_path)
         .filter(pl.col("cliente").is_in(id_series))
         .collect(engine="streaming")
-        .sort(["cliente", "fecha", "ticket"])   # canonical row order → reproducible downstream
     )
+    subset_df = subset_df.sort(subset_df.columns)   # canonical row order → reproducible downstream
     n_rows = len(subset_df)
     subset_df.write_parquet(out_path, compression="zstd")
     size_mb = out_path.stat().st_size / 1024 ** 2
@@ -301,6 +376,9 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
         "n_transaction_rows":  n_rows,
         "avg_rows_per_customer": round(n_rows / actual_n, 1),
         "random_seed":         int(RANDOM_SEED),
+        "selection_method":     "stratified_largest_remainder_stable_hash_v1",
+        "strata_assignment_sha256": strata_digest,
+        "selected_customer_sha256": selected_digest,
         "min_tickets_filter":  int(MIN_TICKETS_PER_CUSTOMER),
         "eligible_population": len(kpis),
         "stratification": {
@@ -320,6 +398,10 @@ def generate(target_size: int = DEFAULT_SIZE, *, force: bool = False) -> dict:
         "all_ks_passed":  bool(all_pass),
         "source_combined": str(combined_path),
         "source_kpis":     str(kpis_path),
+        "source_file_stats": {
+            "combined": _file_stats(combined_path),
+            "kpis": _file_stats(kpis_path),
+        },
         "output":          str(out_path),
     }
     meta_path.write_text(json.dumps(metadata, indent=2))

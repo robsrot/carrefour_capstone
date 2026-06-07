@@ -227,7 +227,7 @@ The raw ticket data is large enough to punish casual full scans.
 - Use Polars lazy scans for large Parquet reads.
 - Use `.collect(engine="streaming")` when scanning `df_combined.parquet` or raw ticket Parquet.
 - Prefer column selection before joins/grouping.
-- Avoid `n_unique()` inside large `group_by` aggregations; use `approx_n_unique()` when exact cardinality is not required.
+- Use `n_unique()` for any aggregation whose result is written to a cached Parquet artifact; `approx_n_unique()` is non-deterministic (HyperLogLog) and breaks bit-exact reproducibility across machines.
 - Cache expensive per-customer and per-product results to Parquet.
 - Never load raw `ie_linea_ticket.csv` directly once Parquet conversion exists.
 
