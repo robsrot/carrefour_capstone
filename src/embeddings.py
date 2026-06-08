@@ -23,6 +23,9 @@ from gensim.models import Word2Vec
 from src.config import (
     DATA_PROCESSED,
     MODELS,
+    PRODUCT_EMBEDDING_CANDIDATES,
+    PRODUCT_EMBEDDING_METHOD,
+    PRODUCT_POPULARITY_ENABLED,
     RANDOM_SEED,
     W2V_EPOCHS,
     W2V_MIN_COUNT,
@@ -31,12 +34,36 @@ from src.config import (
     W2V_WINDOW,
     W2V_WORKERS,
 )
+from src.product_filtering import allowed_product_ids, build_product_popularity, popularity_filter_summary
 
 _log = logging.getLogger(__name__)
 
 _BASKET_CACHE     = DATA_PROCESSED / "basket_sentences.parquet"
 _EMBEDDINGS_CACHE = DATA_PROCESSED / "product_embeddings.parquet"
 _MODEL_PATH       = MODELS / "word2vec_product.model"
+
+
+def build_product_embeddings(
+    *,
+    method: str | None = None,
+    df_combined_path: Path | None = None,
+    force: bool = False,
+) -> pl.DataFrame:
+    """Build product embeddings using the configured Phase 1 method."""
+    selected = method or PRODUCT_EMBEDDING_METHOD
+    if selected not in PRODUCT_EMBEDDING_CANDIDATES:
+        raise ValueError(
+            f"Unknown product embedding method {selected!r}; "
+            f"configured candidates are {PRODUCT_EMBEDDING_CANDIDATES}"
+        )
+    if selected != "word2vec":
+        raise NotImplementedError(
+            f"Product embedding method {selected!r} is configured but not implemented."
+        )
+
+    basket_path = build_basket_sentences(df_combined_path=df_combined_path, force=force)
+    model = train_word2vec(basket_path=basket_path, force=force)
+    return save_embeddings(model, force=force)
 
 
 def _stable_hash(word: str) -> int:
@@ -49,6 +76,7 @@ def _stable_hash(word: str) -> int:
 def build_basket_sentences(
     df_combined_path: Path | None = None,
     *,
+    popularity: pl.DataFrame | None = None,
     force: bool = False,
 ) -> Path:
     """Group df_combined by ticket → one row per basket with a list of product IDs.
@@ -69,9 +97,23 @@ def build_basket_sentences(
         return _BASKET_CACHE
 
     _log.info("Building basket sentences from %s ...", df_combined_path.name)
+
+    transactions = pl.scan_parquet(df_combined_path).select(["ticket", "idarticu"])
+    if PRODUCT_POPULARITY_ENABLED:
+        if popularity is None:
+            popularity = build_product_popularity(df_combined_path, force=force)
+        keep_ids = allowed_product_ids(popularity)
+        summary = popularity_filter_summary(popularity)
+        _log.info(
+            "Popularity hard filter: removing %s/%s products (%.2f%%)",
+            f"{summary['n_removed']:,}",
+            f"{summary['n_products']:,}",
+            summary["removed_pct"],
+        )
+        transactions = transactions.filter(pl.col("idarticu").is_in(keep_ids))
+
     baskets = (
-        pl.scan_parquet(df_combined_path)
-        .select(["ticket", "idarticu"])          # drop unused columns before grouping
+        transactions
         .group_by("ticket")
         .agg(pl.col("idarticu").alias("products"))
         .filter(pl.col("products").list.len() >= 2)   # single-item baskets yield zero co-purchase pairs

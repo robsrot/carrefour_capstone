@@ -75,6 +75,11 @@ def _df_from_embedding(
     return pl.DataFrame({"cliente": cliente, **cols, "promo_rate": promo_rate})
 
 
+def _embedding_columns(df: pl.DataFrame) -> list[str]:
+    """Return dimensionality-reduction columns regardless of reducer prefix."""
+    return [c for c in df.columns if c not in ("cliente", "promo_rate")]
+
+
 # ─── UMAP clustering embedding (20D) ─────────────────────────────────────────
 
 def reduce_umap_cluster(
@@ -82,11 +87,12 @@ def reduce_umap_cluster(
     *,
     force: bool = False,
     n_jobs: int = 1,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """UMAP 100D → 20D embedding for HDBSCAN clustering.
 
     Fits on UMAP_FIT_SAMPLE random customers, transforms the rest.
-    Cached to umap_cluster_20d.parquet.
+    Cached to umap_cluster_20d.parquet, unless cache_path is supplied.
 
     Parameters
     ----------
@@ -94,10 +100,11 @@ def reduce_umap_cluster(
                        If None, loads customer_vectors_weighted.parquet.
     n_jobs           : parallel threads for UMAP fit (-1 = all cores).
     """
-    if _UMAP_CLUSTER_CACHE.exists() and not force:
-        n = pl.scan_parquet(_UMAP_CLUSTER_CACHE).select(pl.len()).collect().item()
+    cache = Path(cache_path) if cache_path is not None else _UMAP_CLUSTER_CACHE
+    if cache.exists() and not force:
+        n = pl.scan_parquet(cache).select(pl.len()).collect().item()
         _log.info("UMAP cluster cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_UMAP_CLUSTER_CACHE)
+        return pl.read_parquet(cache)
 
     if customer_vectors is None:
         _log.info("Loading customer_vectors_weighted.parquet ...")
@@ -198,12 +205,12 @@ def reduce_umap_cluster(
         customer_vectors["promo_rate"],
         prefix="u",
     )
-    _UMAP_CLUSTER_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_UMAP_CLUSTER_CACHE, compression="zstd")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
     _log.info(
         "Saved %s UMAP cluster embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _UMAP_CLUSTER_CACHE.name,
-        _UMAP_CLUSTER_CACHE.stat().st_size / 1024 ** 2,
+        f"{len(df):,}", cache.name,
+        cache.stat().st_size / 1024 ** 2,
     )
     return df
 
@@ -215,6 +222,7 @@ def reduce_umap_viz(
     *,
     force: bool = False,
     n_jobs: int = 1,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """UMAP 20D → 2D embedding for visualisation.
 
@@ -222,16 +230,19 @@ def reduce_umap_viz(
     the visualisation is geometrically consistent with the clustering.
     Cached to umap_viz_2d.parquet.
     """
-    if _UMAP_VIZ_CACHE.exists() and not force:
-        n = pl.scan_parquet(_UMAP_VIZ_CACHE).select(pl.len()).collect().item()
+    cache = Path(cache_path) if cache_path is not None else _UMAP_VIZ_CACHE
+    if cache.exists() and not force:
+        n = pl.scan_parquet(cache).select(pl.len()).collect().item()
         _log.info("UMAP viz cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_UMAP_VIZ_CACHE)
+        return pl.read_parquet(cache)
 
     if umap_cluster is None:
         _log.info("Loading umap_cluster_20d.parquet ...")
         umap_cluster = pl.read_parquet(_UMAP_CLUSTER_CACHE)
 
-    dim_cols = [c for c in umap_cluster.columns if c.startswith("u")]
+    dim_cols = _embedding_columns(umap_cluster)
+    if not dim_cols:
+        raise ValueError("No embedding columns found for 2D visualisation.")
     X = umap_cluster.select(dim_cols).to_numpy().astype(np.float32)
     N = len(X)
 
@@ -278,11 +289,12 @@ def reduce_umap_viz(
     )
     df = df.rename({"viz_0": "x", "viz_1": "y"})
 
-    df.write_parquet(_UMAP_VIZ_CACHE, compression="zstd")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
     _log.info(
         "Saved %s UMAP viz embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _UMAP_VIZ_CACHE.name,
-        _UMAP_VIZ_CACHE.stat().st_size / 1024 ** 2,
+        f"{len(df):,}", cache.name,
+        cache.stat().st_size / 1024 ** 2,
     )
     return df
 
@@ -294,18 +306,23 @@ def reduce_pca(
     *,
     n_components: int = UMAP_CLUSTER_DIMS,
     force: bool = False,
+    cache_path: Path | None = None,
+    model_path: Path | None = None,
 ) -> pl.DataFrame:
     """PCA 100D → 20D baseline (linear, full population, no sampling needed).
 
     sklearn PCA on 1.48M × 100 with float32 uses ~2 GB RAM and finishes in ~30 s.
     Cached to pca_cluster_20d.parquet.
     """
-    if _PCA_CACHE.exists() and _PCA_MODEL_CACHE.exists() and not force:
-        n = pl.scan_parquet(_PCA_CACHE).select(pl.len()).collect().item()
+    cache = Path(cache_path) if cache_path is not None else _PCA_CACHE
+    model_cache = Path(model_path) if model_path is not None else _PCA_MODEL_CACHE
+
+    if cache.exists() and model_cache.exists() and not force:
+        n = pl.scan_parquet(cache).select(pl.len()).collect().item()
         _log.info("PCA cache hit — %s customers", f"{n:,}")
-        with open(_PCA_MODEL_CACHE, "rb") as fh:
+        with open(model_cache, "rb") as fh:
             pca = pickle.load(fh)
-        return pl.read_parquet(_PCA_CACHE), pca
+        return pl.read_parquet(cache), pca
 
     if customer_vectors is None:
         _log.info("Loading customer_vectors_weighted.parquet ...")
@@ -329,13 +346,14 @@ def reduce_pca(
         customer_vectors["promo_rate"],
         prefix="pc",
     )
-    _PCA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_PCA_CACHE, compression="zstd")
-    with open(_PCA_MODEL_CACHE, "wb") as fh:
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    model_cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
+    with open(model_cache, "wb") as fh:
         pickle.dump(pca, fh)
     _log.info(
         "Saved %s PCA embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _PCA_CACHE.name,
-        _PCA_CACHE.stat().st_size / 1024 ** 2,
+        f"{len(df):,}", cache.name,
+        cache.stat().st_size / 1024 ** 2,
     )
     return df, pca
