@@ -1,4 +1,4 @@
-# 3-Day Clustering Improvement Sprint
+# 2-Day Clustering Improvement Sprint
 
 **Date**: 2026-06-08 | **Mode**: `CARREFOUR_MODE=dev` | **Branch**: one per member
 
@@ -6,11 +6,9 @@
 
 ## Safety Protocol — Read Before Running Anything
 
-These rules ensure that running all experiments — including by an AI agent — leaves the project in a state that is equal to or better than the baseline. The project must never deteriorate.
-
 ### Rule 1 — Preserve the baseline artifacts first
 
-Before touching anything, run this once:
+**Do this once, before any experiment. All members wait until confirmed.**
 
 ```python
 import shutil, os
@@ -42,9 +40,7 @@ The `_baseline.parquet` files are never overwritten by any experiment. They are 
 
 ### Rule 2 — Every experiment writes to its own isolated path
 
-Never run an experiment that writes to the default cache path without an explicit `cache_path=` argument. The default paths (`umap_cluster_item2vec.parquet`, `customer_vectors_weighted.parquet`, etc.) are the live state. Experiments write to versioned paths like `umap_cluster_window5.parquet`, `cluster_labels_gmm_k15.parquet`.
-
-Convention: always include the experiment identifier in the artifact name.
+Never run an experiment that writes to the default cache path without an explicit `cache_path=` argument. The default paths (`umap_cluster_item2vec.parquet`, `customer_vectors_weighted.parquet`, etc.) are the live state. Experiments write to versioned paths.
 
 ```python
 # WRONG — overwrites the live baseline
@@ -54,17 +50,19 @@ reduce_umap_cluster(cv, force=True)
 reduce_umap_cluster(cv, force=True, cache_path=DATA_PROCESSED / "umap_cluster_window5.parquet")
 ```
 
+Convention: always include the experiment identifier in the artifact name.
+
 ### Rule 3 — Every experiment result is written to a JSON scorecard file
 
-The `experiment_scorecard()` function (defined below) writes its result to `outputs/dev/experiment_results.json`. This file accumulates across all runs and is the single source of truth for which experiment won.
+The `experiment_scorecard()` function (defined below) writes to `outputs/dev/experiment_results.json`. This file accumulates across all runs and is the single source of truth for which experiment won.
 
 ### Rule 4 — The project ends with the best configuration applied
 
-After all experiments, run the winner-selection code block (see "Selecting and Applying the Winner" at the end). This reads `experiment_results.json`, finds the experiment with the highest `avg_top5_lift`, updates `configs/dev.yaml`, does one clean final rebuild with `force=True` on the affected stages only, and runs `experiment_scorecard()` one last time to verify. The final scorecard must show improvement over baseline (9.32× lift, 11 tribes).
+After all experiments, run the winner-selection code block (see "Selecting and Applying the Winner"). This reads `experiment_results.json`, finds the experiment with the highest `avg_top5_lift`, updates `configs/dev.yaml`, does one clean final rebuild with `force=True` on the affected stages only, and runs `experiment_scorecard()` one last time to verify. The final scorecard must show improvement over baseline (9.32× lift, 11 tribes).
 
 ### Rule 5 — After changing `dev.yaml`, reload ALL pipeline modules
 
-The notebook master cell (Cell 3) runs `importlib.reload(src.config)`, but `src/dimensionality.py`, `src/clustering.py`, `src/embeddings.py`, and `src/customer_vectors.py` each import constants from `src.config` at module load time (`from src.config import UMAP_N_NEIGHBORS, ...`). Reloading `src.config` does NOT update those already-bound names. If you just re-run the master cell, `reduce_umap_cluster()` still uses the old `UMAP_N_NEIGHBORS`.
+The notebook master cell runs `importlib.reload(src.config)`, but `src/dimensionality.py`, `src/clustering.py`, `src/embeddings.py`, and `src/customer_vectors.py` each import constants from `src.config` at module load time. Reloading `src.config` does NOT update those already-bound names.
 
 **After editing `dev.yaml` and re-running the master cell, run this reload cell before calling any pipeline function:**
 
@@ -77,7 +75,6 @@ importlib.reload(src.customer_vectors)
 importlib.reload(src.dimensionality)
 importlib.reload(src.clustering)
 
-# Re-import the public functions after reload so the notebook sees the updated versions
 from src.embeddings   import train_word2vec, save_embeddings, load_product_embeddings
 from src.customer_vectors import build_customer_vectors, build_customer_vectors_mean, \
     build_customer_vectors_tfidf_svd, build_customer_vectors_hybrid
@@ -86,8 +83,6 @@ from src.clustering       import cluster_hdbscan, assign_hdbscan_noise_to_neares
     cluster_kmeans, run_kmeans_baselines, grid_search_hdbscan, evaluate_clustering, profile_tribes
 print("All pipeline modules reloaded.")
 ```
-
-Alternatively, restart the kernel (safest option, slowest). Either way is fine — the important thing is that you do one of them before every experiment that changes `dev.yaml`.
 
 ### Rule 6 — Force-rebuild only what changed
 
@@ -99,7 +94,7 @@ Alternatively, restart the kernel (safest option, slowest). Either way is fine �
 | `configs/dev.yaml` HDBSCAN params | `FORCE_CLUSTERING` only |
 | Custom `cache_path=` experiment | Only the specific function you call with `force=True` |
 
-Never set all four force flags to True unless you changed Word2Vec. Each unnecessary rebuild wastes 20–40 minutes.
+Each unnecessary full rebuild wastes 40–60 minutes. Never set all four force flags unless you changed Word2Vec.
 
 ### Rule 7 — Notebook variable names
 
@@ -109,7 +104,7 @@ The notebook uses `cluster_space` (not `umap_cluster`) as the name for the UMAP 
 
 ## Repo Handover Status
 
-The pipeline is complete end-to-end in dev mode. The current segmentation produces 11 tribes with avg top-5 lift of 9.32×. The goal for this sprint is to push that number higher across the board — sharper product signals in every tribe, finer granularity, zero noise, and stronger behavioral distinctiveness throughout the entire customer space. Some tribes already have strong lift (C0–C4, C10); others are weaker (C5–C7, C9). Both are targets for improvement.
+The pipeline is complete end-to-end in dev mode. The current segmentation produces 11 tribes with avg top-5 lift of 9.32×. The goal for this sprint is to push that number higher — sharper product signals, finer granularity, and stronger behavioral distinctiveness throughout the entire customer space. C5–C7 and C9 are the weakest tribes; C0–C4 and C10 are already strong.
 
 Setup:
 ```powershell
@@ -153,13 +148,73 @@ An experiment is an **improvement** if:
 - **and** all tribes have avg lift ≥ 3×
 - Silhouette drop of more than 0.08 should be flagged as a warning.
 
-The goal is not to fix specific tribes — it is to improve the segmentation globally. Higher lift across all tribes, more tribes with distinct product stories, and fewer customers lumped into large catch-all segments are all improvements.
+---
+
+## 2-Day Schedule and Dependency Map
+
+The dependency chain controls what can run in parallel. M2, M3, M4, and M5 can all start Day 1 on the existing baseline artifacts — none of them wait for M1 to finish.
+
+```
+pipeline dependency chain:
+  Word2Vec model  (M1 changes here)
+    └─> product_embeddings
+          └─> customer_vectors  (M2 changes here)
+                └─> umap_cluster  (M3 UMAP changes here)
+                      └─> cluster_labels  (M3 HDBSCAN/GMM/Bisect changes here)
+                            └─> tribe_profiles
+                                  └─> tribe_names + cards  (M4 lands here)
+
+M5 feature engineering reads df_combined directly — no upstream dependency.
+M5 production run starts Day 2 after the dev winner is confirmed.
+```
+
+```
+DAY 1 — all parallel after backup (Step 0)
+─────────────────────────────────────────────────────────────────
+M1  window=5 rebuild (~50min) → scorecard
+    if improved: window=3 or popularity filter
+
+M2  BM25 on baseline embeddings (~40min) → scorecard
+    Top-N=50 (~40min) → scorecard
+    recency half-life sweep (if time)
+    ↳ if M1 finishes with improvement: re-run BM25 on M1 embeddings
+
+M3  HDBSCAN grid on baseline UMAP (~20min, no rebuild) → pick candidates
+    GMM on baseline UMAP (~10min/k, no rebuild)
+    Bisecting K-Means on weak tribes (~15min/tribe, no rebuild)
+    UMAP sweep on M2's best vectors (~35min/config)  ← wait for M2 BM25
+
+M4  qualitative review of M3 bisecting results
+    tribe card template prep
+    baseline 2D UMAP verification
+
+M5  HHI + diversity features from df_combined (~60min)
+    basket mission features (~45min)
+    price tier affinity features (~60min)
+
+END OF DAY 1: share all scorecards → agree on combined winner config
+─────────────────────────────────────────────────────────────────
+DAY 2 MORNING — sequential
+  one person: combined clean rebuild with winner config (~60–90min)
+  confirm dev scorecard beats baseline before proceeding
+
+DAY 2 AFTERNOON — parallel
+  M5: START PRODUCTION RUN (2–4 hours) ← must start by early afternoon
+  M4: name_all_tribes() → tribe cards → 2D UMAP scatter (dev)
+
+DAY 2 EVENING
+  prod run completes → prod scorecard → name_all_tribes() on prod profiles
+  final state checklist → commit
+─────────────────────────────────────────────────────────────────
+```
+
+**The production run is the final deliverable.** It cannot start until the dev winner is confirmed. Do not let Day 2 morning turn into more experiments — it is a single clean rebuild and scorecard check, then hand off to M5.
 
 ---
 
 ## Shared Evaluation Function
 
-Every experiment ends with this. Paste into a notebook cell near the top — run it once, then call `experiment_scorecard()` after every clustering result.
+Paste into a notebook cell near the top and run it once. Call `experiment_scorecard()` after every clustering result.
 
 ```python
 import polars as pl, numpy as np, json, os
@@ -183,7 +238,6 @@ def _load_results():
 
 def _save_result(result: dict):
     results = _load_results()
-    # Replace existing entry for same method_name if present
     results = [r for r in results if r.get("method") != result["method"]]
     results.append(result)
     RESULTS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -246,16 +300,9 @@ def experiment_scorecard(cluster_labels, umap_cluster, method_name, force_profil
         "tribes_above_threshold": tribes_above_threshold,
         "improved": improved,
     }
-    _save_result(result)   # persists to outputs/dev/experiment_results.json
+    _save_result(result)
     return result
 ```
-
-Cache invalidation chain — when you change a stage, force-rebuild everything downstream:
-```
-df_combined → basket_sentences → word2vec model → product_embeddings
-→ customer_product_weights → customer_vectors → umap_cluster → cluster_labels → tribe_profiles
-```
-Use `force=True` flags or delete the relevant `data/dev/*.parquet` files. Never modify `df_combined.parquet`.
 
 ---
 
@@ -263,75 +310,63 @@ Use `force=True` flags or delete the relevant `data/dev/*.parquet` files. Never 
 
 **Files**: `src/embeddings.py`, `configs/dev.yaml`  
 **Rebuild flags**: `FORCE_EMBEDDINGS=True`, `FORCE_VECTORS=True`, `FORCE_UMAP=True`, `FORCE_CLUSTERING=True`  
-**Artifact naming**: use `method_name` of the form `m1_<descriptor>`, e.g. `m1_window5_ep10`. The cluster label file must be saved to `DATA_PROCESSED / f"cluster_labels_{method_name}.parquet"` using `cache_path=`.  
-**Run order**: start with the lowest-cost change (window size only), measure, then compound if it improved.
+**Artifact naming**: `method_name` of the form `m1_<descriptor>`, e.g. `m1_window5`.  
+**Day 1 start**: immediately after Step 0 backup.  
+**Blocks**: M2's optional cross-track re-run — only if M1 produces a clear lift improvement.  
+**Does NOT block**: M2's initial BM25/Top-N, M3, M4, M5 — all start on baseline embeddings.  
+**Run order**: window size first (window=5), measure, then window=3 if needed. Popularity filter only after window is settled and improved. Each full rebuild is ~50 min — do not chain experiments without measuring first.  
+**Estimated time per experiment**: ~50 min (Word2Vec ~10 min + vectors ~5 min + UMAP ~25 min + clustering + profiling ~10 min).
 
-The product embedding is the signal everything else builds on. The current Word2Vec with `window=10` treats products at opposite ends of a large trolley as co-occurring, blurring the embedding space. Run these experiments in order of difficulty, run `experiment_scorecard()` after each.
-
----
-
-### Classic Word2Vec Tuning
-
-1. **Window size.** Try `window: 3`, `5`, `7` (current: `10`). Smaller windows enforce stricter co-purchase proximity. `window=5` is the standard Item2Vec recommendation.
-
-2. **Training epochs.** Try `epochs: 10`, `15` (current: `5`).
-
-3. **Embedding dimension.** Try `vector_size: 50`, `150`, `200` (current: `100`).
-
-4. **CBOW vs skip-gram.** The `sg=1` flag in `src/embeddings.py` enables skip-gram. Try `sg=0`. CBOW averages context; skip-gram predicts context. Skip-gram is usually better for rare products; CBOW for frequent ones.
-
-5. **Popularity filter tightening.** Reduce `product_popularity.max_basket_share` from `0.15` → `0.10` and `max_customer_share` from `0.40` → `0.25`. Removes more universal staples from basket sentences, forcing the model to learn from distinctive products.
-
-6. **Negative sampling rate.** The `Word2Vec()` call in `src/embeddings.py` currently does not pass a `negative=` argument (gensim default is 5). To control it, make three changes:
-   - Add `negative: 5` under `word2vec:` in `configs/base.yaml`
-   - Add `W2V_NEGATIVE = _cfg["word2vec"]["negative"]` in `src/config.py` (next to the other W2V constants)
-   - Add `negative=W2V_NEGATIVE,` to the `Word2Vec()` call in `src/embeddings.py`
-   
-   Then set `word2vec.negative: 10` or `15` in `configs/dev.yaml` and rebuild. Higher negative sampling produces better-separated embeddings for rare products.
+The product embedding is the signal everything else builds on. The current Word2Vec uses `window=10` (base.yaml). Smaller windows enforce stricter co-purchase proximity, so products must appear together in the same section of a basket rather than anywhere in the same trolley.
 
 ---
 
-### Node2Vec — Product Co-Purchase Graph Embeddings
+### 1. Window Size
 
-Instead of treating baskets as sentences, build a graph where nodes are products and edges are co-purchase pair-lift scores. Node2Vec learns embeddings by running biased random walks on this graph.
+Try `window: 5` first — this is the standard Item2Vec recommendation and the most likely single improvement.
 
-```python
-# pip install node2vec
-import networkx as nx
-from node2vec import Node2Vec
-import polars as pl
-
-pair_lift = pl.read_parquet("data/processed/product_eda_pair_lift_top250.parquet")
-
-G = nx.Graph()
-for row in pair_lift.filter(pl.col("lift") > 2.0).to_dicts():
-    G.add_edge(str(row["idarticu_a"]), str(row["idarticu_b"]), weight=float(row["lift"]))
-
-node2vec = Node2Vec(
-    G,
-    dimensions=100,
-    walk_length=30,
-    num_walks=200,
-    p=1,        # return parameter — controls backtracking
-    q=0.5,      # in-out parameter — q<1 favors DFS (community structure)
-    workers=1,  # reproducibility
-    seed=42,
-)
-model = node2vec.fit(window=5, min_count=1, workers=1, epochs=10, seed=42)
-
-# Export to same format as Word2Vec product embeddings
-product_ids   = list(model.wv.key_to_index.keys())
-product_vecs  = [model.wv[pid] for pid in product_ids]
-df_embeddings = pl.DataFrame({
-    "idarticu": pl.Series(product_ids).cast(pl.Int64),
-    "vector":   pl.Series(product_vecs, dtype=pl.List(pl.Float32)),
-})
-df_embeddings.write_parquet("data/dev/product_embeddings_node2vec.parquet", compression="zstd")
+Edit `configs/dev.yaml`:
+```yaml
+word2vec:
+  window: 5    # current: 10 (base.yaml)
+  epochs: 5    # keep dev override
 ```
 
-Tune `p` and `q`: `p=1, q=0.5` favors structural equivalence (products in similar roles across categories); `p=1, q=2` favors BFS/homophily (products closely co-purchased). Try both and compare.
+Reload modules (Rule 5), then run with all four force flags. Save the cluster result to an isolated path:
 
-Pass `product_embeddings_node2vec.parquet` as the embedding input to `build_customer_vectors_weighted()` by setting the `embeddings_path` argument. Then run the full pipeline and call `experiment_scorecard()`.
+```python
+core = cluster_hdbscan(cluster_space, force=True,
+           cache_path=DATA_PROCESSED / "cluster_core_m1_window5.parquet")
+full = assign_hdbscan_noise_to_nearest_tribe(cluster_space, core, force=True,
+           cache_path=DATA_PROCESSED / "cluster_labels_m1_window5.parquet")
+experiment_scorecard(full, cluster_space, method_name="m1_window5")
+```
+
+If `window=5` does not improve lift, try `window=3`. If `window=5` improved, also try `window=7` to check whether the optimum is between 5 and 10.
+
+---
+
+### 2. Popularity Filter Tightening
+
+**Prerequisite**: window sweep complete and confirmed improvement. Only run this if the window change improved lift — otherwise the two experiments will compound and you won't know which helped.
+
+Edit `configs/dev.yaml`:
+```yaml
+product_popularity:
+  max_basket_share: 0.10    # was 0.15
+  max_customer_share: 0.25  # was 0.40
+```
+
+This removes more universal staples from basket sentences, forcing the model to learn from distinctive products. Combine with the best window value from step 1. Use artifact name `m1_window5_filter` (or whichever window won).
+
+---
+
+### 3. Quick Follow-ups (only if steps 1–2 finish before end of Day 1)
+
+These are all config-only changes and each requires a full rebuild (~50 min). Only run one if time clearly allows.
+
+- **Epochs**: try `epochs: 10` (current dev override is `5`, base is `10`). More training passes on the same data.
+- **CBOW vs skip-gram**: the `sg=1` flag in `src/embeddings.py` enables skip-gram. Try `sg=0` in `base.yaml` (or patch it directly in the Word2Vec call). CBOW averages context; skip-gram is usually better for rare products.
 
 ---
 
@@ -342,7 +377,7 @@ Use the embedding sanity check cell in the notebook. Pick these probe products:
 - An Iberian charcuterie product → top neighbors should be other Iberian charcuterie, not mass-market ham
 - An organic produce product → top neighbors should be other organic products
 
-If neighbors degrade (random, or incoherent), the change hurt the embedding quality — revert.
+If neighbors degrade (random or incoherent), the change hurt the embedding quality — revert.
 
 ---
 
@@ -351,274 +386,102 @@ If neighbors degrade (random, or incoherent), the change hurt the embedding qual
 **Files**: `src/customer_vectors.py`, `configs/dev.yaml`  
 **Rebuild flags**: `FORCE_VECTORS=True`, `FORCE_UMAP=True`, `FORCE_CLUSTERING=True`  
 **Artifact naming**: `method_name` of the form `m2_<descriptor>`, e.g. `m2_bm25_k1_1.5`.  
-**Run order**: BM25 first (config-only change, lowest risk), then NMF/LDA (new function, medium risk), then neural network approaches (highest risk, do last).
+**Day 1 start**: immediately after Step 0 — use the existing `product_embeddings.parquet` baseline. Do NOT wait for M1.  
+**Blocks**: M3's UMAP sweep (Part B) — M3 should run their UMAP parameter sweep on M2's best customer vectors, not the baseline.  
+**Does NOT block**: M3's Part A (HDBSCAN grid, GMM, Bisecting K-Means on baseline UMAP).  
+**Run order**: BM25 first (highest expected single lift improvement), then Top-N, then recency half-life sweep if time allows. Cross-track: if M1 finishes with a clear improvement, re-run your best experiment on M1's new embeddings.  
+**Estimated time per experiment**: ~40 min (vectors ~5 min + UMAP ~25 min + clustering + profiling ~10 min).
 
-The current customer vector is a recency/frequency-weighted mean of product embeddings. Averaging all products a customer has bought blurs their identity. Customers who buy 30 different products end up near the centroid of all 30 products' vectors. Multiple alternatives can fix this.
-
----
-
-### Classical Improvements
-
-1. **BM25 saturation weighting.** Add to `_apply_weight_transform()` in `src/customer_vectors.py`:
-   ```python
-   if transform == "bm25":
-       k1 = 1.5
-       v = np.maximum(values, 0.0).astype(np.float64)
-       return (v / (v + k1)).astype(np.float32)
-   ```
-   Set `customer_vectors.weight_transform: bm25` in `configs/dev.yaml`. Also try `k1=1.2` and `k1=2.0`.
-
-2. **Recency half-life sweep.** Try `halflife_days: 30`, `45`, `60`, `90`.
-
-3. **Top-N product pooling.** Restrict each customer's vector to their top-N products by interaction weight before averaging. Try N=20, 50, 100. Prevents one-off purchases from diluting the core product signal.
-
-4. **Separate short-term / long-term vectors.** Split interactions at month 3. Build two weighted vectors per customer and concatenate them before UMAP. The delta may separate stable from shifting customers.
+The current customer vector is a recency/frequency-weighted mean of product embeddings with `log1p` transform. Averaging all products a customer has bought blurs their identity — customers who buy 30 different products end up near the centroid of all 30 products' vectors. The experiments below address this directly.
 
 ---
 
-### NMF — Latent Product Topic Decomposition
+### 1. BM25 Saturation Weighting
 
-NMF factorizes the customer-product interaction matrix into K non-negative components. Each component is a latent "product topic" with interpretable top products (e.g. Topic 0 = baby food, Topic 1 = Iberian charcuterie). A customer's vector is their mix of these topics. Unlike embedding + averaging, NMF is directly interpretable.
+**Run this first. Highest expected single improvement in the sprint.**
 
-Add to `src/customer_vectors.py`:
+BM25 applies a saturation curve that dampens staple products more aggressively than `log1p`, while preserving the signal from distinctive products.
 
+Add to `_apply_weight_transform()` in `src/customer_vectors.py`:
 ```python
-from sklearn.decomposition import NMF
-from scipy.sparse import csr_matrix
-
-_NMF_CACHE = DATA_PROCESSED / "customer_vectors_nmf.parquet"
-
-def build_customer_vectors_nmf(
-    df_combined_path=None, *, n_components=30, force=False
-) -> pl.DataFrame:
-    if _NMF_CACHE.exists() and not force:
-        return pl.read_parquet(_NMF_CACHE)
-
-    if df_combined_path is None:
-        df_combined_path = DATA_PROCESSED / "df_combined.parquet"
-
-    interactions = _build_interactions(df_combined_path, RECENCY_HALFLIFE_DAYS, force=False)
-
-    # Build sparse matrix
-    customers = interactions["cliente"].unique().sort().to_list()
-    products  = interactions["idarticu"].unique().sort().to_list()
-    cust_idx  = {c: i for i, c in enumerate(customers)}
-    prod_idx  = {p: i for i, p in enumerate(products)}
-
-    rows = [cust_idx[r["cliente"]] for r in interactions.to_dicts()]
-    cols = [prod_idx[r["idarticu"]] for r in interactions.to_dicts()]
-    data = interactions["weight"].to_list()
-    matrix = csr_matrix((data, (rows, cols)), shape=(len(customers), len(products)))
-
-    nmf = NMF(n_components=n_components, init="nndsvda", random_state=RANDOM_SEED, max_iter=300)
-    vectors = nmf.fit_transform(matrix).astype(np.float32)
-
-    # L2-normalise rows
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    vectors = vectors / np.maximum(norms, 1e-8)
-
-    # Log top products per topic for interpretability check
-    from src.data_loader import load_maestra_articulos
-    articles = load_maestra_articulos()
-    id_to_name = dict(zip(articles["idarticu"].to_list(), articles["desc_larga_articulo"].to_list()))
-    for t in range(min(5, n_components)):
-        top_idx  = nmf.components_[t].argsort()[-5:][::-1]
-        top_prod = [id_to_name.get(products[i], str(products[i])) for i in top_idx]
-        _log.info("  NMF Topic %d: %s", t, top_prod)
-
-    df = pl.DataFrame({
-        "cliente": pl.Series(customers),
-        "vector":  pl.Series(vectors.tolist(), dtype=pl.List(pl.Float32)),
-    }).sort("cliente")
-    _NMF_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_NMF_CACHE, compression="zstd")
-    return df
+if transform == "bm25":
+    k1 = 1.5
+    v = np.maximum(values, 0.0).astype(np.float64)
+    return (v / (v + k1)).astype(np.float32)
 ```
 
-Try `n_components: 20`, `30`, `40`. After each run, check the logged topic-product printouts — if topics are coherent (topic 0 = baby food, topic 3 = organic produce), NMF is working. Then call `experiment_scorecard()`.
+Edit `configs/dev.yaml`:
+```yaml
+customer_vectors:
+  weight_transform: bm25
+```
+
+Reload modules, rebuild with `FORCE_VECTORS=True`, `FORCE_UMAP=True`, `FORCE_CLUSTERING=True`.
+
+```python
+core = cluster_hdbscan(cluster_space, force=True,
+           cache_path=DATA_PROCESSED / "cluster_core_m2_bm25_k1_1.5.parquet")
+full = assign_hdbscan_noise_to_nearest_tribe(cluster_space, core, force=True,
+           cache_path=DATA_PROCESSED / "cluster_labels_m2_bm25_k1_1.5.parquet")
+experiment_scorecard(full, cluster_space, method_name="m2_bm25_k1_1.5")
+```
+
+If improved, also try `k1=1.2` and `k1=2.0` — change the constant in the code and re-run with separate artifact names (`m2_bm25_k1_1.2`, `m2_bm25_k1_2.0`).
 
 ---
 
-### LDA — Probabilistic Topic Modeling
+### 2. Top-N Product Pooling
 
-Latent Dirichlet Allocation treats each customer's purchase history as a "document" and products as "words". Each customer gets a distribution over K topics, and each topic has a distribution over products. Similar to NMF but with a probabilistic generative model — often produces cleaner, more interpretable topics than NMF for sparse data.
+Restrict each customer's vector to their top-N products by interaction weight before averaging. Prevents one-off purchases from diluting the core product signal.
+
+Add a `top_n` parameter to `build_customer_vectors` in `src/customer_vectors.py` that filters to the top-N rows per customer (by weight) before the embedding mean. Default to `None` to preserve existing behavior.
+
+Try `N=50` first, then `N=20` if time allows.
 
 ```python
-from sklearn.decomposition import LatentDirichletAllocation
-from scipy.sparse import csr_matrix
-
-# Reuse the same sparse matrix as NMF above
-# LDA requires non-negative integer counts — use raw purchase frequency, not weights
-lda = LatentDirichletAllocation(
-    n_components=30,
-    random_state=RANDOM_SEED,
-    learning_method="online",
-    max_iter=20,
-)
-vectors = lda.fit_transform(matrix).astype(np.float32)
-# vectors shape: (n_customers, n_components) — each row sums to 1 (topic proportions)
+core = cluster_hdbscan(cluster_space, force=True,
+           cache_path=DATA_PROCESSED / "cluster_core_m2_topn50.parquet")
+full = assign_hdbscan_noise_to_nearest_tribe(cluster_space, core, force=True,
+           cache_path=DATA_PROCESSED / "cluster_labels_m2_topn50.parquet")
+experiment_scorecard(full, cluster_space, method_name="m2_topn50")
 ```
-
-Try `n_components: 20`, `30`, `40`. Check topic coherence (top products per topic). Pass to UMAP + HDBSCAN and call `experiment_scorecard()`.
 
 ---
 
-### Autoencoder Customer Embeddings (Neural Network)
+### 3. Recency Half-Life Sweep (only if M2-1 and M2-2 are done)
 
-Train a feed-forward autoencoder on the customer-product interaction matrix. The bottleneck layer is the customer embedding. Unlike NMF/LDA, the autoencoder can learn non-linear interactions.
-
-```python
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-
-# Use the dense matrix for small n_components; for 44k customers × 55k products
-# use sparse input + mini-batches
-# Simpler: use the NMF/TFIDF 100D vectors as input to the autoencoder
-
-# Input: existing customer_vectors_weighted or tfidf_svd vectors (100D)
-X = np.array(cv_weighted["vector"].to_list(), dtype=np.float32)
-X_tensor = torch.FloatTensor(X)
-loader   = DataLoader(TensorDataset(X_tensor), batch_size=512, shuffle=True)
-
-class CustomerAutoencoder(nn.Module):
-    def __init__(self, input_dim=100, bottleneck=32):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 64), nn.ReLU(),
-            nn.Linear(64, bottleneck),
-        )
-        self.decoder = nn.Sequential(
-            nn.Linear(bottleneck, 64), nn.ReLU(),
-            nn.Linear(64, input_dim),
-        )
-    def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z), z
-
-torch.manual_seed(42)
-model     = CustomerAutoencoder(input_dim=X.shape[1], bottleneck=32)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.MSELoss()
-
-for epoch in range(50):
-    total_loss = 0
-    for (batch,) in loader:
-        optimizer.zero_grad()
-        recon, _ = model(batch)
-        loss = criterion(recon, batch)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch}: loss={total_loss/len(loader):.4f}")
-
-# Extract bottleneck embeddings
-model.eval()
-with torch.no_grad():
-    _, embeddings = model(X_tensor)
-    ae_vectors = embeddings.numpy()
-
-# Save as customer vectors
-cv_ae = pl.DataFrame({
-    "cliente": cv_weighted["cliente"],
-    "vector":  pl.Series(ae_vectors.tolist(), dtype=pl.List(pl.Float32)),
-})
-cv_ae.write_parquet("data/dev/customer_vectors_autoencoder.parquet", compression="zstd")
+Edit `configs/dev.yaml`:
+```yaml
+customer_vectors:
+  recency_halflife_days: 30    # current: 60
 ```
 
-Try `bottleneck=16`, `32`, `64`. Pass to UMAP + HDBSCAN. Call `experiment_scorecard()`.
+Try `30` and `90`. A shorter half-life amplifies recent purchase behavior; a longer one treats the full 6-month window more evenly. Run `experiment_scorecard()` after each.
 
 ---
 
-### Variational Autoencoder (VAE)
+### Cross-track: Re-run on M1 embeddings (Day 1 afternoon, if M1 improved)
 
-A VAE forces the latent space to be smooth and approximately Gaussian, which tends to produce better cluster separation than a plain autoencoder. The reparameterization trick makes the gradients flow through the stochastic bottleneck.
-
-```python
-class CustomerVAE(nn.Module):
-    def __init__(self, input_dim=100, latent_dim=32):
-        super().__init__()
-        self.fc1    = nn.Linear(input_dim, 64)
-        self.fc_mu  = nn.Linear(64, latent_dim)
-        self.fc_var = nn.Linear(64, latent_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 64), nn.ReLU(),
-            nn.Linear(64, input_dim),
-        )
-
-    def encode(self, x):
-        h   = torch.relu(self.fc1(x))
-        return self.fc_mu(h), self.fc_var(h)
-
-    def reparameterize(self, mu, log_var):
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    def forward(self, x):
-        mu, log_var = self.encode(x)
-        z    = self.reparameterize(mu, log_var)
-        recon = self.decoder(z)
-        return recon, mu, log_var
-
-def vae_loss(recon, x, mu, log_var, beta=1.0):
-    recon_loss = nn.functional.mse_loss(recon, x, reduction="sum")
-    kld        = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-    return recon_loss + beta * kld
-
-torch.manual_seed(42)
-vae       = CustomerVAE(input_dim=X.shape[1], latent_dim=32)
-optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
-
-for epoch in range(100):
-    for (batch,) in loader:
-        optimizer.zero_grad()
-        recon, mu, log_var = vae(batch)
-        loss = vae_loss(recon, batch, mu, log_var, beta=1.0)
-        loss.backward()
-        optimizer.step()
-
-vae.eval()
-with torch.no_grad():
-    mu_vecs, _ = vae.encode(X_tensor)
-    vae_vectors = mu_vecs.numpy()   # use mu (mean) as the embedding, not sampled z
-
-cv_vae = pl.DataFrame({
-    "cliente": cv_weighted["cliente"],
-    "vector":  pl.Series(vae_vectors.tolist(), dtype=pl.List(pl.Float32)),
-})
-cv_vae.write_parquet("data/dev/customer_vectors_vae.parquet", compression="zstd")
-```
-
-Try `latent_dim=16`, `32`, `64`. Try `beta=0.5`, `1.0`, `4.0` (beta-VAE with higher beta forces more disentangled representations). Pass to UMAP + HDBSCAN. Call `experiment_scorecard()`.
+If M1's window sweep produced a confirmed improvement, re-run your best M2 configuration (whichever of BM25/Top-N gave the highest lift) pointing at M1's new `product_embeddings.parquet`. Name the combined run `m1m2_window5_bm25` (substitute actual experiment IDs). Call `experiment_scorecard()`. This is the most valuable combined test of the sprint.
 
 ---
 
 ## Member 3 — Dimensionality Reduction & Clustering
 
 **Files**: `src/dimensionality.py`, `src/clustering.py`, `configs/dev.yaml`  
-**Rebuild flags**: UMAP changes → `FORCE_UMAP=True`, `FORCE_CLUSTERING=True`. Clustering changes only → `FORCE_CLUSTERING=True`.  
+**Rebuild flags**: UMAP changes → `FORCE_UMAP=True`, `FORCE_CLUSTERING=True`. Clustering-only changes → `FORCE_CLUSTERING=True`.  
 **Artifact naming**: `method_name` of the form `m3_<descriptor>`, e.g. `m3_hdbscan_mcs50_ms3_leaf` or `m3_gmm_k15`.  
-**Run order**: HDBSCAN grid search first (no code changes, just config), then GMM/Bisecting (small additions), then DEC (neural network, highest risk).
+**Day 1 Part A** (HDBSCAN grid, GMM, Bisecting K-Means): start immediately after Step 0 — all run on the existing `umap_cluster_item2vec.parquet`. No rebuild needed.  
+**Day 1 Part B** (UMAP sweep): start after M2's BM25 vectors are ready. Run the UMAP sweep on M2's best customer vectors rather than the baseline — the combination of better vectors and tuned UMAP is more valuable than tuning UMAP alone.  
+**Run order**: HDBSCAN grid first (fastest, no code changes), then GMM, then Bisecting K-Means, then UMAP sweep (after M2).
 
 ---
 
-### UMAP Hyperparameter Sweep
+### 1. HDBSCAN Full Grid Search
 
-1. **`n_neighbors`**: Try `10`, `15`, `30` (current: `20`). Smaller = more local topology = more tribes.
-2. **`cluster_dims`**: Try `20`, `30`, `75` (current: `50`).
-3. **`min_dist_cluster`**: Try `0.0`, `0.05`, `0.1`. Lower values pack embeddings tighter, sharpening density peaks.
-4. **Metric**: Try `metric="euclidean"` on L2-normalized vectors alongside current `cosine`.
+**Run this first. No rebuild needed — operates on the existing baseline UMAP embedding.**
 
-Run every combination. Each UMAP output should be followed by the full HDBSCAN pipeline and `experiment_scorecard()`.
-
----
-
-### HDBSCAN Full Grid Search
-
-Set `RUN_HDBSCAN_GRID_SEARCH = True` in the notebook master cell. Expand `configs/dev.yaml`:
-
+Expand `configs/dev.yaml`:
 ```yaml
 hdbscan_grid:
   min_cluster_size: [15, 25, 50, 75, 100, 150, 200]
@@ -626,10 +489,9 @@ hdbscan_grid:
   cluster_method: [leaf, eom]
 ```
 
-After the grid runs, load results and filter to configs producing 12–20 tribes. The grid result file is named by the notebook as `hdbscan_grid_{VECTOR_SOURCE}_{SELECTED_REDUCER}_full.parquet` — in the current dev baseline that is `data/dev/hdbscan_grid_item2vec_umap_full.parquet`.
+Set `RUN_HDBSCAN_GRID_SEARCH = True` in the notebook master cell. After the grid runs, filter for good candidates:
 
 ```python
-# Read the grid results (run grid_search_hdbscan with RUN_HDBSCAN_GRID_SEARCH=True first)
 hdb_grid = pl.read_parquet(DATA_PROCESSED / f"hdbscan_grid_{VECTOR_SOURCE}_{SELECTED_REDUCER}_full.parquet")
 candidates = hdb_grid.filter(
     (pl.col("n_clusters") >= 12) & (pl.col("n_clusters") <= 20) & (pl.col("noise_pct") < 15)
@@ -637,13 +499,24 @@ candidates = hdb_grid.filter(
 print(candidates.select(["min_cluster_size","min_samples","cluster_method","n_clusters","noise_pct","silhouette"]))
 ```
 
-For each candidate, run full `cluster_hdbscan()` + `assign_hdbscan_noise_to_nearest_tribe()` with explicit `cache_path` arguments, then `experiment_scorecard()`.
+For each promising candidate (pick 3–4 configs), run full clustering and score:
 
-`cluster_method: leaf` finds more, smaller, tighter clusters. `eom` merges sub-clusters more aggressively. Test both across all `min_cluster_size` values.
+```python
+core = cluster_hdbscan(cluster_space,
+           min_cluster_size=50, min_samples=3, cluster_selection_method="leaf",
+           force=True, cache_path=DATA_PROCESSED / "cluster_core_m3_mcs50_ms3_leaf.parquet")
+full = assign_hdbscan_noise_to_nearest_tribe(cluster_space, core, force=True,
+           cache_path=DATA_PROCESSED / "cluster_labels_m3_mcs50_ms3_leaf.parquet")
+experiment_scorecard(full, cluster_space, method_name="m3_mcs50_ms3_leaf")
+```
+
+`cluster_method=leaf` finds more, smaller, tighter clusters. `eom` merges sub-clusters more aggressively. Test both across `min_cluster_size` values. The grid output shows which density resolution produces the cleanest product stories without excessive noise.
 
 ---
 
-### Gaussian Mixture Models (GMM)
+### 2. Gaussian Mixture Models (GMM)
+
+**No UMAP rebuild needed. Runs on the existing baseline UMAP embedding.**
 
 GMM produces soft probabilistic assignments instead of hard labels. Unlike HDBSCAN, it has no noise points — every customer gets assigned. It also handles elliptical clusters that HDBSCAN misses.
 
@@ -678,294 +551,244 @@ def cluster_gmm(umap_cluster: pl.DataFrame, n_components: int, *, force=False,
     return df
 ```
 
-Try `n_components: 10`, `12`, `15`, `18`, `20`. Compare BIC scores (lower = better model fit). Call `experiment_scorecard()` on each. Also try `covariance_type="tied"` and `"diag"` — different covariance structures reveal different cluster shapes.
+Try `n_components=12`, `15`, `18`. Compare BIC scores (lower = better model fit). Call `experiment_scorecard()` on each.
+
+```python
+for k in [12, 15, 18]:
+    labels = cluster_gmm(cluster_space, n_components=k, force=True,
+                 cache_path=DATA_PROCESSED / f"cluster_labels_m3_gmm_k{k}.parquet")
+    experiment_scorecard(labels, cluster_space, method_name=f"m3_gmm_k{k}")
+```
 
 ---
 
-### Bisecting K-Means — Surgical Tribe Splitting
+### 3. Bisecting K-Means — Surgical Tribe Splitting
 
-Apply bisecting K-Means to any tribe whose avg top-5 lift is below the global average (9.32×). Currently that includes C5, C6, C7, and C9 — but after running other experiments the list may change. This lets you re-split whatever weak tribes the global algorithms leave behind.
+**No UMAP rebuild needed. Works on baseline cluster labels and baseline UMAP.**
+
+Apply bisecting K-Means to the four weakest tribes (C5, C6, C7, C9 — lift 4.2×–7.4×). Run each independently first, then combine the winning splits into one final merged label set.
+
+M4 provides qualitative review of each split result in parallel — check their feedback before deciding whether to combine splits.
 
 ```python
 from sklearn.cluster import BisectingKMeans
 import numpy as np
 
-baseline = pl.read_parquet("data/dev/cluster_labels_hdbscan_assigned.parquet")
-umap     = pl.read_parquet("data/dev/umap_cluster_item2vec.parquet")
+baseline = pl.read_parquet(DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet")
+umap     = pl.read_parquet(DATA_PROCESSED / "umap_cluster_item2vec.parquet")
 dim_cols = [c for c in umap.columns if c not in ("cliente", "promo_rate")]
 
-# Target: any tribe with n > 3000 OR avg top-5 lift < 9.32 (fill this in from your scorecard)
-weak_tribes = [5, 6, 7, 9]   # update based on your actual scorecard output
-
-new_label_parts = [baseline.filter(~pl.col("cluster").is_in(weak_tribes))]
+weak_tribes = [5, 6, 7, 9]
 
 for tribe_id in weak_tribes:
-    for n_splits in [2, 3, 4]:
+    for n_splits in [2, 3]:
         tribe_customers = baseline.filter(pl.col("cluster") == tribe_id)["cliente"]
         tribe_umap      = umap.filter(pl.col("cliente").is_in(tribe_customers))
         X_tribe         = tribe_umap.select(dim_cols).to_numpy().astype(np.float32)
 
         bkm = BisectingKMeans(
-            n_clusters=n_splits, random_state=RANDOM_SEED, bisecting_strategy="largest_cluster"
+            n_clusters=n_splits, random_state=RANDOM_SEED,
+            bisecting_strategy="largest_cluster"
         )
         sub_labels = bkm.fit_predict(X_tribe)
         sub_df = tribe_umap.select("cliente").with_columns(
             pl.Series("cluster", (tribe_id * 10 + sub_labels).astype(np.int32)),
             pl.lit(0.0).alias("promo_rate"),
         )
-        merged = pl.concat(new_label_parts[:1] + [sub_df]).sort("cliente")
-        experiment_scorecard(merged, umap, method_name=f"bisect_C{tribe_id}_k{n_splits}")
+        others = baseline.filter(~pl.col("cluster").is_in([tribe_id]))
+        merged = pl.concat([others, sub_df]).sort("cliente")
+        experiment_scorecard(merged, umap, method_name=f"m3_bisect_C{tribe_id}_k{n_splits}")
 ```
 
-Run on each weak tribe independently first, then combine all the winning splits into one final label set and run `experiment_scorecard()` on the combined result.
-
----
-
-### Agglomerative Hierarchical Clustering
-
-Hierarchical clustering builds a dendrogram — you can cut it at any level to get any number of tribes. Unlike HDBSCAN, it has no noise. Unlike K-Means, it doesn't assume spherical clusters. Does not scale to 44k customers, but scales fine on the 12k HDBSCAN fit sample.
+After identifying the best split for each weak tribe, combine all winning splits into one final label set and score:
 
 ```python
-from sklearn.cluster import AgglomerativeClustering
-import scipy.cluster.hierarchy as sch
-import matplotlib.pyplot as plt
-
-# Use the HDBSCAN fit sample (same 12k customers used to fit the baseline)
-fit_sample_customers = pl.read_parquet("data/dev/hdbscan_fit_sample_customers.parquet")  # if saved
-# If not saved, resample using RANDOM_SEED:
-rng = np.random.default_rng(42)
-sample_idx = rng.choice(len(umap), size=12000, replace=False)
-X_sample   = umap.select(dim_cols).to_numpy().astype(np.float32)[sample_idx]
-
-# Plot dendrogram to choose the cut
-Z = sch.linkage(X_sample, method="ward")
-plt.figure(figsize=(12, 5))
-sch.dendrogram(Z, truncate_mode="lastp", p=30, leaf_rotation=90)
-plt.title("Hierarchical clustering dendrogram")
-plt.tight_layout()
-plt.savefig("outputs/dev/dendrogram.png")
-plt.show()
-
-# Cut at chosen level
-for n_tribes in [12, 15, 18]:
-    agg = AgglomerativeClustering(n_clusters=n_tribes, linkage="ward")
-    sample_labels = agg.fit_predict(X_sample)
-    # Extend to full population via nearest-neighbour (same as HDBSCAN noise assignment)
-    from sklearn.neighbors import NearestNeighbors
-    X_full = umap.select(dim_cols).to_numpy().astype(np.float32)
-    nn = NearestNeighbors(n_neighbors=1, metric="cosine", n_jobs=1).fit(X_sample)
-    _, idx = nn.kneighbors(X_full)
-    full_labels = sample_labels[idx.ravel()].astype(np.int32)
-    labels_df   = umap.select("cliente").with_columns(
-        pl.Series("cluster", full_labels),
-        pl.lit(0.0).alias("promo_rate"),
-    ).sort("cliente")
-    experiment_scorecard(labels_df, umap, method_name=f"hierarchical_ward_k{n_tribes}")
+experiment_scorecard(combined_merged, umap, method_name="m3_bisect_all_combined")
 ```
-
-The dendrogram is the most useful output — it shows you visually at what distance the natural breaks occur.
 
 ---
 
-### OPTICS
+### 4. UMAP Hyperparameter Sweep
 
-OPTICS is a generalization of DBSCAN/HDBSCAN that uses a reachability plot to allow variable-density clusters. It is more robust to clusters with unequal density, which is common in real customer data where niche tribes (tight, high-lift) and broad behavioral groups (diffuse, lower-lift) coexist in the same embedding space.
+**Prerequisite: M2's BM25 vectors are ready. Run on M2's best customer vector output, not the baseline.**
+
+If M2's vectors are not ready yet, start on the baseline and re-run on M2's vectors once they arrive.
+
+Edit `configs/dev.yaml` (one change at a time, one rebuild each):
+
+```yaml
+# n_neighbors — current: 20 in dev.yaml; try these
+umap:
+  n_neighbors: 15    # more local structure, potentially more distinct tribes
+
+# cluster_dims — current: 50; try these
+umap:
+  cluster_dims: 30   # tighter manifold, may separate dense sub-groups
+
+# min_dist_cluster — current: 0.05; try this
+umap:
+  min_dist_cluster: 0.0   # packs embeddings tighter, sharpens density peaks
+```
+
+Reload modules between each change. For each config, rebuild UMAP and re-run HDBSCAN with the best parameters found in step 1:
 
 ```python
-from sklearn.cluster import OPTICS
-
-dim_cols = [c for c in umap.columns if c not in ("cliente", "promo_rate")]
-X = umap.select(dim_cols).to_numpy().astype(np.float32)
-
-for min_samples in [5, 10, 20]:
-    for xi in [0.05, 0.1, 0.2]:
-        clust = OPTICS(min_samples=min_samples, xi=xi, metric="cosine", n_jobs=1)
-        clust.fit(X)
-        labels = clust.labels_.astype(np.int32)
-        n_noise = (labels == -1).sum()
-        n_tribes = len(set(labels)) - (1 if -1 in labels else 0)
-        print(f"  min_samples={min_samples}, xi={xi}: {n_tribes} tribes, {n_noise} noise ({n_noise/len(labels):.1%})")
-
-        if n_tribes >= 8 and n_noise / len(labels) < 0.15:
-            # Assign noise via nearest-neighbour same as HDBSCAN
-            noise_mask = labels == -1
-            non_noise_X = X[~noise_mask]
-            non_noise_labels = labels[~noise_mask]
-            nn = NearestNeighbors(n_neighbors=1, metric="cosine", n_jobs=1).fit(non_noise_X)
-            _, idx = nn.kneighbors(X[noise_mask])
-            labels[noise_mask] = non_noise_labels[idx.ravel()]
-
-            labels_df = umap.select("cliente").with_columns(
-                pl.Series("cluster", labels),
-                pl.lit(0.0).alias("promo_rate"),
-            ).sort("cliente")
-            experiment_scorecard(labels_df, umap, method_name=f"optics_ms{min_samples}_xi{xi}")
+umap_nb15 = reduce_umap_cluster(cv_for_umap, force=True,
+                cache_path=DATA_PROCESSED / "umap_cluster_m3_nb15.parquet")
+core = cluster_hdbscan(umap_nb15, force=True,
+           cache_path=DATA_PROCESSED / "cluster_core_m3_nb15.parquet")
+full = assign_hdbscan_noise_to_nearest_tribe(umap_nb15, core, force=True,
+           cache_path=DATA_PROCESSED / "cluster_labels_m3_nb15.parquet")
+experiment_scorecard(full, umap_nb15, method_name="m3_umap_nb15")
 ```
+
+Run at most 3–4 configs. Each is ~35 min.
 
 ---
 
-### Deep Embedded Clustering (DEC)
+### 5. Feature Weight Ablations (only if steps 1–4 are done and time allows)
 
-DEC is a neural network that jointly optimizes a cluster assignment and a deep embedding. It starts from a pre-trained autoencoder (use Member 2's autoencoder) and then fine-tunes the encoder so that the embedding clusters cleanly. Purpose-built for unsupervised clustering.
+The current dev config has `promo=0.0` and `store=0.0`. Small non-zero weights add a behavioral dimension — but if they dominate topology the tribes become "promo hunters" or "geography clusters" rather than product tribes. Test carefully.
+
+```yaml
+feature_weights:
+  promo: 0.25    # try this first; revert if lift degrades
+```
+
+Only `FORCE_UMAP=True` and `FORCE_CLUSTERING=True` are needed. Call `experiment_scorecard()`. Revert the config change if lift does not improve.
+
+---
+
+## Member 4 — Tribe Profiles and Presentation
+
+**Files**: `src/tribe_namer.py`, notebook  
+**Artifact naming**: `method_name` of the form `m4_<descriptor>`.  
+**Day 1**: preparation and qualitative support for M3's bisecting K-Means experiments.  
+**Day 2**: all the substantive output — profiling, naming, tribe cards, 2D scatter, prod naming.  
+**Run order**: qualitative bisecting review (Day 1) → template prep → combined rebuild complete → profile → name → cards → 2D scatter (all Day 2). Re-run naming on prod profiles after M5's prod run finishes.
+
+M4 does not block any other member on Day 1. On Day 2, M4's tribe cards are the final presentation artifact — they should be ready before the sprint closes.
+
+---
+
+### Day 1 — Qualitative Review of Bisecting K-Means
+
+As M3 runs each bisecting split, inspect the scorecard output. For each sub-tribe, look at the top-product lift and check whether the split produces a coherent product story or merely a mechanical improvement in the metric.
+
+Flag splits that should be rejected:
+- Sub-tribes that share the same top products — the split is arbitrary
+- Sub-tribes where lift improves but the top products are incoherent (random products with no thematic link)
+- Sub-tribes with n < 440 customers (below the minimum gate)
+
+Communicate directly to M3: "C6 split into k=2 produces clean organic vs conventional sub-tribes — keep" vs "C9 split into k=3 is arbitrary — reject k=3, use k=2".
+
+---
+
+### Day 1 — Tribe Card Template
+
+Prepare a reusable Python function that formats a tribe row into a presentation card. This runs on Day 2 with the final named profiles.
 
 ```python
-import torch, torch.nn as nn
-import numpy as np
-from sklearn.cluster import KMeans
-
-# Step 1: Pre-train autoencoder (use Member 2's code)
-# Assume 'ae_model' is the trained CustomerAutoencoder and X is the input matrix
-
-# Step 2: Initialize cluster centers with K-Means on the bottleneck embeddings
-ae_model.eval()
-with torch.no_grad():
-    _, Z = ae_model(torch.FloatTensor(X))
-    Z_np = Z.numpy()
-
-n_clusters = 15
-km = KMeans(n_clusters=n_clusters, random_state=42, n_init=20)
-km.fit(Z_np)
-cluster_centers = torch.FloatTensor(km.cluster_centers_)
-
-# Step 3: DEC fine-tuning — Student's t-distribution soft assignment
-def soft_assignment(Z, centers, alpha=1.0):
-    q = 1.0 / (1.0 + torch.sum((Z.unsqueeze(1) - centers.unsqueeze(0)) ** 2, dim=2) / alpha)
-    q = q ** ((alpha + 1.0) / 2.0)
-    return q / q.sum(dim=1, keepdim=True)
-
-def target_distribution(q):
-    p = q ** 2 / q.sum(dim=0)
-    return p / p.sum(dim=1, keepdim=True)
-
-centers = nn.Parameter(cluster_centers)
-optimizer = torch.optim.Adam(list(ae_model.encoder.parameters()) + [centers], lr=1e-4)
-
-X_tensor = torch.FloatTensor(X)
-for iteration in range(200):
-    _, Z = ae_model(X_tensor)
-    q = soft_assignment(Z, centers)
-    if iteration % 50 == 0:
-        p    = target_distribution(q.detach())
-        loss = nn.functional.kl_div(q.log(), p, reduction="batchmean")
-        print(f"  DEC iter {iteration}: KL loss={loss.item():.4f}")
-    p    = target_distribution(q.detach())
-    loss = nn.functional.kl_div(q.log(), p, reduction="batchmean")
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-# Final hard assignments
-ae_model.eval()
-with torch.no_grad():
-    _, Z_final = ae_model(X_tensor)
-    q_final    = soft_assignment(Z_final, centers)
-    dec_labels = q_final.argmax(dim=1).numpy().astype(np.int32)
-
-labels_df = cv_weighted.select("cliente").with_columns(
-    pl.Series("cluster", dec_labels),
-    pl.lit(0.0).alias("promo_rate"),
-).sort("cliente")
-
-# Note: DEC produces its own embedding — pass the Z_final embeddings as 'umap_cluster'
-Z_df = cv_weighted.select("cliente").hstack(
-    pl.DataFrame(Z_final.numpy(), schema=[f"dim_{i}" for i in range(Z_final.shape[1])])
-)
-experiment_scorecard(labels_df, Z_df, method_name=f"dec_k{n_clusters}")
+def print_tribe_card(row: dict) -> None:
+    top5 = list(zip(
+        (row.get("top_products") or [])[:5],
+        (row.get("top_lifts")    or [])[:5],
+    ))
+    print(f"\n{'─'*60}")
+    print(f"C{row['cluster']:>2} | {row.get('tribe_name', '?')}")
+    print(f"{'─'*60}")
+    print(f"  Customers : {row['n_customers']:,}")
+    print(f"  Revenue   : {row.get('revenue_share', 0):.1%}")
+    print(f"  Avg basket: €{row.get('avg_basket_value', 0):.1f}  |  "
+          f"Promo rate: {row.get('avg_promo_rate', 0):.1%}")
+    print(f"  Top products by lift:")
+    for prod, lift in top5:
+        print(f"    {lift:.1f}×  {prod[:52]}")
+    desc = row.get("tribe_description") or row.get("description") or ""
+    if desc:
+        print(f"  Description: {desc}")
+    action = row.get("carrefour_action") or ""
+    if action:
+        print(f"  Action: {action}")
 ```
 
-Try `n_clusters=10`, `12`, `15`, `18`. DEC is particularly good at producing compact, well-separated clusters because it explicitly optimizes the cluster assignment objective.
-
 ---
 
-### Feature Weight Ablations
+### Day 1 — Baseline 2D UMAP Verification
 
-7. **Promo weight**: `feature_weights.promo` → `0.25`, `0.5`. Useful if promo sensitivity is orthogonal to product preferences; harmful if tribes become purely "promo hunters" with no product story.
-8. **Store weight**: `feature_weights.store` → `0.25`. Useful if it reveals format-driven product behavior (e.g. hypermarket vs convenience); harmful if it just separates customers by geography.
-
-Run each, call `experiment_scorecard()`, revert if lift degrades.
-
----
-
-## Member 4 — Temporal Validation & Tribe Presentation
-
-**Files**: `src/customer_vectors.py`, `src/tribe_namer.py`  
-**Artifact naming**: `method_name` of the form `m4_<descriptor>`, e.g. `m4_lifecycle_delta` or `m4_consensus_5runs`.  
-**Run order**: temporal stability first (read-only analysis, zero risk), then lifecycle vectors (new function, medium risk), then consensus clustering and BERT4Rec (high risk, do last).
-
----
-
-### Temporal Stability Experiments
-
-1. **Build time-windowed customer vectors.** Add a date-filtered version of `_build_interactions()` to `src/customer_vectors.py` that accepts `date_from` and `date_to` parameters and uses `date_to` as the recency decay reference. Build:
-   - W1+W2 vectors: 2022-01-01 – 2022-04-30 → `data/dev/customer_vectors_w12.parquet`
-   - W3 vectors: 2022-05-01 – 2022-06-30 → `data/dev/customer_vectors_w3.parquet`
-
-2. **Cluster W1+W2. Assign W3 via nearest-neighbour.** Run the standard UMAP + HDBSCAN on W1+W2 vectors. Assign W3 customers to the nearest W1+W2 tribe centroid using `sklearn.neighbors.NearestNeighbors(metric="cosine", n_jobs=1)` in raw vector space.
-
-3. **Measure top-product stability per tribe.** For each tribe, compute Jaccard overlap between the tribe's top-10 products in W1+W2 and in W3. ≥ 60% = stable. ≤ 30% = seasonal or noise. Report per-tribe.
-
-4. **Lifestyle vector experiment.** Build a per-customer concatenated vector: `[W1+W2_vector, W3_vector, (W3 − W1W2)_delta]`. Pass this to UMAP + HDBSCAN. The delta dimensions may expose customers transitioning between behavioral patterns and produce finer tribes.
-
-5. **Transition matrix.** For each customer active in both windows, record their tribe assignment in W1+W2 and in W3. Build a tribe × tribe transition matrix. High off-diagonal counts indicate either seasonal tribes or a poor clustering.
-
----
-
-### Sequential Pattern Model — BERT4Rec (Stretch Goal)
-
-BERT4Rec treats each customer's purchase history as a sequence and trains a bidirectional transformer to predict masked products. The [CLS] token output is a rich customer representation that captures sequential behavioral patterns, not just basket co-occurrence.
-
-```python
-# pip install recbole  (includes BERT4Rec, SASRec, and other sequential models)
-# OR implement a minimal version with HuggingFace transformers
-
-from transformers import BertConfig, BertModel
-import torch
-
-# Build input sequences: for each customer, sort their purchases by date
-# and convert to a sequence of product IDs (treat as token IDs)
-# Truncate to max_seq_len=50 (most recent 50 products)
-
-# Pseudocode — full implementation requires the interaction log sorted by date:
-# sequences = build_purchase_sequences(df_combined, max_len=50)  # (n_customers, 50)
-# token_ids = torch.LongTensor(sequences)
-
-config = BertConfig(
-    vocab_size=60000,     # number of unique product IDs
-    hidden_size=64,
-    num_hidden_layers=2,
-    num_attention_heads=4,
-    intermediate_size=128,
-    max_position_embeddings=52,
-)
-bert = BertModel(config)
-
-# Train with masked product prediction (mask random items, predict original)
-# Extract [CLS] embedding as customer vector
-# This captures "what product comes next given this sequence" — rich behavioral signal
-```
-
-BERT4Rec is a 2-day implementation. It's most valuable if sequential patterns in purchase order (e.g. customers who systematically expand from baby food to organic) are not captured by the basket co-occurrence approach.
-
----
-
-### Tribe Profiles and Naming
-
-5. **Profile the best result from other members.** Once you know which configuration has the highest scorecard, run `profile_tribes()` on those labels with `force=True`.
-
-6. **Name all tribes via Claude API.** `src/tribe_namer.py` is implemented:
-   ```python
-   from src.tribe_namer import name_all_tribes
-   profiles = pl.read_parquet("data/dev/tribe_profiles_<best_method>.parquet")
-   named    = name_all_tribes(profiles)
-   named.write_parquet("data/dev/tribe_profiles_final_named.parquet", compression="zstd")
-   ```
-
-7. **Produce one tribe card per tribe.** For the final presentation: tribe name, n customers, revenue share, avg basket, avg promo rate, top 5 products by lift, recommended Carrefour action.
-
-8. **Generate the final 2D UMAP visualization colored by tribe.** This is the primary presentation asset. The notebook already has a `reduce_umap_viz()` call that produces 2D coordinates. Re-run it on the final winning labels and produce the scatter plot:
+Confirm the 2D scatter plot pipeline works before Day 2. Run it on the baseline labels now so Day 2 only requires a single re-run with final labels.
 
 ```python
 from src.dimensionality import reduce_umap_viz
+import matplotlib.pyplot as plt, matplotlib.cm as cm, numpy as np
+
+umap_2d        = reduce_umap_viz(cluster_space, force=False)
+baseline_labels = pl.read_parquet(DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet")
+plot_df         = umap_2d.join(baseline_labels.select(["cliente", "cluster"]), on="cliente")
+
+clusters = sorted(plot_df["cluster"].unique().to_list())
+colors   = cm.tab20(np.linspace(0, 1, len(clusters)))
+
+fig, ax = plt.subplots(figsize=(14, 10))
+for cid, color in zip(clusters, colors):
+    sub = plot_df.filter(pl.col("cluster") == cid)
+    ax.scatter(sub["x"].to_numpy(), sub["y"].to_numpy(),
+               s=0.8, alpha=0.4, color=color, label=f"C{cid}")
+ax.legend(markerscale=8, fontsize=8, loc="upper right")
+ax.set_title("Customer Tribes — Baseline (UMAP 2D)")
+ax.set_axis_off()
+plt.tight_layout()
+plt.savefig(OUTPUTS / "tribe_map_baseline.png", dpi=150)
+plt.show()
+```
+
+---
+
+### Day 2 — Profile Winning Tribes
+
+**Prerequisite**: Day 2 combined rebuild complete and scorecard confirmed.
+
+```python
+from src.clustering import profile_tribes
+
+winner_labels = pl.read_parquet(DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet")
+profiles      = profile_tribes(winner_labels, method_name="combined_final_dev", force=True)
+profiles.write_parquet(DATA_PROCESSED / "tribe_profiles_combined_final_dev.parquet",
+                       compression="zstd")
+```
+
+---
+
+### Day 2 — Name All Tribes via Claude API
+
+`src/tribe_namer.py` is already implemented:
+
+```python
+from src.tribe_namer import name_all_tribes
+
+profiles = pl.read_parquet(DATA_PROCESSED / "tribe_profiles_combined_final_dev.parquet")
+named    = name_all_tribes(profiles)
+named.write_parquet(DATA_PROCESSED / "tribe_profiles_final_named.parquet", compression="zstd")
+print(named.select(["cluster", "tribe_name", "n_customers"]))
+```
+
+---
+
+### Day 2 — Tribe Cards
+
+```python
+named_profiles = pl.read_parquet(DATA_PROCESSED / "tribe_profiles_final_named.parquet")
+for row in named_profiles.sort("cluster").to_dicts():
+    print_tribe_card(row)
+```
+
+---
+
+### Day 2 — Final 2D UMAP Scatter
+
+```python
+from src.dimensionality import reduce_umap_viz
+import matplotlib.pyplot as plt, matplotlib.cm as cm, numpy as np
 
 umap_2d = reduce_umap_viz(
     cluster_space,
@@ -973,16 +796,12 @@ umap_2d = reduce_umap_viz(
     cache_path=DATA_PROCESSED / "umap_viz_final_2d.parquet",
 )
 
-# Join 2D coords with tribe names for the colored scatter
 named_profiles = pl.read_parquet(DATA_PROCESSED / "tribe_profiles_final_named.parquet")
-id_to_name = dict(zip(named_profiles["cluster"].to_list(), named_profiles["tribe_name"].to_list()))
+id_to_name     = dict(zip(named_profiles["cluster"].to_list(),
+                          named_profiles["tribe_name"].to_list()))
 
 final_labels = pl.read_parquet(DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet")
-plot_df = umap_2d.join(final_labels.select(["cliente", "cluster"]), on="cliente")
-
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import numpy as np
+plot_df      = umap_2d.join(final_labels.select(["cliente", "cluster"]), on="cliente")
 
 clusters = sorted(plot_df["cluster"].unique().to_list())
 colors   = cm.tab20(np.linspace(0, 1, len(clusters)))
@@ -1004,223 +823,35 @@ plt.show()
 
 ---
 
-## Member 5 — Feature Engineering, Ensemble Methods & Production
+### Day 2 — Re-run Tribe Naming on Production Profiles
 
-**Files**: `src/customer_vectors.py`, `src/clustering.py`, `src/dimensionality.py`  
-**Artifact naming**: `method_name` of the form `m5_<descriptor>`, e.g. `m5_price_mission_concat` or `m5_consensus_5runs`.  
-**Run order**: feature engineering first (additive, low risk), then ensemble/two-stage methods (medium risk), then production run last (Day 3 only, after winner is selected).
-
-This member's work is orthogonal to Members 1–4. Feature engineering adds new behavioral dimensions to the customer vectors. Ensemble methods improve stability across the whole segmentation. The production run is the final deliverable — the full 1.48M-customer segmentation that the other four members' dev experiments feed into.
-
----
-
----
-
-### Consensus / Ensemble Clustering
-
-Run the same clustering algorithm multiple times on different UMAP projections (or different random seeds), then assign each customer to their most consistent tribe across runs. This removes instability from the final labels — a customer only gets firmly assigned to a tribe if they reliably land there.
+**Prerequisite**: M5's production run complete.
 
 ```python
-from collections import Counter
-import numpy as np, polars as pl
-from src.dimensionality import reduce_umap_cluster
-from src.clustering import cluster_hdbscan, assign_hdbscan_noise_to_nearest_tribe
-from src.config import DATA_PROCESSED, RANDOM_SEED
+import os; os.environ["CARREFOUR_MODE"] = "prod"
+import importlib, src.config; importlib.reload(src.config)
+from src.config import DATA_PROCESSED as PROD_DATA
+from src.tribe_namer import name_all_tribes
 
-N_RUNS = 5
-all_labels = []  # list of np.int32 arrays, one per run
-
-# reduce_umap_cluster() uses RANDOM_SEED from config — it does not accept random_state=.
-# To get different UMAP projections for consensus, temporarily patch the module constant.
-import src.dimensionality as _dim_mod
-
-for run in range(N_RUNS):
-    seed = RANDOM_SEED + run * 1000
-    _dim_mod.RANDOM_SEED = seed   # patch before calling — restore afterwards
-    umap_run = reduce_umap_cluster(
-        cv_for_umap, force=True,
-        cache_path=DATA_PROCESSED / f"umap_cluster_consensus_run{run}.parquet",
-    )
-    _dim_mod.RANDOM_SEED = RANDOM_SEED   # restore
-    core  = cluster_hdbscan(umap_run, force=True,
-                             cache_path=DATA_PROCESSED / f"cluster_core_run{run}.parquet")
-    full  = assign_hdbscan_noise_to_nearest_tribe(
-                umap_run, core, force=True,
-                cache_path=DATA_PROCESSED / f"cluster_full_run{run}.parquet")
-    all_labels.append(full.sort("cliente")["cluster"].to_numpy())
-
-# Pairwise label alignment (Hungarian algorithm to match cluster IDs across runs)
-# Simplest approach: use majority vote after aligning with run 0 as reference
-from scipy.optimize import linear_sum_assignment
-
-def align_labels(ref, new_labels, max_clusters=30):
-    cost = np.zeros((max_clusters, max_clusters), dtype=np.int32)
-    for r, n in zip(ref, new_labels):
-        if r >= 0 and n >= 0 and r < max_clusters and n < max_clusters:
-            cost[r, n] += 1
-    row_ind, col_ind = linear_sum_assignment(-cost)
-    mapping = {col_ind[i]: row_ind[i] for i in range(len(row_ind))}
-    return np.array([mapping.get(x, x) for x in new_labels], dtype=np.int32)
-
-ref_labels = all_labels[0]
-aligned    = [ref_labels] + [align_labels(ref_labels, lab) for lab in all_labels[1:]]
-
-# Assign each customer to the majority-vote tribe across N_RUNS
-stacked = np.stack(aligned, axis=1)   # (n_customers, N_RUNS)
-consensus_labels = np.array([
-    Counter(row).most_common(1)[0][0] for row in stacked
-], dtype=np.int32)
-
-customers = pl.read_parquet(DATA_PROCESSED / "umap_cluster_item2vec.parquet").sort("cliente")["cliente"]
-consensus_df = pl.DataFrame({
-    "cliente":    customers,
-    "cluster":    pl.Series(consensus_labels),
-    "promo_rate": pl.lit(0.0, dtype=pl.Float32).cast(pl.Float32).repeat_by(len(customers)).explode(),
-}).sort("cliente")
-
-umap_base = pl.read_parquet(DATA_PROCESSED / "umap_cluster_item2vec.parquet")
-experiment_scorecard(consensus_df, umap_base, method_name="consensus_hdbscan_5runs")
+prod_profiles = pl.read_parquet(PROD_DATA / "tribe_profiles_hdbscan_assigned.parquet")
+named_prod    = name_all_tribes(prod_profiles)
+named_prod.write_parquet(PROD_DATA / "tribe_profiles_final_named.parquet", compression="zstd")
 ```
-
-Consensus clustering typically improves ALL tribes simultaneously because unstable borderline customers get pulled to whichever tribe is their most consistent home.
 
 ---
 
-### Two-Stage Hierarchical Clustering
+## Member 5 — Feature Engineering & Production
 
-Instead of running one global clustering, first divide the customer space into 5–8 macro groups, then run a fine-grained clustering within each macro group. This avoids HDBSCAN's tendency to merge dense sub-groups into one large cluster.
-
-```python
-from sklearn.cluster import MiniBatchKMeans
-from src.clustering import cluster_hdbscan, assign_hdbscan_noise_to_nearest_tribe
-import polars as pl, numpy as np
-
-umap = pl.read_parquet("data/dev/umap_cluster_item2vec.parquet")
-dim_cols = [c for c in umap.columns if c not in ("cliente", "promo_rate")]
-X = umap.select(dim_cols).to_numpy().astype(np.float32)
-
-# Stage 1: coarse macro-groups
-km_macro = MiniBatchKMeans(n_clusters=6, random_state=42, n_init=5)
-macro_labels = km_macro.fit_predict(X)
-
-# Stage 2: fine-grained HDBSCAN within each macro group
-all_sub_labels = np.full(len(X), -1, dtype=np.int32)
-global_cluster_id = 0
-
-for macro_id in range(6):
-    mask      = macro_labels == macro_id
-    idx       = np.where(mask)[0]
-    X_sub     = X[mask]
-    sub_umap  = umap.filter(pl.Series(mask))
-
-    sub_core  = cluster_hdbscan(
-        sub_umap,
-        min_cluster_size=50,   # smaller — each macro group is ~7k customers
-        force=True,
-        cache_path=DATA_PROCESSED / f"cluster_core_macro{macro_id}.parquet",
-    )
-    sub_full  = assign_hdbscan_noise_to_nearest_tribe(
-        sub_umap, sub_core, force=True,
-        cache_path=DATA_PROCESSED / f"cluster_full_macro{macro_id}.parquet",
-    )
-    sub_raw   = sub_full.sort("cliente")["cluster"].to_numpy()
-
-    # Remap to globally unique IDs
-    for local_id in np.unique(sub_raw):
-        mask_sub = sub_raw == local_id
-        all_sub_labels[idx[mask_sub]] = global_cluster_id
-        global_cluster_id += 1
-
-labels_df = umap.select("cliente").with_columns(
-    pl.Series("cluster", all_sub_labels),
-    pl.lit(0.0).alias("promo_rate"),
-).sort("cliente")
-experiment_scorecard(labels_df, umap, method_name="two_stage_macro6_hdbscan")
-```
-
-Try `n_clusters=5`, `6`, `8` for the macro stage. The key insight: within a macro group the density structure is more uniform, so HDBSCAN can use a tighter `min_cluster_size` and still produce clean results.
+**Files**: `src/customer_vectors.py`, notebook  
+**Artifact naming**: `method_name` of the form `m5_<descriptor>`.  
+**Day 1 start**: immediately after Step 0 — all feature engineering reads `df_combined.parquet` directly and has no upstream dependency on M1/M2/M3.  
+**Day 1 output**: three feature parquet files ready to concatenate to the winning vector on Day 2 (only if the Day 1 sync decides to include them).  
+**Day 2**: production pipeline run — start as early as possible after the dev winner is confirmed. This is the final deliverable and takes 2–4 hours.  
+**Run order**: HHI features first (fastest), then basket mission, then price tier. Start prod run immediately on Day 2 after dev is confirmed — do not wait.
 
 ---
 
-### Contrastive Learning — Behavioral Distinctiveness Embeddings
-
-Contrastive learning explicitly trains customer embeddings so that customers with similar purchase behavior are close in vector space and customers with different behavior are far apart. This directly optimizes what the segmentation needs, rather than hoping that Word2Vec basket co-occurrence produces it indirectly.
-
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-
-# Input: existing 100D customer vectors (item2vec weighted mean)
-X  = np.array(cv_weighted["vector"].to_list(), dtype=np.float32)
-X_t = torch.FloatTensor(X)
-
-class ContrastiveEncoder(nn.Module):
-    def __init__(self, input_dim=100, proj_dim=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, 128), nn.ReLU(),
-            nn.Linear(128, proj_dim),
-        )
-    def forward(self, x):
-        return F.normalize(self.net(x), dim=1)
-
-def nt_xent_loss(z, temperature=0.5):
-    """NT-Xent contrastive loss (SimCLR). z has shape (2N, D)."""
-    N  = z.shape[0] // 2
-    z1, z2 = z[:N], z[N:]
-    z_all  = torch.cat([z1, z2], dim=0)
-    sim    = torch.mm(z_all, z_all.T) / temperature
-    # Mask out self-similarity
-    mask   = torch.eye(2 * N, dtype=torch.bool)
-    sim.masked_fill_(mask, float("-inf"))
-    labels = torch.cat([torch.arange(N, 2 * N), torch.arange(N)])
-    return F.cross_entropy(sim, labels)
-
-# Augmentation: add small Gaussian noise to create a "positive pair"
-def augment(x, noise_std=0.05):
-    return x + torch.randn_like(x) * noise_std
-
-encoder   = ContrastiveEncoder(input_dim=X.shape[1], proj_dim=64)
-optimizer = torch.optim.Adam(encoder.parameters(), lr=3e-4)
-loader    = DataLoader(TensorDataset(X_t), batch_size=512, shuffle=True)
-
-torch.manual_seed(42)
-for epoch in range(50):
-    total = 0
-    for (batch,) in loader:
-        z1   = encoder(augment(batch))
-        z2   = encoder(augment(batch))
-        loss = nt_xent_loss(torch.cat([z1, z2], dim=0))
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        total += loss.item()
-    if epoch % 10 == 0:
-        print(f"Epoch {epoch}: loss={total/len(loader):.4f}")
-
-encoder.eval()
-with torch.no_grad():
-    contrastive_vecs = encoder(X_t).numpy()
-
-cv_contrastive = pl.DataFrame({
-    "cliente": cv_weighted["cliente"],
-    "vector":  pl.Series(contrastive_vecs.tolist(), dtype=pl.List(pl.Float32)),
-})
-cv_contrastive.write_parquet("data/dev/customer_vectors_contrastive.parquet", compression="zstd")
-```
-
-Pass to UMAP + HDBSCAN and call `experiment_scorecard()`. Tune `noise_std` (augmentation strength) and `temperature`. Higher `noise_std` forces the encoder to learn a more robust representation of behavioral identity.
-
----
-
-### Price Tier & Basket Mission Feature Engineering
-
-The current customer vectors are entirely product-embedding-based. Adding explicit behavioral features can separate tribes that are product-similar but behaviorally distinct.
-
-**Price tier affinity** — for each customer, compute the fraction of spend in each price tier (budget / mid-range / premium) and add as 3 extra dimensions:
+### 1. Category Breadth and Shopping Diversity Features
 
 ```python
 import polars as pl
@@ -1228,7 +859,84 @@ from src.config import DATA_PROCESSED
 
 df = pl.scan_parquet(DATA_PROCESSED / "df_combined.parquet").collect(engine="streaming")
 
-# Classify products by price tier using per-product median price
+customer_diversity = (
+    df.group_by("cliente")
+    .agg([
+        pl.col("categoria1").n_unique().alias("n_categories"),
+        pl.col("idarticu").n_unique().alias("n_distinct_products"),
+        pl.col("idtransac").n_unique().alias("n_baskets"),
+        (pl.col("importe").sum() / pl.col("idtransac").n_unique()).alias("avg_basket_value"),
+    ])
+)
+
+for col in ["n_categories", "n_distinct_products", "n_baskets", "avg_basket_value"]:
+    min_v = customer_diversity[col].min()
+    max_v = customer_diversity[col].max()
+    customer_diversity = customer_diversity.with_columns(
+        ((pl.col(col) - min_v) / (max_v - min_v + 1e-8)).alias(f"{col}_norm")
+    )
+
+customer_diversity.write_parquet(
+    DATA_PROCESSED / "customer_diversity_features.parquet", compression="zstd"
+)
+print(f"Written: {len(customer_diversity):,} customers")
+```
+
+`n_categories` and `n_distinct_products` separate category specialists (niche tribes, typically high-lift) from generalists (large catch-all tribes). These 4 normalised scalar features can be concatenated to any customer vector before UMAP.
+
+---
+
+### 2. Basket Mission Distribution
+
+Classify each basket by mission, then represent each customer by their basket mission distribution.
+
+```python
+basket_stats = (
+    df.group_by(["cliente", "idtransac"])
+    .agg([
+        pl.len().alias("n_items"),
+        pl.col("importe").sum().alias("basket_value"),
+        pl.col("categoria1").n_unique().alias("n_categories"),
+    ])
+)
+
+basket_stats = basket_stats.with_columns(
+    pl.when((pl.col("n_items") >= 20) & (pl.col("basket_value") >= 50))
+       .then(pl.lit("stock_up"))
+    .when((pl.col("n_categories") <= 3) & (pl.col("n_items") <= 8))
+       .then(pl.lit("fresh_topup"))
+    .when((pl.col("n_items") <= 5) & (pl.col("basket_value") <= 15))
+       .then(pl.lit("convenience"))
+    .otherwise(pl.lit("mixed"))
+    .alias("mission")
+)
+
+customer_missions = (
+    basket_stats.group_by(["cliente", "mission"]).len()
+    .pivot(values="len", index="cliente", columns="mission", aggregate_function="sum")
+    .fill_null(0)
+)
+mission_cols = [c for c in customer_missions.columns if c != "cliente"]
+total = customer_missions.select(mission_cols).sum_horizontal()
+for col in mission_cols:
+    customer_missions = customer_missions.with_columns(
+        (pl.col(col) / total).alias(f"mission_{col}")
+    )
+customer_missions = customer_missions.select(
+    ["cliente"] + [f"mission_{c}" for c in mission_cols]
+)
+customer_missions.write_parquet(
+    DATA_PROCESSED / "customer_mission_features.parquet", compression="zstd"
+)
+```
+
+---
+
+### 3. Price Tier Affinity
+
+For each customer, compute the fraction of spend in each price tier (budget / mid / premium).
+
+```python
 product_price = (
     df.group_by("idarticu")
     .agg(pl.col("importe").median().alias("median_price"))
@@ -1250,123 +958,73 @@ customer_price = (
     .pivot(values="spend", index="cliente", columns="price_tier", aggregate_function="sum")
     .fill_null(0.0)
 )
-# Normalise to fractions
 tier_cols = [c for c in customer_price.columns if c != "cliente"]
 total     = customer_price.select(tier_cols).sum_horizontal()
 for col in tier_cols:
-    customer_price = customer_price.with_columns((pl.col(col) / total).alias(f"tier_{col}"))
+    customer_price = customer_price.with_columns(
+        (pl.col(col) / total).alias(f"tier_{col}")
+    )
 customer_price = customer_price.select(["cliente"] + [f"tier_{c}" for c in tier_cols])
-customer_price.write_parquet(DATA_PROCESSED / "customer_price_tier_features.parquet", compression="zstd")
-```
-
-**Basket mission distribution** — classify each basket by mission (stock-up, fresh top-up, convenience, non-food), then represent each customer by their basket mission distribution:
-
-```python
-basket_stats = (
-    df.group_by(["cliente", "idtransac"])
-    .agg([
-        pl.len().alias("n_items"),
-        pl.col("importe").sum().alias("basket_value"),
-        pl.col("categoria1").n_unique().alias("n_categories"),
-    ])
+customer_price.write_parquet(
+    DATA_PROCESSED / "customer_price_tier_features.parquet", compression="zstd"
 )
-
-# Simple heuristic classification
-basket_stats = basket_stats.with_columns(
-    pl.when((pl.col("n_items") >= 20) & (pl.col("basket_value") >= 50))
-       .then(pl.lit("stock_up"))
-    .when((pl.col("n_categories") <= 3) & (pl.col("n_items") <= 8))
-       .then(pl.lit("fresh_topup"))
-    .when((pl.col("n_items") <= 5) & (pl.col("basket_value") <= 15))
-       .then(pl.lit("convenience"))
-    .otherwise(pl.lit("mixed"))
-    .alias("mission")
-)
-
-customer_missions = (
-    basket_stats.group_by(["cliente", "mission"]).len()
-    .pivot(values="len", index="cliente", columns="mission", aggregate_function="sum")
-    .fill_null(0)
-)
-# Normalise
-mission_cols = [c for c in customer_missions.columns if c != "cliente"]
-total = customer_missions.select(mission_cols).sum_horizontal()
-for col in mission_cols:
-    customer_missions = customer_missions.with_columns((pl.col(col) / total).alias(f"mission_{col}"))
 ```
-
-Concatenate price tier and mission features to your best customer vector before UMAP:
-```python
-cv_augmented = cv_best.join(customer_price, on="cliente").join(customer_missions.select(["cliente"] + [f"mission_{c}" for c in mission_cols]), on="cliente")
-# Expand the vector column with the extra scalar columns before passing to UMAP
-```
-
-These features add orthogonal behavioral dimensions — a customer can be "organic product buyer" in one dimension and "premium price tier, stock-up mission" in another.
 
 ---
 
-### Category Breadth & Shopping Diversity Features
+### 4. Feature Concatenation Helper
 
-Customers who buy many distinct categories are generalists; customers who concentrate spend in 2–3 categories are specialists. The current vectors do not capture this directly — two customers with identical product embeddings but very different category concentration will look the same to UMAP.
+Prepare the helper to augment the winning customer vector with M5 features before UMAP. Used on Day 2 if the Day 1 sync decides to include M5 features.
 
+```python
+import polars as pl, numpy as np
+
+def augment_vectors_with_features(cv: pl.DataFrame, feature_paths: list) -> pl.DataFrame:
+    """Concatenate scalar feature columns onto a customer vector DataFrame."""
+    result = cv
+    for path in feature_paths:
+        feats = pl.read_parquet(path)
+        scalar_cols = [c for c in feats.columns if c != "cliente"]
+        result = result.join(feats.select(["cliente"] + scalar_cols), on="cliente", how="left")
+        for col in scalar_cols:
+            result = result.with_columns(pl.col(col).fill_null(0.0))
+
+    vec_array   = np.array(result["vector"].to_list(), dtype=np.float32)
+    extra_cols  = [c for c in result.columns if c not in ("cliente", "vector")]
+    extra_array = result.select(extra_cols).to_numpy().astype(np.float32)
+    combined    = np.hstack([vec_array, extra_array])
+
+    return result.select("cliente").with_columns(
+        pl.Series("vector", combined.tolist(), dtype=pl.List(pl.Float32))
+    )
+```
+
+---
+
+### 5. Production Pipeline Run (Day 2 — start immediately after dev winner confirmed)
+
+**This is the most important output of the sprint. Start it before working on anything else on Day 2 afternoon.**
+
+**Prerequisites before starting:**
+1. Day 2 combined dev rebuild complete and scorecard confirms improvement.
+2. `configs/dev.yaml` matches the winning configuration.
+3. `git status` is clean on your branch.
+
+**Verify prod data is present:**
 ```python
 import polars as pl
-from src.config import DATA_PROCESSED
-
-df = pl.scan_parquet(DATA_PROCESSED / "df_combined.parquet").collect(engine="streaming")
-
-customer_diversity = (
-    df.group_by("cliente")
-    .agg([
-        pl.col("categoria1").n_unique().alias("n_categories"),
-        pl.col("idarticu").n_unique().alias("n_distinct_products"),
-        pl.col("idtransac").n_unique().alias("n_baskets"),
-        (pl.col("importe").sum() / pl.col("idtransac").n_unique()).alias("avg_basket_value"),
-        (pl.col("importe") / pl.col("importe").sum()).pow(2).sum().alias("spend_hhi"),
-        # Herfindahl-Hirschman Index of category spend — high HHI = category specialist
-    ])
-)
-
-# Normalise each feature to [0, 1] before concatenating to the customer vector
-for col in ["n_categories", "n_distinct_products", "avg_basket_value", "spend_hhi"]:
-    min_v = customer_diversity[col].min()
-    max_v = customer_diversity[col].max()
-    customer_diversity = customer_diversity.with_columns(
-        ((pl.col(col) - min_v) / (max_v - min_v + 1e-8)).alias(f"{col}_norm")
-    )
-
-customer_diversity.write_parquet(DATA_PROCESSED / "customer_diversity_features.parquet", compression="zstd")
+df = pl.scan_parquet("data/processed/df_combined.parquet")
+print(df.collect(engine="streaming").shape)
+# Expected: (191017715, 13)
 ```
 
-Concatenate these 4 normalised scalar features to the product vector before UMAP. The `spend_hhi` (Herfindahl index) is particularly useful — it separates category specialists (high HHI, typically high-lift niche tribes) from generalists (low HHI, typically large catch-all tribes).
-
----
-
-### Production Pipeline Run (Day 3 — after winner is selected)
-
-This is the most important output of the sprint. The dev experiments run on 44k customers. The production run applies the winning configuration to the full 1.48M eligible customers.
-
-**Prerequisites before starting the prod run:**
-1. The winner-selection code has run and identified a winning `method_name`.
-2. `configs/dev.yaml` has been updated to match the winning configuration.
-3. All final state checklist assertions pass on the dev result.
-4. `git status` is clean on your branch.
-
-**Run the production pipeline:**
-
+**Switch to prod mode and run:**
 ```powershell
-# Switch to prod mode
 $env:CARREFOUR_MODE = "prod"
-
-# Verify prod data is present
-python -c "import polars as pl; df = pl.scan_parquet('data/processed/df_combined.parquet'); print(df.collect(engine='streaming').shape)"
-# Expected: (191017715, 13) — 191M rows
-
-# Open the ML notebook in prod mode
 jupyter notebook notebooks/03_ml_pipeline.ipynb
 ```
 
-In the notebook master cell, set **only** the force flags corresponding to what the winning experiment changed:
+In the notebook master cell, set only the force flags corresponding to what the winning experiment changed:
 
 ```python
 # Example: if the winner changed word2vec window + BM25 weighting
@@ -1376,7 +1034,7 @@ FORCE_UMAP       = True    # vectors changed, UMAP must refit
 FORCE_CLUSTERING = True    # always rebuild final labels in prod
 ```
 
-The production UMAP fits on a 300k-customer sample (configured in `configs/base.yaml` under `umap.fit_sample`) and transforms all 1.48M customers. HDBSCAN fits on a 300k sample and assigns the rest via nearest-neighbour. This run will take **2–4 hours** depending on the hardware.
+The production UMAP fits on a 300k-customer sample and transforms all 1.48M customers. HDBSCAN fits on 300k and assigns the rest via nearest-neighbour. This run will take **2–4 hours**.
 
 **After the prod run completes, run the production scorecard:**
 
@@ -1386,35 +1044,58 @@ os.environ["CARREFOUR_MODE"] = "prod"
 import importlib, src.config; importlib.reload(src.config)
 from src.config import DATA_PROCESSED
 
-# Load prod labels and UMAP embedding
 prod_labels = pl.read_parquet(DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet")
 prod_umap   = pl.read_parquet(DATA_PROCESSED / "umap_cluster_item2vec.parquet")
-
 experiment_scorecard(prod_labels, prod_umap, method_name="prod_final")
 ```
 
 The production scorecard must show:
-- Avg top-5 lift > 9.32× (same bar as dev, adjusted for larger population)
+- Avg top-5 lift > 9.32×
 - All tribes ≥ 440 customers (0.04% of 1.48M — a much softer gate than dev)
 - Silhouette ≥ 0.20 (production silhouette is typically lower than dev due to population size)
 
-**Finally, run `name_all_tribes()` on the production profiles:**
+---
 
-```python
-from src.tribe_namer import name_all_tribes
+## Day 2 Integration
 
-prod_profiles = pl.read_parquet(DATA_PROCESSED / "tribe_profiles_hdbscan_assigned.parquet")
-named = name_all_tribes(prod_profiles)
-named.write_parquet(DATA_PROCESSED / "tribe_profiles_final_named.parquet", compression="zstd")
-```
+### Morning: Combined Clean Rebuild
 
-This is the final deliverable: `data/processed/tribe_profiles_final_named.parquet` contains the full production segmentation with commercial names, descriptions, and recommended Carrefour actions.
+**One designated person runs this.** Everyone else prepares tribe card templates and verifies prod data is accessible.
+
+1. Update `configs/dev.yaml` with the combined winning configuration from the Day 1 sync.
+2. Reload all modules (Rule 5).
+3. Set force flags only for the stages that changed (Rule 6).
+4. Run the full pipeline through to `assign_hdbscan_noise_to_nearest_tribe()`.
+5. Call `experiment_scorecard()` with `method_name="combined_final_dev"`.
+6. Confirm `improved: true` before proceeding.
+
+If the combined result does not beat the baseline: check that `dev.yaml` was actually updated, modules were reloaded, and force flags hit the right stages. If still no improvement, fall back to the single best individual experiment as the winning config.
+
+### Afternoon: Parallel Deliverables
+
+Once the dev scorecard is confirmed:
+- **M5 starts the production run immediately** — this is the longest-running task and blocks the final deliverable.
+- **M4 starts tribe profiling, naming, and cards** — use the dev results. The prod run will finish later and M4 re-runs the naming step on prod profiles once M5 is done.
+
+### Selecting the Winner Config
+
+**Compatibility rules**:
+- M1 (embeddings) + M2 (vectors): always compatible — sequential pipeline stages.
+- M2 (vectors) + M3 (UMAP/clustering): always compatible.
+- M5 features + any vector: compatible, but only include M5 features if they improved lift in an isolated test on Day 1. Do not add them speculatively — each additional UMAP dimension can hurt cluster separation.
+- M3's best HDBSCAN params should be applied on top of whatever vectors M1+M2 produce.
+
+**Selection order:**
+1. Highest avg top-5 lift across all tribes
+2. Highest tribe count with all tribes ≥ 3× lift
+3. Min tribe size ≥ 440
+4. Fewest tribes with lift below the current average
 
 ---
 
 ## Selecting and Applying the Winner
 
-Run this after all experiments are complete (or at the end of each day to see progress). It reads all accumulated scorecard results, ranks them, and applies the best configuration.
+Run this at the Day 1 sync and again after the Day 2 combined rebuild.
 
 ```python
 import json, shutil
@@ -1425,7 +1106,6 @@ from src.config import OUTPUTS, DATA_PROCESSED
 RESULTS_FILE = OUTPUTS / "experiment_results.json"
 results = json.loads(RESULTS_FILE.read_text(encoding="utf-8"))
 
-# Rank: primary = avg_top5_lift, secondary = tribe_count, gate = min_size >= 440 and improved
 valid = [r for r in results if r["improved"] and r["min_size"] >= 440]
 
 if not valid:
@@ -1449,48 +1129,25 @@ else:
     for i, r in enumerate(ranked[:10]):
         print(f"  {i+1:2}. {r['method']:<45} lift={r['avg_top5_lift']:.3f}× tribes={r['tribe_count']}")
 
-# After identifying the winner, promote its label file to the live path:
 winner_labels_path = DATA_PROCESSED / f"cluster_labels_{winner['method']}.parquet"
 live_labels_path   = DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet"
 
 if winner_labels_path.exists():
-    shutil.copy2(live_labels_path, DATA_PROCESSED / "cluster_labels_hdbscan_assigned_pre_sprint.parquet")
+    shutil.copy2(live_labels_path,
+                 DATA_PROCESSED / "cluster_labels_hdbscan_assigned_pre_sprint.parquet")
     shutil.copy2(winner_labels_path, live_labels_path)
     print(f"\nPromoted {winner_labels_path.name} → cluster_labels_hdbscan_assigned.parquet")
     print("Previous labels saved as cluster_labels_hdbscan_assigned_pre_sprint.parquet")
 else:
     print(f"\nWARNING: winner artifact not found at {winner_labels_path}")
-    print("Run the final pipeline manually with the winning config and save with cache_path set to the winner method name.")
+    print("Run the final pipeline manually with the winning config and save with cache_path set.")
 ```
 
-**Important**: the winner-selection code renames artifact files but does not change `configs/dev.yaml` automatically — update the config manually to match the winning experiment's parameters before the final pipeline run. The file name tells you which experiment won; trace it back to the experiment section to find the config values.
+**Important**: the winner-selection code renames artifact files but does not change `configs/dev.yaml` automatically. Update the config manually to match the winning experiment's parameters before the prod pipeline run.
 
 ---
 
-## Day 3 Integration
-
-Each member shares their best `experiment_scorecard()` output. Agree on a combined config and run the final pipeline.
-
-**Selection order:**
-1. Highest avg top-5 lift across all tribes
-2. Highest tribe count with all tribes ≥ 3× lift
-3. Min tribe size ≥ 440
-4. Lowest number of tribes with lift below the current avg (9.32×)
-
-**Compatibility:**
-- M1 (embeddings) + M2 (vectors): always compatible — different pipeline stages
-- M1/M2 + M5 (features): compatible — M5 concatenates new scalar features to whatever vector M1/M2 produce
-- M2 (vectors) + M3 (clustering): always compatible
-- M3 (clustering) + M4 (temporal): compatible — temporal is post-hoc validation
-- M5 (prod run): runs last, after all other members have identified their winning config
-
-Agree on one `configs/dev.yaml`. One person runs the final pipeline with all four force flags set correctly for the stages that changed. Run `experiment_scorecard()` one final time on the combined result. This result must appear in `outputs/dev/experiment_results.json` with `improved: true`.
-
-Member 4 runs `name_all_tribes()` on the final profiles only after the scorecard confirms improvement.
-
-### Final State Checklist
-
-Before closing the sprint, verify all of the following:
+## Final State Checklist
 
 ```python
 import json, polars as pl
@@ -1502,28 +1159,28 @@ assert (DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet").exists()
 # 2. Baseline is preserved
 assert (DATA_PROCESSED / "cluster_labels_hdbscan_assigned_baseline.parquet").exists()
 
-# 3. Final scorecard beats baseline
+# 3. Final dev scorecard beats baseline
 results  = json.loads((OUTPUTS / "experiment_results.json").read_text())
 final    = sorted([r for r in results if r["improved"]], key=lambda x: x["avg_top5_lift"], reverse=True)
 assert final, "No improved result found — sprint did not improve the segmentation"
 winner   = final[0]
 assert winner["avg_top5_lift"] > 9.32, f"Lift {winner['avg_top5_lift']} not above baseline 9.32"
-assert winner["min_size"] >= 440,     f"Min tribe size {winner['min_size']} below threshold"
+assert winner["min_size"] >= 440,      f"Min tribe size {winner['min_size']} below threshold"
 print(f"Sprint complete. Winner: {winner['method']} | lift={winner['avg_top5_lift']}× | tribes={winner['tribe_count']}")
 
-# 4. Named tribe profiles exist (dev)
+# 4. Named dev tribe profiles exist
 assert (DATA_PROCESSED / "tribe_profiles_final_named.parquet").exists(), \
-    "Run name_all_tribes() on the final tribe profiles"
+    "Run name_all_tribes() on the final dev tribe profiles"
 
-# 5. Production run complete (Member 5)
+# 5. Production run complete
 import os; os.environ["CARREFOUR_MODE"] = "prod"
 import importlib, src.config; importlib.reload(src.config)
 from src.config import DATA_PROCESSED as PROD_DATA
 assert (PROD_DATA / "tribe_profiles_final_named.parquet").exists(), \
-    "Production run not complete — Member 5 must run the prod pipeline and name_all_tribes()"
+    "Production run not complete — M5 must run the prod pipeline and name_all_tribes()"
 ```
 
-If any assertion fails, the sprint is not done. Do not merge to the main branch until all assertions pass.
+If any assertion fails, the sprint is not done. Do not merge until all assertions pass.
 
 ---
 
@@ -1541,39 +1198,32 @@ If any assertion fails, the sprint is not done. Do not merge to the main branch 
 | `data/dev/df_combined.parquet` | Source of truth — never modify or delete |
 | `data/dev/tribe_profiles_hdbscan_assigned.parquet` | Current baseline profiles |
 
+---
+
 ## Experiment Summary Matrix
 
-| Member | Experiment | Effort | Expected lift improvement |
-|---|---|---|---|
-| 1 | Word2Vec window/epoch tuning | Low | Medium — sharper product neighborhoods |
-| 1 | Popularity filter tightening | Low | Medium — removes noise from staples |
-| 1 | Negative sampling rate | Low | Low-Medium — better rare product embeddings |
-| 1 | Embedding dimension sweep | Low | Low-Medium |
-| 1 | CBOW vs skip-gram | Low | Unknown — try both |
-| 1 | Node2Vec graph embeddings | Medium | High — graph structure captures community membership |
-| 2 | BM25 weighting | Low | High — reduces staple domination in all vectors |
-| 2 | Recency half-life sweep | Low | Medium — affects all tribes proportionally |
-| 2 | Top-N product pooling | Low | Medium — sharpens niche signal in all tribes |
-| 2 | NMF topic decomposition | Medium | High — inherently interpretable topics |
-| 2 | LDA topic modeling | Medium | High — probabilistic topics, often cleaner than NMF |
-| 2 | Autoencoder embeddings | Medium | Medium — non-linear compression |
-| 2 | VAE embeddings | Medium-High | High — smooth latent space, better cluster separation |
-| 2 | Short/long-term vector split | Medium | Medium — may reveal transitioning customers |
-| 3 | UMAP n_neighbors/dims sweep | Low | Medium — changes topology, affects all tribes |
-| 3 | HDBSCAN full grid search | Low | High — finer density resolution across the whole space |
-| 3 | GMM | Low | Medium — handles elliptical clusters HDBSCAN misses |
-| 3 | Bisecting K-Means (surgical) | Low | High — targeted split of any weak tribe |
-| 3 | Agglomerative hierarchical | Medium | High — dendrogram reveals natural cut points |
-| 3 | OPTICS | Medium | Medium — variable-density clusters |
-| 3 | DEC (deep clustering) | High | High — jointly optimizes embedding and cluster assignment |
-| 3 | Promo/store feature ablations | Low | Unknown — test both directions |
-| 4 | Temporal stability analysis | Medium | N/A — validation only |
-| 4 | Lifecycle delta vectors | Medium | Medium — surfaces transitioning behavioral patterns |
-| 4 | BERT4Rec sequential | High | Unknown — captures sequential purchase patterns |
-| 5 | Price tier affinity features | Low | Medium — separates premium vs budget segments |
-| 5 | Basket mission distribution | Low-Medium | Medium — adds orthogonal behavioral dimensions |
-| 5 | Category breadth / HHI features | Low | Medium — separates specialists from generalists |
-| 5 | Consensus / ensemble clustering | Medium | High — stabilizes all tribes simultaneously |
-| 5 | Two-stage hierarchical clustering | Medium | High — resolves dense sub-groups that HDBSCAN merges |
-| 5 | Contrastive learning (SimCLR) | Medium-High | High — explicitly optimizes behavioral distinctiveness |
-| 5 | Production pipeline run | High (compute) | Final deliverable — 1.48M customers |
+| Member | Experiment | Effort | Est. time | Expected lift | Prerequisite |
+|---|---|---|---|---|---|
+| 1 | Word2Vec window=5 (try 3 if needed) | Low | ~50 min | Medium-High | Step 0 |
+| 1 | Popularity filter tightening | Low | ~50 min | Medium | M1 window improved |
+| 1 | Epochs / CBOW / dimension (optional) | Low | ~50 min each | Low-Medium | M1 window done |
+| 2 | BM25 weighting (k1=1.5) | Low | ~40 min | High | Step 0 |
+| 2 | Top-N product pooling (N=50) | Low | ~40 min | Medium | Step 0 |
+| 2 | Recency half-life sweep (30, 90) | Low | ~40 min each | Medium | Step 0 (if time) |
+| 2 | BM25 re-run on M1 embeddings | Low | ~40 min | High | M1 improved |
+| 3 | HDBSCAN full grid search | Low | ~20 min | High | Step 0 |
+| 3 | GMM (k=12, 15, 18) | Low | ~10 min each | Medium | Step 0 |
+| 3 | Bisecting K-Means (weak tribes) | Low | ~15 min each | High | Step 0 |
+| 3 | UMAP n_neighbors + dims sweep | Low | ~35 min each | Medium | M2 BM25 done |
+| 3 | Feature weight ablations (promo/store) | Low | ~35 min each | Unknown | M3-4 done (if time) |
+| 4 | Bisecting qualitative review | — | ongoing | N/A (supports M3) | Step 0 |
+| 4 | Tribe card template | — | ~1 hr | N/A (deliverable) | Step 0 |
+| 4 | Baseline 2D UMAP verification | — | ~30 min | N/A (deliverable) | Step 0 |
+| 4 | Profile + name + cards + 2D scatter | — | ~2 hr | N/A (deliverable) | Dev rebuild confirmed |
+| 4 | Re-run naming on prod profiles | — | ~30 min | N/A (deliverable) | Prod run complete |
+| 5 | HHI + diversity features | Low | ~60 min | Medium | Step 0 |
+| 5 | Basket mission features | Low | ~45 min | Medium | Step 0 |
+| 5 | Price tier affinity | Low | ~60 min | Medium | Step 0 |
+| 5 | **Production pipeline run** | High (compute) | **2–4 hours** | **Final deliverable** | Dev confirmed |
+
+**Out of scope for this sprint**: Node2Vec, NMF, LDA, autoencoder, VAE, DEC, contrastive learning, BERT4Rec, consensus clustering (5 full runs), two-stage hierarchical clustering, OPTICS, agglomerative hierarchical, temporal stability, lifecycle delta vectors, short/long-term vector split.
