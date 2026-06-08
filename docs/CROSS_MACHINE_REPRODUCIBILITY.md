@@ -35,14 +35,16 @@ replacing UMAP with a deterministic reducer (e.g., PCA-only). For this capstone
 the cluster *structure* (tribe profiles, top-product lift) is stable across machines
 even when individual cluster assignments shift at boundaries.
 
-### Residual — customer KPI float sums (not fixed)
+### Residual — customer KPI float sums (fixed)
 
 `customer_kpis.parquet` is built from streaming float sums (`avg_basket_size`,
-`total_spend_6m`). The same issue as the recency weight, but smaller effect.
-Observed impact: `strata_assignment_sha256` in `subset_metadata.json` differs
-between machines, meaning a small number of customers cross tertile boundaries.
-The `selected_customer_sha256` (the actual dev subset membership) has been
-identical across runs so far, so this has not caused a downstream problem.
+`total_spend_6m`). The same issue as the recency weight. Applied the same
+integer-quantization fix in Notebook 02 cell `bd862d2b`: `importe` is multiplied
+by `_EUR_SCALE = 100` and cast to `Int64` before any streaming aggregation.
+`total_spend_6m` and `avg_basket_size` are accumulated as integer eurocents and
+converted back to EUR only at the final `.with_columns()` step.
+Both `strata_assignment_sha256` and `selected_customer_sha256` should now be
+bit-identical across machines after a clean re-run.
 
 ## Verification Checksums
 
@@ -57,7 +59,7 @@ identical across machines.
 | Hash field | Required | Notes |
 |---|---|---|
 | `selected_customer_sha256` | must match | determines which rows are in `df_combined.parquet` dev |
-| `strata_assignment_sha256` | should match | KPI float residual may cause mismatch; acceptable if `selected_customer_sha256` matches |
+| `strata_assignment_sha256` | must match | KPI float fix applied; mismatch means `customer_kpis.parquet` was not rebuilt |
 
 Both files are tracked in git (gitignore exceptions added for `*.json` rule).
 
@@ -83,9 +85,9 @@ final selection. Apply the integer-quantization fix to the KPI aggregations in
 Notebook 02 Section 2.8 (the `avg_basket_size` and `total_spend_6m` streaming sums).
 
 **`strata_assignment_sha256` differs but `selected_customer_sha256` matches:**
-acceptable. The KPI floats shifted some customers between strata but the
-largest-remainder stable-hash selection was robust enough to pick the same people.
-No action needed.
+this should no longer happen after the integer-quantization fix. If it does,
+check whether `customer_kpis.parquet` was regenerated with the updated cell;
+delete the cache and re-run Notebook 02 Section 4.1.
 
 **`quality_report.json` differs:** something changed in production preprocessing.
 The raw parquets may differ between machines, or `src/data_quality.py` changed.
