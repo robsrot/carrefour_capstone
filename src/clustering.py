@@ -90,7 +90,7 @@ def cluster_hdbscan(
     Parameters
     ----------
     umap_cluster : DataFrame from reduce_umap_cluster() — columns [cliente, u0…u19, promo_rate].
-                   If None, loads umap_cluster_20d.parquet.
+                   If None, loads umap_cluster.parquet.
 
     Returns
     -------
@@ -104,8 +104,8 @@ def cluster_hdbscan(
         return pl.read_parquet(cache)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+        _log.info("Loading umap_cluster.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster.parquet")
 
     X, _ = _embedding_to_numpy(umap_cluster)
     N = len(X)
@@ -215,8 +215,8 @@ def assign_hdbscan_noise_to_nearest_tribe(
         _log.info("HDBSCAN assigned cache has older schema — rebuilding")
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+        _log.info("Loading umap_cluster.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster.parquet")
     if hdbscan_labels is None:
         _log.info("Loading cluster_labels_hdbscan.parquet ...")
         hdbscan_labels = pl.read_parquet(_HDBSCAN_CACHE)
@@ -305,8 +305,8 @@ def cluster_kmeans(
         return pl.read_parquet(cache)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+        _log.info("Loading umap_cluster.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster.parquet")
 
     # Derive K from HDBSCAN output if not provided
     if n_clusters is None:
@@ -371,8 +371,8 @@ def run_kmeans_baselines(
     not be the only source of the segment count.
     """
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+        _log.info("Loading umap_cluster.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster.parquet")
 
     if k_values is None:
         k_values = KMEANS_BASELINE_CLUSTERS
@@ -521,8 +521,8 @@ def grid_search_hdbscan(
         return pl.read_parquet(out)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
-        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+        _log.info("Loading umap_cluster.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster.parquet")
 
     if min_cluster_sizes is None:
         min_cluster_sizes = HDBSCAN_GRID_MIN_CLUSTER_SIZE

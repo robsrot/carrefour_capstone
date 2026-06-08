@@ -12,9 +12,15 @@ Scale strategy for UMAP (1.48M × 100 is too large for a single fit call):
 
 Public API
 ----------
-reduce_umap_cluster()  → data/processed/umap_cluster_20d.parquet
-reduce_umap_viz()      → data/processed/umap_viz_2d.parquet
-reduce_pca()           → data/processed/pca_cluster_20d.parquet
+reduce_umap_cluster()  → data/processed/umap_cluster.parquet
+reduce_umap_viz()      → data/processed/umap_viz.parquet
+reduce_pca()           → data/processed/pca_cluster.parquet
+
+The number of clustering dimensions is controlled by umap.cluster_dims in base.yaml
+(currently 50). Filenames intentionally omit the dimension count so they never
+become stale when that config value changes.  Source-specific runs (e.g.
+reduce_umap_cluster(cache_path=...umap_cluster_item2vec.parquet)) use explicit
+paths supplied by the caller; the module-level defaults are only fallbacks.
 
 All functions accept a Polars DataFrame with columns [cliente, vector, promo_rate]
 and return one with [cliente, <dim columns>, promo_rate].
@@ -50,9 +56,9 @@ _log = logging.getLogger(__name__)
 
 # UMAP_FIT_SAMPLE is loaded from config (base: 300k prod, 30k dev).
 
-_UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
-_UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
-_PCA_CACHE          = DATA_PROCESSED / "pca_cluster_20d.parquet"
+_UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster.parquet"
+_UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz.parquet"
+_PCA_CACHE          = DATA_PROCESSED / "pca_cluster.parquet"
 _PCA_MODEL_CACHE    = DATA_PROCESSED / "pca_model.pkl"
 
 
@@ -92,7 +98,7 @@ def reduce_umap_cluster(
     """UMAP 100D → 20D embedding for HDBSCAN clustering.
 
     Fits on UMAP_FIT_SAMPLE random customers, transforms the rest.
-    Cached to umap_cluster_20d.parquet, unless cache_path is supplied.
+    Cached to umap_cluster.parquet, unless cache_path is supplied.
 
     Parameters
     ----------
@@ -228,7 +234,7 @@ def reduce_umap_viz(
 
     Takes the 20D clustering embedding as input (not the raw 100D vectors) so
     the visualisation is geometrically consistent with the clustering.
-    Cached to umap_viz_2d.parquet.
+    Cached to umap_viz.parquet.
     """
     cache = Path(cache_path) if cache_path is not None else _UMAP_VIZ_CACHE
     if cache.exists() and not force:
@@ -237,7 +243,7 @@ def reduce_umap_viz(
         return pl.read_parquet(cache)
 
     if umap_cluster is None:
-        _log.info("Loading umap_cluster_20d.parquet ...")
+        _log.info("Loading umap_cluster.parquet ...")
         umap_cluster = pl.read_parquet(_UMAP_CLUSTER_CACHE)
 
     dim_cols = _embedding_columns(umap_cluster)
@@ -312,7 +318,7 @@ def reduce_pca(
     """PCA 100D → 20D baseline (linear, full population, no sampling needed).
 
     sklearn PCA on 1.48M × 100 with float32 uses ~2 GB RAM and finishes in ~30 s.
-    Cached to pca_cluster_20d.parquet.
+    Cached to pca_cluster.parquet.
     """
     cache = Path(cache_path) if cache_path is not None else _PCA_CACHE
     model_cache = Path(model_path) if model_path is not None else _PCA_MODEL_CACHE

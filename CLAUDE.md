@@ -173,11 +173,11 @@ Prod is the default when `CARREFOUR_MODE` is unset.
 - Mode-specific outputs must go through `src.config.DATA_PROCESSED`, `MODELS`, and `OUTPUTS`.
 - Do not write generated artifacts to hardcoded `data/dev` or `data/processed` paths inside pipeline code.
 
-Known naming mismatch:
+Naming convention for reducer outputs:
 
-- `umap_cluster_20d.parquet` and `pca_cluster_20d.parquet` are historical filenames.
-- The active config currently uses `cluster_dims: 50`, so these files contain 50 dimensions in current runs.
-- If you rename these artifacts, migrate all references in `src/dimensionality.py`, `src/clustering.py`, notebooks, docs, and any cached output assumptions in one deliberate change.
+- Default cache filenames (`umap_cluster.parquet`, `umap_viz.parquet`, `pca_cluster.parquet`) intentionally omit the dimension count.
+- Source-specific runs write to caller-supplied paths (e.g. `umap_cluster_item2vec.parquet`).
+- The number of clustering dimensions is controlled solely by `umap.cluster_dims` in `base.yaml` (currently 50).
 
 ## Cache Invalidation Rules
 

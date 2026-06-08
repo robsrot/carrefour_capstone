@@ -81,12 +81,12 @@ Raw CSVs
 | `customer_vectors_weighted.parquet` | 43,998 |
 | `customer_vectors_mean.parquet` | 43,998 |
 | `customer_store_features.parquet` | 44,000 |
-| `umap_cluster_20d.parquet` | 43,998 |
-| `umap_viz_2d.parquet` | 43,998 |
-| `pca_cluster_20d.parquet` | 43,998 |
+| `umap_cluster_item2vec.parquet` | 43,999 |
+| `umap_viz_item2vec_umap_2d.parquet` | 43,999 |
+| `pca_cluster_item2vec.parquet` | 43,999 |
 | `cluster_labels_hdbscan.parquet` | 43,998 |
 
-Note: `umap_cluster_20d.parquet` and `pca_cluster_20d.parquet` are historical filenames. The active config currently uses 50 clustering dimensions.
+Note: Source-specific runs use the vector-source name in the filename (e.g. `umap_cluster_item2vec.parquet`). The dimension count (50) is controlled by `umap.cluster_dims` in `base.yaml` and is not embedded in the filename.
 
 ### Dev Clustering Results
 

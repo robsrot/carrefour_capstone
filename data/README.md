@@ -52,9 +52,9 @@ Dev-mode ML runs write to `data/dev/`:
 | `customer_vectors_weighted.parquet` | Primary recency/frequency-weighted customer vectors |
 | `customer_vectors_mean.parquet` | Simple-mean baseline customer vectors |
 | `customer_store_features.parquet` | Store spend-share features by customer |
-| `umap_cluster_20d.parquet` | Current UMAP clustering embedding; filename is historical, active config uses 50 dims |
-| `umap_viz_2d.parquet` | 2D UMAP map for visualization |
-| `pca_cluster_20d.parquet` | PCA baseline embedding; filename is historical, active config uses 50 dims |
+| `umap_cluster_<source>.parquet` | UMAP clustering embedding (dims set by `umap.cluster_dims` in base.yaml) |
+| `umap_viz_<source>_umap_2d.parquet` | 2D UMAP map for visualization |
+| `pca_cluster_<source>.parquet` | PCA baseline embedding |
 | `cluster_labels_hdbscan.parquet` | Primary density-based cluster labels |
 | `cluster_labels_kmeans_k*.parquet` | Fixed-K K-Means baseline labels |
 | `hdbscan_grid_results.parquet` | HDBSCAN hyperparameter sweep results |
