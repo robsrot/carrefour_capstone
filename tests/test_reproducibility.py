@@ -94,14 +94,34 @@ def test_proportional_sample_is_deterministic(tiny_kpis_df):
     kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
 
     target = 60
-    rng1 = np.random.default_rng(RANDOM_SEED)
-    rng2 = np.random.default_rng(RANDOM_SEED)
-
-    ids1 = _proportional_sample(kpis, target, rng1)
-    ids2 = _proportional_sample(kpis, target, rng2)
+    ids1 = _proportional_sample(kpis, target, RANDOM_SEED)
+    ids2 = _proportional_sample(kpis, target, RANDOM_SEED)
 
     assert sorted(ids1) == sorted(ids2)
-    assert len(ids1) > 0
+    assert len(ids1) == target
+
+
+def test_proportional_sample_is_independent_of_input_order(tiny_kpis_df):
+    """Same seed + same customers/strata -> identical sample even if KPI rows move."""
+    from src.config import RANDOM_SEED
+    from src.generate_dev_subset import _proportional_sample, _assign_strata
+
+    def add_strata(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        store_counts = pd.Series(1, index=df["cliente"].values)
+        sector_bins = pd.Series("grocery_pgc", index=df["cliente"].values)
+        df["stratum"] = _assign_strata(df, store_counts, sector_bins)
+        return df
+
+    kpis = add_strata(tiny_kpis_df)
+    shuffled = add_strata(
+        tiny_kpis_df.sample(frac=1.0, random_state=99).reset_index(drop=True)
+    )
+
+    ids1 = _proportional_sample(kpis, 60, RANDOM_SEED)
+    ids2 = _proportional_sample(shuffled, 60, RANDOM_SEED)
+
+    assert sorted(ids1) == sorted(ids2)
 
 
 def test_proportional_sample_different_seeds_differ(tiny_kpis_df):
@@ -114,8 +134,8 @@ def test_proportional_sample_different_seeds_differ(tiny_kpis_df):
     kpis["stratum"] = _assign_strata(kpis, store_counts, sector_bins)
 
     target = 60
-    ids1 = _proportional_sample(kpis, target, np.random.default_rng(42))
-    ids2 = _proportional_sample(kpis, target, np.random.default_rng(99))
+    ids1 = _proportional_sample(kpis, target, 42)
+    ids2 = _proportional_sample(kpis, target, 99)
 
     assert sorted(ids1) != sorted(ids2)
 
@@ -132,7 +152,7 @@ def test_proportional_sample_covers_all_strata(tiny_kpis_df):
 
     # Sample 50% of the population — every stratum should be represented
     target = len(kpis) // 2
-    ids = set(_proportional_sample(kpis, target, np.random.default_rng(RANDOM_SEED)))
+    ids = set(_proportional_sample(kpis, target, RANDOM_SEED))
 
     sampled_strata = set(kpis[kpis["cliente"].isin(ids)]["stratum"].unique())
     all_strata = set(kpis["stratum"].unique())

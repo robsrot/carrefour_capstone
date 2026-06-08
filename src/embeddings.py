@@ -214,7 +214,7 @@ def save_embeddings(
     df = pl.DataFrame({
         "idarticu":  pl.Series([int(v) for v in vocab], dtype=pl.Int64),
         "embedding": pl.Series(vectors.tolist(), dtype=pl.List(pl.Float32)),
-    })
+    }).sort("idarticu")                 # canonical order independent of gensim vocab insertion order
     df.write_parquet(_EMBEDDINGS_CACHE, compression="zstd")
     _log.info(
         "Saved %s embeddings → %s  (%.1f MB on disk)",

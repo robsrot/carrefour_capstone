@@ -336,6 +336,7 @@ def build_store_features(
             for c in raw_cols
         ])
         .select(["cliente"] + [f"spend_share_s{c}" for c in raw_cols])
+        .sort("cliente")                # canonical order — pivot output row order is non-deterministic
     )
 
     _STORE_FEATURES_CACHE.parent.mkdir(parents=True, exist_ok=True)

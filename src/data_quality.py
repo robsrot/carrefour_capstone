@@ -252,8 +252,7 @@ def audit_customer_activity() -> dict:
     activity = (
         _df_tickets()
         .group_by("cliente")
-        # approx_n_unique uses HyperLogLog (~1% error) — O(1) memory per group vs O(cardinality) for exact
-        .agg(pl.col("ticket").approx_n_unique().alias("n_tickets"))
+        .agg(pl.col("ticket").n_unique().alias("n_tickets"))
         .collect(engine="streaming")
     )
 
