@@ -37,6 +37,7 @@ from sklearn.metrics import silhouette_score, davies_bouldin_score
 
 from src.config import (
     DATA_PROCESSED,
+    ROOT,
     RANDOM_SEED,
     HDBSCAN_MIN_CLUSTER_SIZE,
     HDBSCAN_MIN_SAMPLES,
@@ -52,12 +53,14 @@ from src.config import (
     KMEANS_N_INIT,
     SILHOUETTE_SAMPLE,
 )
+from src.product_themes import classify_product_themes
 
 _log = logging.getLogger(__name__)
 
 # HDBSCAN_FIT_SAMPLE and SILHOUETTE_SAMPLE are loaded from config (base: 100k/50k prod, 10k dev).
 
 _HDBSCAN_CACHE  = DATA_PROCESSED / "cluster_labels_hdbscan.parquet"
+_HDBSCAN_ASSIGNED_CACHE = DATA_PROCESSED / "cluster_labels_hdbscan_assigned.parquet"
 _KMEANS_CACHE   = DATA_PROCESSED / "cluster_labels_kmeans.parquet"
 _PROFILES_CACHE = DATA_PROCESSED / "tribe_profiles.parquet"
 
@@ -76,7 +79,11 @@ def _embedding_to_numpy(df: pl.DataFrame) -> tuple[np.ndarray, list[str]]:
 def cluster_hdbscan(
     umap_cluster: pl.DataFrame | None = None,
     *,
+    min_cluster_size: int | None = None,
+    min_samples: int | None = None,
+    cluster_method: str | None = None,
     force: bool = False,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """Fit HDBSCAN on a 300k sample, assign remaining customers via approximate_predict.
 
@@ -88,12 +95,13 @@ def cluster_hdbscan(
     Returns
     -------
     DataFrame: cliente str | cluster int32 | promo_rate float32
-    Cached to cluster_labels_hdbscan.parquet.
+    Cached to cluster_labels_hdbscan.parquet, unless cache_path is supplied.
     """
-    if _HDBSCAN_CACHE.exists() and not force:
-        n = pl.scan_parquet(_HDBSCAN_CACHE).select(pl.len()).collect().item()
+    cache = Path(cache_path) if cache_path is not None else _HDBSCAN_CACHE
+    if cache.exists() and not force:
+        n = pl.scan_parquet(cache).select(pl.len()).collect().item()
         _log.info("HDBSCAN cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_HDBSCAN_CACHE)
+        return pl.read_parquet(cache)
 
     if umap_cluster is None:
         _log.info("Loading umap_cluster_20d.parquet ...")
@@ -101,6 +109,10 @@ def cluster_hdbscan(
 
     X, _ = _embedding_to_numpy(umap_cluster)
     N = len(X)
+
+    min_cluster_size = int(min_cluster_size or HDBSCAN_MIN_CLUSTER_SIZE)
+    min_samples = int(min_samples or HDBSCAN_MIN_SAMPLES)
+    cluster_method = str(cluster_method or HDBSCAN_CLUSTER_METHOD)
 
     # Random sample for fit
     rng = np.random.default_rng(RANDOM_SEED)
@@ -111,14 +123,14 @@ def cluster_hdbscan(
     _log.info(
         "HDBSCAN fit: %s sample, min_cluster_size=%d, min_samples=%d, metric=%s ...",
         f"{len(X_sample):,}",
-        HDBSCAN_MIN_CLUSTER_SIZE, HDBSCAN_MIN_SAMPLES, HDBSCAN_METRIC,
+        min_cluster_size, min_samples, HDBSCAN_METRIC,
     )
     clusterer = HDBSCAN(
-        min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
-        min_samples=HDBSCAN_MIN_SAMPLES,
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
         metric=HDBSCAN_METRIC,
         algorithm="ball_tree",
-        cluster_selection_method=HDBSCAN_CLUSTER_METHOD,
+        cluster_selection_method=cluster_method,
         n_jobs=1,
     )
     clusterer.fit(X_sample)
@@ -154,11 +166,109 @@ def cluster_hdbscan(
         "promo_rate": umap_cluster["promo_rate"],
     })
 
-    _HDBSCAN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_HDBSCAN_CACHE, compression="zstd")
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
     _log.info(
         "Saved %s HDBSCAN labels → %s",
-        f"{len(df):,}", _HDBSCAN_CACHE.name,
+        f"{len(df):,}", cache.name,
+    )
+    return df
+
+
+def assign_hdbscan_noise_to_nearest_tribe(
+    umap_cluster: pl.DataFrame | None = None,
+    hdbscan_labels: pl.DataFrame | None = None,
+    *,
+    force: bool = False,
+    cache_path: Path | None = None,
+) -> pl.DataFrame:
+    """Assign HDBSCAN noise customers to their nearest non-noise tribe.
+
+    This keeps HDBSCAN as the discovery method while producing an all-customer
+    operational segmentation. The original density result is preserved in
+    `hdbscan_cluster`; the final all-customer label is stored in `cluster`.
+
+    Returns
+    -------
+    DataFrame:
+        cliente str
+        cluster int32                 all customers assigned to a non-noise tribe
+        hdbscan_cluster int32          original HDBSCAN label (-1 = density noise)
+        was_hdbscan_noise bool
+        assignment_source str          "hdbscan_core" | "nearest_hdbscan_tribe"
+        assignment_distance float32    0 for core customers, nearest-core distance for assigned noise
+        promo_rate float32
+    """
+    cache = Path(cache_path) if cache_path is not None else _HDBSCAN_ASSIGNED_CACHE
+    if cache.exists() and not force:
+        cached = pl.read_parquet(cache)
+        required = {
+            "cluster",
+            "hdbscan_cluster",
+            "was_hdbscan_noise",
+            "assignment_source",
+            "assignment_distance",
+        }
+        if required.issubset(set(cached.columns)):
+            _log.info("HDBSCAN assigned cache hit — %s", cache.name)
+            return cached
+        _log.info("HDBSCAN assigned cache has older schema — rebuilding")
+
+    if umap_cluster is None:
+        _log.info("Loading umap_cluster_20d.parquet ...")
+        umap_cluster = pl.read_parquet(DATA_PROCESSED / "umap_cluster_20d.parquet")
+    if hdbscan_labels is None:
+        _log.info("Loading cluster_labels_hdbscan.parquet ...")
+        hdbscan_labels = pl.read_parquet(_HDBSCAN_CACHE)
+
+    X, _ = _embedding_to_numpy(umap_cluster)
+    aligned = (
+        umap_cluster.select("cliente")
+        .join(hdbscan_labels.select(["cliente", "cluster"]), on="cliente", how="left")
+        .with_columns(pl.col("cluster").fill_null(-1).cast(pl.Int32))
+    )
+    original = aligned["cluster"].to_numpy().astype(np.int32)
+
+    core_mask = original >= 0
+    noise_mask = ~core_mask
+    if not core_mask.any():
+        raise ValueError("HDBSCAN produced no non-noise tribes; cannot assign noise customers.")
+
+    final = original.copy()
+    assignment_distance = np.zeros(len(original), dtype=np.float32)
+    assignment_source = np.full(len(original), "hdbscan_core", dtype=object)
+
+    if noise_mask.any():
+        _log.info(
+            "Assigning %s HDBSCAN noise customers to nearest non-noise tribe ...",
+            f"{int(noise_mask.sum()):,}",
+        )
+        core_labels = original[core_mask]
+        nn = NearestNeighbors(n_neighbors=1, metric=HDBSCAN_METRIC, n_jobs=1)
+        nn.fit(X[core_mask])
+        distances, indices = nn.kneighbors(X[noise_mask])
+        final[noise_mask] = core_labels[indices.ravel()].astype(np.int32)
+        assignment_distance[noise_mask] = distances.ravel().astype(np.float32)
+        assignment_source[noise_mask] = "nearest_hdbscan_tribe"
+
+    df = pl.DataFrame({
+        "cliente": umap_cluster["cliente"],
+        "cluster": pl.Series(final, dtype=pl.Int32),
+        "hdbscan_cluster": pl.Series(original, dtype=pl.Int32),
+        "was_hdbscan_noise": pl.Series(noise_mask),
+        "assignment_source": pl.Series(assignment_source.tolist()),
+        "assignment_distance": pl.Series(assignment_distance),
+        "promo_rate": umap_cluster["promo_rate"],
+    })
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    df.write_parquet(cache, compression="zstd")
+    _log.info(
+        "Saved %s HDBSCAN assigned labels → %s  (%d tribes, %.1f%% assigned from noise)",
+        f"{len(df):,}",
+        cache.name,
+        int(df["cluster"].n_unique()),
+        float(df["was_hdbscan_noise"].mean() * 100),
     )
     return df
 
@@ -170,6 +280,7 @@ def cluster_kmeans(
     *,
     n_clusters: int | None = None,
     force: bool = False,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """MiniBatchKMeans on the full 1.48M customers.
 
@@ -183,7 +294,7 @@ def cluster_kmeans(
     Cached to cluster_labels_kmeans.parquet or cluster_labels_kmeans_k{K}.parquet.
     """
     explicit_k = n_clusters is not None
-    cache = (
+    cache = Path(cache_path) if cache_path is not None else (
         DATA_PROCESSED / f"cluster_labels_kmeans_k{int(n_clusters)}.parquet"
         if explicit_k
         else _KMEANS_CACHE
@@ -250,6 +361,8 @@ def run_kmeans_baselines(
     k_values: list[int] | None = None,
     force: bool = False,
     profile: bool = False,
+    cache_prefix: str | None = None,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """Run fixed-K MiniBatchKMeans baselines and compare cluster quality.
 
@@ -266,10 +379,16 @@ def run_kmeans_baselines(
 
     results: list[dict] = []
     for k in k_values:
+        label_cache = (
+            DATA_PROCESSED / f"cluster_labels_kmeans_{cache_prefix}_k{int(k)}.parquet"
+            if cache_prefix
+            else None
+        )
         labels = cluster_kmeans(
             umap_cluster,
             n_clusters=int(k),
             force=force,
+            cache_path=label_cache,
         )
         result = evaluate_clustering(
             umap_cluster,
@@ -294,7 +413,7 @@ def run_kmeans_baselines(
         "silhouette",
         "davies_bouldin",
     ])
-    out = DATA_PROCESSED / "kmeans_baseline_results.parquet"
+    out = Path(cache_path) if cache_path is not None else DATA_PROCESSED / "kmeans_baseline_results.parquet"
     df.write_parquet(out, compression="zstd")
     _log.info("Saved K-Means baseline comparison → %s", out.name)
     return df
@@ -388,6 +507,7 @@ def grid_search_hdbscan(
     target_clusters: int = 15,
     metric_sample_size: int | None = None,
     force: bool = False,
+    cache_path: Path | None = None,
 ) -> pl.DataFrame:
     """Evaluate HDBSCAN hyperparameter candidates on the configured fit sample.
 
@@ -395,7 +515,7 @@ def grid_search_hdbscan(
     nearest-neighbour assignment. Use the winning candidate with cluster_hdbscan()
     or update configs/base.yaml once a commercially readable option is chosen.
     """
-    out = DATA_PROCESSED / "hdbscan_grid_results.parquet"
+    out = Path(cache_path) if cache_path is not None else DATA_PROCESSED / "hdbscan_grid_results.parquet"
     if out.exists() and not force:
         _log.info("HDBSCAN grid cache hit — %s", out.name)
         return pl.read_parquet(out)
@@ -476,6 +596,8 @@ def profile_tribes(
     method_name: str = "hdbscan",
     *,
     top_n_products: int = 20,
+    top_n_sectors: int = 5,
+    top_n_themes: int = 10,
     force: bool = False,
 ) -> pl.DataFrame:
     """Build a commercial profile for each tribe.
@@ -493,6 +615,10 @@ def profile_tribes(
         total_revenue  float64
         revenue_share  float32  (% of all revenue this tribe accounts for)
         avg_promo_rate float32
+        top_sectors    list[str]   (sector names, sorted by lift descending)
+        top_sector_lifts list[float]
+        top_themes     list[str]   (editable product-name themes, sorted by lift)
+        top_theme_lifts list[float]
         top_products   list[str]   (product descriptions, sorted by lift descending)
         top_lifts      list[float] (lift scores — tribe purchase rate ÷ overall purchase rate)
 
@@ -500,13 +626,35 @@ def profile_tribes(
     """
     cache = DATA_PROCESSED / f"tribe_profiles_{method_name}.parquet"
     if cache.exists() and not force:
-        _log.info("Tribe profiles cache hit — %s", cache.name)
-        return pl.read_parquet(cache)
+        cached = pl.read_parquet(cache)
+        required_cols = {
+            "top_sectors",
+            "top_sector_lifts",
+            "top_themes",
+            "top_theme_lifts",
+            "top_products",
+            "top_lifts",
+        }
+        if required_cols.issubset(set(cached.columns)):
+            _log.info("Tribe profiles cache hit — %s", cache.name)
+            return cached
+        _log.info("Profile cache %s uses an older schema — rebuilding", cache.name)
 
     _log.info("Building tribe profiles for %s ...", method_name)
 
-    # Load customer KPIs (1.46M rows, 117 MB — safe in RAM)
-    kpis = pl.read_parquet(DATA_PROCESSED / "customer_kpis.parquet")
+    # Load customer KPIs. In dev mode the transaction subset lives in data/dev,
+    # while customer_kpis.parquet remains the production-wide artifact.
+    kpi_path = DATA_PROCESSED / "customer_kpis.parquet"
+    if not kpi_path.exists():
+        prod_kpi_path = ROOT / "data" / "processed" / "customer_kpis.parquet"
+        if prod_kpi_path.exists():
+            kpi_path = prod_kpi_path
+        else:
+            raise FileNotFoundError(
+                "customer_kpis.parquet not found in the active data directory "
+                f"or production fallback: {DATA_PROCESSED}, {prod_kpi_path}"
+            )
+    kpis = pl.read_parquet(kpi_path)
 
     # KPI aggregation per tribe
     joined = cluster_labels.join(kpis, on="cliente", how="left")
@@ -539,13 +687,13 @@ def profile_tribes(
     # Step 1: per-(cluster, product) purchase counts via streaming scan
     raw_counts = (
         pl.scan_parquet(combined_path)
-        .select(["cliente", "idarticu", "desc_larga_articulo"])
+        .select(["cliente", "idarticu", "desc_larga_articulo", "desc_sector"])
         .join(
             cluster_labels.select(["cliente", "cluster"]).lazy(),
             on="cliente",
             how="inner",
         )
-        .group_by(["cluster", "idarticu", "desc_larga_articulo"])
+        .group_by(["cluster", "idarticu", "desc_larga_articulo", "desc_sector"])
         .agg(pl.len().alias("tribe_count"))
         .collect(engine="streaming")
     )
@@ -553,7 +701,7 @@ def profile_tribes(
     # Step 2: overall purchase counts per product and grand total
     overall_counts = (
         raw_counts
-        .group_by(["idarticu", "desc_larga_articulo"])
+        .group_by(["idarticu", "desc_larga_articulo", "desc_sector"])
         .agg(pl.col("tribe_count").sum().alias("overall_count"))
     )
     total_purchases = int(raw_counts["tribe_count"].sum())
@@ -565,10 +713,104 @@ def profile_tribes(
         .agg(pl.col("tribe_count").sum().alias("tribe_total"))
     )
 
-    # Step 4: lift = (tribe_count / tribe_total) / (overall_count / total_purchases)
+    # Step 4: sector lift profiles
+    sector_counts = (
+        raw_counts
+        .group_by(["cluster", "desc_sector"])
+        .agg(pl.col("tribe_count").sum().alias("tribe_count"))
+    )
+    sector_overall = (
+        sector_counts
+        .group_by("desc_sector")
+        .agg(pl.col("tribe_count").sum().alias("overall_count"))
+    )
+    sector_lift = (
+        sector_counts
+        .join(sector_overall, on="desc_sector", how="left")
+        .join(tribe_totals, on="cluster", how="left")
+        .with_columns(
+            (
+                (pl.col("tribe_count").cast(pl.Float64) / pl.col("tribe_total"))
+                / (pl.col("overall_count").cast(pl.Float64) / total_purchases)
+            ).alias("lift")
+        )
+    )
+    top_sectors = (
+        sector_lift
+        .group_by("cluster")
+        .agg([
+            pl.col("desc_sector")
+              .sort_by(pl.col("lift"), descending=True)
+              .head(top_n_sectors)
+              .alias("top_sectors"),
+            pl.col("lift")
+              .sort(descending=True)
+              .head(top_n_sectors)
+              .round(2)
+              .alias("top_sector_lifts"),
+        ])
+    )
+
+    # Step 5: editable product-name theme lift profiles.
+    # A product can match several themes, so theme shares need not sum to 100%.
+    theme_counts = (
+        raw_counts
+        .with_columns(
+            pl.col("desc_larga_articulo")
+            .map_elements(classify_product_themes, return_dtype=pl.List(pl.Utf8))
+            .alias("theme")
+        )
+        .explode("theme")
+        .filter(pl.col("theme").is_not_null())
+        .group_by(["cluster", "theme"])
+        .agg(pl.col("tribe_count").sum().alias("tribe_count"))
+    )
+    if len(theme_counts) > 0:
+        theme_overall = (
+            theme_counts
+            .group_by("theme")
+            .agg(pl.col("tribe_count").sum().alias("overall_count"))
+        )
+        theme_lift = (
+            theme_counts
+            .join(theme_overall, on="theme", how="left")
+            .join(tribe_totals, on="cluster", how="left")
+            .with_columns(
+                (
+                    (pl.col("tribe_count").cast(pl.Float64) / pl.col("tribe_total"))
+                    / (pl.col("overall_count").cast(pl.Float64) / total_purchases)
+                ).alias("lift")
+            )
+            .filter(pl.col("tribe_count") >= 30)
+        )
+        top_themes = (
+            theme_lift
+            .group_by("cluster")
+            .agg([
+                pl.col("theme")
+                  .sort_by(pl.col("lift"), descending=True)
+                  .head(top_n_themes)
+                  .alias("top_themes"),
+                pl.col("lift")
+                  .sort(descending=True)
+                  .head(top_n_themes)
+                  .round(2)
+                  .alias("top_theme_lifts"),
+            ])
+        )
+    else:
+        top_themes = pl.DataFrame(
+            schema={
+                "cluster": pl.Int32,
+                "top_themes": pl.List(pl.Utf8),
+                "top_theme_lifts": pl.List(pl.Float64),
+            }
+        )
+
+    # Step 6: product lift = (tribe_count / tribe_total) / (overall_count / total_purchases)
     with_lift = (
         raw_counts
-        .join(overall_counts, on=["idarticu", "desc_larga_articulo"], how="left")
+        .join(overall_counts, on=["idarticu", "desc_larga_articulo", "desc_sector"], how="left")
         .join(tribe_totals, on="cluster", how="left")
         .with_columns(
             (
@@ -579,7 +821,7 @@ def profile_tribes(
         .filter(pl.col("tribe_count") >= 30)   # ignore products bought by fewer than 30 customers in this tribe
     )
 
-    # Step 5: top N products per tribe sorted by lift descending
+    # Step 7: top N products per tribe sorted by lift descending
     top_products = (
         with_lift
         .group_by("cluster")
@@ -596,7 +838,12 @@ def profile_tribes(
         ])
     )
 
-    profiles = kpi_profiles.join(top_products, on="cluster", how="left")
+    profiles = (
+        kpi_profiles
+        .join(top_sectors, on="cluster", how="left")
+        .join(top_themes, on="cluster", how="left")
+        .join(top_products, on="cluster", how="left")
+    )
 
     cache.parent.mkdir(parents=True, exist_ok=True)
     profiles.write_parquet(cache, compression="zstd")

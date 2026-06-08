@@ -1,6 +1,6 @@
 # Project Status and Product-First Roadmap
 
-Status date: 2026-06-05.
+Status date: 2026-06-08.
 
 This document explains where the Carrefour segmentation project stands, what the current pipeline does, what is still missing, and how to improve the pipeline so the final tribes are meaningful because of the products customers buy.
 
@@ -23,8 +23,8 @@ The main remaining risk is not "can we run clustering?" We can. The risk is whet
 | Dev subset | 44,000 customers, 7,490,843 transaction rows, all KS validation checks passed. |
 | Phase 1 | Basket sentences and Word2Vec product embeddings generated in dev mode. |
 | Phase 2 | Weighted and mean customer vectors generated in dev mode. |
-| Phase 3 | UMAP and PCA embeddings generated in dev mode. |
-| Phase 4 | HDBSCAN, HDBSCAN grid, and K-Means baselines generated in dev mode. |
+| Phase 3 | UMAP and PCA are configured as reducer candidates; the notebook can select and persist a winner. |
+| Phase 4 | HDBSCAN-derived labels and K-Means baselines are configured as clustering candidates; the notebook can select and persist a winner. |
 | Visual outputs | Dev plots exist for embeddings, customer vectors, UMAP/PCA, and clustering comparison. |
 
 ### Not Yet Complete
@@ -35,7 +35,7 @@ The main remaining risk is not "can we run clustering?" We can. The risk is whet
 | Tribe profiles | `profile_tribes()` exists but cached profile outputs are not present. |
 | Tribe naming | No implemented LLM/manual naming layer yet. |
 | Product-first model selection | Current metrics are geometric; final choice needs product-lift interpretation. |
-| UMAP input ablation | Current UMAP input includes product vectors plus promo and store features. We need to know whether promo/store are helping or dominating. |
+| UMAP input ablation | Experiment 0 is now product-only. Promo/store should be tested only as explicit ablations so we can prove whether they help or dominate. |
 | Customer vector diagnostics | Weighted mean may still blur product signals; we need tests against alternatives. |
 | Temporal segmentation | Time windows are declared in config but not implemented as a pipeline. |
 | Interactive deliverable | Static plots exist; no product-like interactive segmentation explorer yet. |
@@ -52,12 +52,24 @@ Raw CSVs
 -> basket sentences
 -> Word2Vec product embeddings
 -> customer product weights
--> weighted customer vectors + mean baseline + store features
--> UMAP clustering embedding + UMAP 2D visualization + PCA baseline
--> HDBSCAN grid + configured HDBSCAN + fixed-K K-Means baselines
+-> weighted customer vectors + mean baseline + product-only hybrid vector
+-> store features for profiling and explicit ablations
+-> configured vector-source benchmark and selected product representation
+-> configured reducer benchmark: UMAP and/or PCA
+-> configured clustering benchmark: HDBSCAN-derived labels and/or fixed-K K-Means
+-> persisted selection artifacts in outputs/.../model_selection/
 -> clustering plots
 -> tribe profiles and tribe names (next)
 ```
+
+### Experiment 0 Selection Contract
+
+`configs/base.yaml` is now the single source of truth for candidate models:
+
+- `pipeline.vector_source`, `pipeline.reducer`, and `pipeline.clusterer` may be set to `auto` or to a concrete locked choice.
+- Candidate lists live under `model_selection`.
+- When a component is `auto`, `03_ml_pipeline.ipynb` benchmarks the candidates, selects a winner, and writes a JSON artifact under `outputs/.../model_selection/`.
+- Fallback values such as `hybrid`, `umap`, and `hdbscan_assigned` are only provisional choices used before benchmark results exist. They are not permanent winners.
 
 ## Dev Run Snapshot
 
@@ -135,9 +147,10 @@ This adds a stronger product story: not just "who are the tribes?", but "which p
    - Add sector/category rollups beside product names.
    - Flag clusters where top products are incoherent or dominated by store/promo artifacts.
 
-3. Run product-only UMAP ablations.
-   - Current feature weights: `promo=1.0`, `store=1.0`, `kpi=0.0`.
-   - Test `promo=0.0`, `store=0.0`, `kpi=0.0` as the product-only baseline.
+3. Run optional non-product ablations after the product-only baseline.
+   - Current baseline: `pipeline.vector_source=auto`, with product-only candidates `item2vec`, `tfidf_svd`, and `hybrid`.
+   - `hybrid` is a fallback/candidate, not a hardcoded winner.
+   - Use `hybrid_with_store` only when deliberately testing store-format influence.
    - Then test a small ladder such as store weights `0.0`, `0.25`, `1.0` and promo weights `0.0`, `0.25`, `1.0`.
 
 4. Improve customer vectorization if profiles are weak.
@@ -180,20 +193,20 @@ Parameters to tune:
 
 ### 2. Change UMAP Input Deliberately
 
-Current UMAP input is:
+Experiment 0 reduction input is selected from configured product-only vector candidates:
 
 ```text
-100 product-vector dims + promo_rate + 4 store-share dims
+item2vec | tfidf_svd | hybrid
 ```
 
-This is reasonable, but it can pull clusters toward store format or promo behavior. Because the capstone asks for product-first segmentation, run these ablations:
+The current candidate set is product-only. Because the capstone asks for product-first segmentation, treat store, promo, and KPI features as ablations rather than default clustering inputs:
 
 | Experiment | Purpose |
 |---|---|
 | Product only | Proves what the product vectors alone can recover. |
 | Product + promo | Tests whether promo sensitivity adds useful behavioral separation. |
 | Product + store | Tests whether store format reveals product assortment behavior or simply dominates. |
-| Product + promo + store | Current setting; compare against ablations. |
+| Product + promo + store | Stress test after the product-only baseline is understood. |
 | Product + KPI | Only as a stress test; KPIs should usually be profiled after clustering. |
 
 Decision rule: keep promo/store in the final UMAP input only if product-lift profiles improve and clusters do not become merely "store 7 shoppers" or "promo-heavy shoppers".

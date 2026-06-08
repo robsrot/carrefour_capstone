@@ -5,24 +5,45 @@ global:
 
 word2vec:
   vector_size: 100
-  window: 5
+  window: 10
   min_count: 3
   epochs: 10
   sg: 1          # skip-gram (better than CBOW for rare products)
   workers: 1     # workers=1 required for bit-exact reproducibility across runs and devices (gensim thread-race)
 
+product_embeddings:
+  method: word2vec
+  candidates: [word2vec]  # Add future Phase 1 embedding models here when implemented.
+
 customer_vectors:
   recency_halflife_days: 60   # 30 was too aggressive for a 6-month window
+  recency_reference_date: "2022-06-30"   # last day in dataset — update if data window changes
+  weight_transform: log1p     # none | sqrt | log1p; dampens repeated staple purchases.
+  normalize_product_embeddings: true
+  tfidf_svd_dims: 100
+  hybrid_include_store_shares: false  # Experiment 0 baseline is product-only; store shares are an explicit ablation.
+  hybrid_weights:
+    item2vec: 1.0
+    tfidf_svd: 1.0
+    category_shares: 1.0
+
+product_popularity:
+  enabled: true               # Remove ultra-common products from embedding/vector inputs.
+  max_basket_share: 0.15      # Hard-remove products appearing in >15% of baskets.
+  max_customer_share: 0.40    # Hard-remove products bought by >40% of customers.
+  idf_weighting: true         # Soft-downweight common remaining products in customer vectors.
+  idf_min_weight: 0.25        # Floor so staples are muted, not erased.
+  idf_max_weight: 3.0         # Cap so very rare products do not dominate vectors.
 
 feature_weights:
-  promo: 1.0  # Keep promo sensitivity as a light behavioral signal.
-  store: 1.0  # Keep store affinity, but do not let it dominate product mix.
-  kpi: 0.0    # Main clustering signal should be product type; KPIs are profiled after.
+  promo: 0.0  # Product-only segmentation; profile promo sensitivity after clustering.
+  store: 0.0  # Product-only segmentation; profile store affinity after clustering.
+  kpi: 0.0    # Product-only segmentation; profile KPIs after clustering.
 
 umap:
   cluster_dims: 50
   viz_dims: 2
-  n_neighbors: 50
+  n_neighbors: 20
   min_dist_cluster: 0.05   # 0.0 preserves tighter local structure for clustering
   min_dist_viz: 0.1
   metric: cosine
@@ -33,7 +54,7 @@ hdbscan:
   min_samples: 10
   metric: euclidean
   cluster_method: eom
-  fit_sample: 100000       # max customers for exact HDBSCAN fit; rest assigned via kNN
+  fit_sample: 300000       # match umap.fit_sample — 27.8% of 1.08M gives representative density structure
   silhouette_sample: 50000 # silhouette is O(n²) — sample for tractability
 
 hdbscan_grid:
@@ -46,6 +67,29 @@ kmeans:
   batch_size: 10000
   n_init: 5
   max_iter: 300
+
+pipeline:
+  # Set a component to "auto" to benchmark configured candidates and select a winner.
+  # Set a concrete value to lock that model for a reproducible rerun.
+  selection_mode: auto     # auto | config
+  vector_source: auto      # auto | item2vec | tfidf_svd | hybrid | hybrid_with_store | mean
+  reducer: auto            # auto | umap | pca
+  clusterer: auto          # auto | hdbscan_assigned | hdbscan_core | kmeans
+  fallback_vector_source: hybrid
+  fallback_reducer: umap
+  fallback_clusterer: hdbscan_assigned
+
+model_selection:
+  target_tribe_count: 15
+  vector_sources: [item2vec, tfidf_svd, hybrid]
+  reducers: [umap, pca]
+  clusterers: [hdbscan_assigned, kmeans]
+  target_kmeans_k: 15
+  reduction_benchmark_sample: 50000
+  n_neighbors_candidates: [10, 15, 20, 30, 50]
+
+vector_source_benchmark:
+  n_sample: 30000   # customers to use for the comparison UMAP+HDBSCAN (prod); full run in Section 3.3
 
 tribe_namer:
   model: claude-haiku-4-5-20251001
