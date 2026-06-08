@@ -1,0 +1,134 @@
+{
+  "target_size": 44000,
+  "actual_size": 44000,
+  "n_transaction_rows": 7511379,
+  "avg_rows_per_customer": 170.7,
+  "random_seed": 42,
+  "selection_method": "stratified_largest_remainder_stable_hash_v1",
+  "strata_assignment_sha256": "66bd09ab492dc4b375cc521a26fcbb25c8a73e22138c3dcbf98fdf1440ad068a",
+  "selected_customer_sha256": "639a350439343089bef1d4225e6c3052bd9bc741b469637f95b7bd4159c9effe",
+  "min_tickets_filter": 3,
+  "eligible_population": 1086759,
+  "stratification": {
+    "dimensions": [
+      "visit_count \u2014 3 tertile bins  (v_lo / v_md / v_hi)",
+      "total_spend_6m \u2014 3 tertile bins  (s_lo / s_md / s_hi)",
+      "store_count \u2014 binary  (st1 = single-store / st2p = multi-store)",
+      "dominant_sector \u2014 3 bins  (grocery_pgc / fresh / non_food)"
+    ],
+    "sector_bin_map": {
+      "1": "grocery_pgc",
+      "2": "fresh",
+      "3": "non_food",
+      "4": "non_food",
+      "6": "non_food",
+      "7": "non_food"
+    },
+    "sector_distribution": {
+      "fresh": 230121,
+      "grocery_pgc": 1044666,
+      "non_food": 207928
+    },
+    "n_strata_possible": 54,
+    "n_strata_populated": 54,
+    "strata_counts": {
+      "v_hi__s_hi__st1__fresh": 19547,
+      "v_hi__s_hi__st1__grocery_pgc": 103504,
+      "v_hi__s_hi__st1__non_food": 4140,
+      "v_hi__s_hi__st2p__fresh": 16342,
+      "v_hi__s_hi__st2p__grocery_pgc": 94492,
+      "v_hi__s_hi__st2p__non_food": 3784,
+      "v_hi__s_lo__st1__fresh": 2075,
+      "v_hi__s_lo__st1__grocery_pgc": 6308,
+      "v_hi__s_lo__st1__non_food": 103,
+      "v_hi__s_lo__st2p__fresh": 1441,
+      "v_hi__s_lo__st2p__grocery_pgc": 6473,
+      "v_hi__s_lo__st2p__non_food": 156,
+      "v_hi__s_md__st1__fresh": 8215,
+      "v_hi__s_md__st1__grocery_pgc": 34823,
+      "v_hi__s_md__st1__non_food": 1356,
+      "v_hi__s_md__st2p__fresh": 7459,
+      "v_hi__s_md__st2p__grocery_pgc": 40877,
+      "v_hi__s_md__st2p__non_food": 1526,
+      "v_lo__s_hi__st1__fresh": 1537,
+      "v_lo__s_hi__st1__grocery_pgc": 12321,
+      "v_lo__s_hi__st1__non_food": 3953,
+      "v_lo__s_hi__st2p__fresh": 331,
+      "v_lo__s_hi__st2p__grocery_pgc": 2430,
+      "v_lo__s_hi__st2p__non_food": 827,
+      "v_lo__s_lo__st1__fresh": 29183,
+      "v_lo__s_lo__st1__grocery_pgc": 121636,
+      "v_lo__s_lo__st1__non_food": 33451,
+      "v_lo__s_lo__st2p__fresh": 11267,
+      "v_lo__s_lo__st2p__grocery_pgc": 52396,
+      "v_lo__s_lo__st2p__non_food": 12136,
+      "v_lo__s_md__st1__fresh": 10492,
+      "v_lo__s_md__st1__grocery_pgc": 60443,
+      "v_lo__s_md__st1__non_food": 18324,
+      "v_lo__s_md__st2p__fresh": 3436,
+      "v_lo__s_md__st2p__grocery_pgc": 18634,
+      "v_lo__s_md__st2p__non_food": 5018,
+      "v_md__s_hi__st1__fresh": 7146,
+      "v_md__s_hi__st1__grocery_pgc": 53306,
+      "v_md__s_hi__st1__non_food": 6551,
+      "v_md__s_hi__st2p__fresh": 3532,
+      "v_md__s_hi__st2p__grocery_pgc": 25147,
+      "v_md__s_hi__st2p__non_food": 3358,
+      "v_md__s_lo__st1__fresh": 8469,
+      "v_md__s_lo__st1__grocery_pgc": 36061,
+      "v_md__s_lo__st1__non_food": 3055,
+      "v_md__s_lo__st2p__fresh": 5542,
+      "v_md__s_lo__st2p__grocery_pgc": 29886,
+      "v_md__s_lo__st2p__non_food": 2616,
+      "v_md__s_md__st1__fresh": 11708,
+      "v_md__s_md__st1__grocery_pgc": 67329,
+      "v_md__s_md__st1__non_food": 10138,
+      "v_md__s_md__st2p__fresh": 8025,
+      "v_md__s_md__st2p__grocery_pgc": 48087,
+      "v_md__s_md__st2p__non_food": 6367
+    }
+  },
+  "ks_validation": {
+    "visit_count": {
+      "ks_stat": 0.0012,
+      "p_value": 1.0,
+      "pass": true
+    },
+    "avg_basket_size": {
+      "ks_stat": 0.004,
+      "p_value": 0.5034,
+      "pass": true
+    },
+    "total_spend_6m": {
+      "ks_stat": 0.0032,
+      "p_value": 0.7764,
+      "pass": true
+    },
+    "avg_promo_rate": {
+      "ks_stat": 0.0029,
+      "p_value": 0.8674,
+      "pass": true
+    },
+    "unique_products": {
+      "ks_stat": 0.0021,
+      "p_value": 0.9909,
+      "pass": true
+    }
+  },
+  "all_ks_passed": true,
+  "source_combined": "C:\\Users\\sebog\\proyectos\\carrefour_capstone\\data\\processed\\df_combined.parquet",
+  "source_kpis": "C:\\Users\\sebog\\proyectos\\carrefour_capstone\\data\\processed\\customer_kpis.parquet",
+  "source_file_stats": {
+    "combined": {
+      "path": "C:\\Users\\sebog\\proyectos\\carrefour_capstone\\data\\processed\\df_combined.parquet",
+      "size_bytes": 10544875780,
+      "mtime_ns": 1780908369980101400
+    },
+    "kpis": {
+      "path": "C:\\Users\\sebog\\proyectos\\carrefour_capstone\\data\\processed\\customer_kpis.parquet",
+      "size_bytes": 119139395,
+      "mtime_ns": 1780908971779232000
+    }
+  },
+  "output": "C:\\Users\\sebog\\proyectos\\carrefour_capstone\\data\\dev\\df_combined.parquet"
+}

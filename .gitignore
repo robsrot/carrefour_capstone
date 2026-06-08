@@ -20,6 +20,10 @@ data/dev/*
 *.tar.gz
 *.gz
 
+# Metadata JSON files that must be tracked
+!data/processed/quality_report.json
+!data/dev/subset_metadata.json
+
 # MODELS — too large for git
 models/*
 !models/.gitkeep
