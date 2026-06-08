@@ -74,6 +74,11 @@ _HYBRID_PRODUCT_ONLY_CACHE = DATA_PROCESSED / "customer_vectors_hybrid_product_o
 _HYBRID_WITH_STORE_CACHE = DATA_PROCESSED / "customer_vectors_hybrid_with_store.parquet"
 _STORE_FEATURES_CACHE = DATA_PROCESSED / "customer_store_features.parquet"
 
+# Recency weights are floats; integer-quantise before streaming aggregation so
+# the sum is associative across chunk orderings on different machines.
+# 1e8 preserves 8 significant decimal digits — more than enough for exp(-λ·t).
+_WEIGHT_SCALE = 100_000_000
+
 
 # ─── 1. Stage 1: per-(customer, product) interaction weights ──────────────────
 
@@ -110,17 +115,22 @@ def _build_interactions(
         pl.scan_parquet(df_combined_path)
         .select(["cliente", "idarticu", "fecha", "idpromoc"])
         .with_columns([
+            # Quantise to Int64 before aggregation: integer addition is associative,
+            # so the streaming sum is bit-identical regardless of chunk boundaries
+            # or the order in which chunks are merged across machines.
             (
-                pl.lit(-decay_lambda, dtype=pl.Float64)
-                * (pl.lit(_REFERENCE_DATE) - pl.col("fecha")).dt.total_days().cast(pl.Float64)
-            ).exp().alias("recency_weight"),
+                (
+                    pl.lit(-decay_lambda, dtype=pl.Float64)
+                    * (pl.lit(_REFERENCE_DATE) - pl.col("fecha")).dt.total_days().cast(pl.Float64)
+                ).exp() * _WEIGHT_SCALE
+            ).round(0).cast(pl.Int64).alias("recency_weight_int"),
             # idpromoc is String in df_combined: "Promo" | "No promo" (never null)
             (pl.col("idpromoc") == "Promo")
             .cast(pl.Int32).alias("is_promo"),
         ])
         .group_by(["cliente", "idarticu"])
         .agg([
-            pl.col("recency_weight").sum().alias("weight"),
+            (pl.col("recency_weight_int").sum().cast(pl.Float64) / _WEIGHT_SCALE).alias("weight"),
             pl.col("is_promo").sum().alias("promo_purchases"),
             pl.len().cast(pl.Int32).alias("total_purchases"),
         ])
