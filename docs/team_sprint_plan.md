@@ -4,6 +4,75 @@
 
 ---
 
+## Role Assignments
+
+Fill in names before sending.
+
+| Member | Name | Focus |
+|---|---|---|
+| M1 | _Sil/Rach_ | Product Embeddings |
+| M2 | _Sil/Rach_ | Customer Vector Representations |
+| M3 | _Sebas_ | Dimensionality Reduction & Clustering |
+| M4 | _Tito_ | Tribe Profiles and Presentation |
+| M5 |_Robyn_ | Feature Engineering & Production |
+
+---
+
+## Shared Files — Where They Go
+
+Robyn will share files via [OneDrive/WhatsApp/USB]. Place them exactly as shown before running anything.
+
+**Required for reproducibility — must be identical across all machines:**
+
+```
+carrefour_capstone/
+├── data/
+│   ├── dev/
+│   │   └── df_combined.parquet          ← 96 MB  (source of truth; M1 and M5 rebuild from this)
+│   │   └── subset_metadata.json         ← <1 MB  (dev subset parameters)
+│   └── processed/
+│       └── customer_kpis.parquet        ← 114 MB (required by profile_tribes — will crash without it)
+```
+
+`customer_kpis.parquet` lives in `data/processed/` even though the sprint runs in dev mode — the pipeline looks there as its fallback.
+
+All other pipeline artifacts (`product_embeddings`, `customer_vectors_weighted`, `umap_cluster_item2vec`, cluster labels, tribe profiles) will be built by running the notebook. Expect ~50 min for a full rebuild from `df_combined.parquet` before you can start your experiments.
+
+---
+
+## Before You Start — Environment and Data Check
+
+Run this once after placing the shared files to confirm your environment and data are in place before Step 0.
+
+```python
+import os, polars as pl
+os.environ["CARREFOUR_MODE"] = "dev"
+from src.config import DATA_PROCESSED, ROOT
+
+all_ok = True
+
+# --- Required for reproducibility (must be identical across all machines) ---
+print("Required shared files:")
+required = {
+    DATA_PROCESSED / "df_combined.parquet":                    "source of truth — M1 and M5 rebuild from this",
+    ROOT / "data" / "processed" / "customer_kpis.parquet":     "required by profile_tribes() / experiment_scorecard()",
+}
+for path, reason in required.items():
+    ok = path.exists()
+    print(f"  {'OK    ' if ok else 'MISSING'} {path.name}  ({reason})")
+    all_ok = all_ok and ok
+
+if all_ok:
+    df = pl.scan_parquet(DATA_PROCESSED / "df_combined.parquet")
+    shape = df.collect(engine="streaming").shape
+    print(f"\ndf_combined shape: {shape}  (expected ~7.5M rows, 44 000 customers)")
+    print("\nRequired files present. Proceed to Step 0.")
+else:
+    print("\nMissing required files — do not proceed until resolved. Contact Robyn.")
+```
+
+---
+
 ## Safety Protocol — Read Before Running Anything
 
 ### Rule 1 — Preserve the baseline artifacts first
@@ -108,8 +177,11 @@ The pipeline is complete end-to-end in dev mode. The current segmentation produc
 
 Setup:
 ```powershell
+git checkout perf
+git pull
 git checkout -b experiment/<your-name>
 conda activate carrefour
+conda env update -f environment.yml --prune
 $env:CARREFOUR_MODE = "dev"
 ```
 
@@ -192,7 +264,7 @@ M5  HHI + diversity features from df_combined (~60min)
     basket mission features (~45min)
     price tier affinity features (~60min)
 
-END OF DAY 1: share all scorecards → agree on combined winner config
+END OF DAY 1: post all scorecards to the WhatsApp group → agree on combined winner config
 ─────────────────────────────────────────────────────────────────
 DAY 2 MORNING — sequential
   one person: combined clean rebuild with winner config (~60–90min)
@@ -481,6 +553,8 @@ If M1's window sweep produced a confirmed improvement, re-run your best M2 confi
 
 **Run this first. No rebuild needed — operates on the existing baseline UMAP embedding.**
 
+> **Note**: `VECTOR_SOURCE` is set by the notebook's vector-source selection cell (the one that prints "Selected vector source → item2vec"). Run the notebook through that cell before running the grid-read snippet below, or just hardcode `VECTOR_SOURCE = "item2vec"` in your experiment cell.
+
 Expand `configs/dev.yaml`:
 ```yaml
 hdbscan_grid:
@@ -492,7 +566,7 @@ hdbscan_grid:
 Set `RUN_HDBSCAN_GRID_SEARCH = True` in the notebook master cell. After the grid runs, filter for good candidates:
 
 ```python
-hdb_grid = pl.read_parquet(DATA_PROCESSED / f"hdbscan_grid_{VECTOR_SOURCE}_{SELECTED_REDUCER}_full.parquet")
+hdb_grid = pl.read_parquet(DATA_PROCESSED / f"hdbscan_grid_{VECTOR_SOURCE}_bmark.parquet")
 candidates = hdb_grid.filter(
     (pl.col("n_clusters") >= 12) & (pl.col("n_clusters") <= 20) & (pl.col("noise_pct") < 15)
 ).sort("noise_pct")
@@ -674,6 +748,8 @@ M4 does not block any other member on Day 1. On Day 2, M4's tribe cards are the 
 ### Day 1 — Qualitative Review of Bisecting K-Means
 
 As M3 runs each bisecting split, inspect the scorecard output. For each sub-tribe, look at the top-product lift and check whether the split produces a coherent product story or merely a mechanical improvement in the metric.
+
+**Post your verdict on each split to the WhatsApp group as M3 finishes them** — M3 should not combine splits without M4's sign-off.
 
 Flag splits that should be rejected:
 - Sub-tribes that share the same top products — the split is arbitrary
