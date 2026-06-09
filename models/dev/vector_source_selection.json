@@ -1,0 +1,36 @@
+{
+  "component": "vector_source",
+  "requested": "auto",
+  "selected": "item2vec",
+  "fallback": "hybrid",
+  "candidates": [
+    "item2vec",
+    "tfidf_svd",
+    "hybrid"
+  ],
+  "winner": {
+    "vector_source": "item2vec",
+    "vector_dims": 100,
+    "benchmark_sample": 12000,
+    "best_min_cluster_size": 136,
+    "best_min_samples": 1,
+    "best_cluster_method": "leaf",
+    "grid_n_clusters": 16,
+    "grid_noise_pct": 58.58,
+    "grid_silhouette": 0.3999,
+    "grid_davies_bouldin": 0.8714,
+    "core_n_clusters": 16,
+    "core_noise_pct": 58.58,
+    "core_silhouette": 0.3999,
+    "core_davies_bouldin": 0.8714,
+    "assigned_n_clusters": 16,
+    "assigned_from_noise_pct": 58.58,
+    "assigned_silhouette": 0.1938,
+    "assigned_davies_bouldin": 1.3279,
+    "runtime_min": 3.0,
+    "target_gap": 1,
+    "coverage_adj_silhouette": 0.08027196,
+    "selected": "item2vec"
+  },
+  "comparison_path": "C:\\Users\\rothl\\Desktop\\IE Capstone\\carrefour_capstone\\data\\dev\\vector_source_hdbscan_comparison.parquet"
+}

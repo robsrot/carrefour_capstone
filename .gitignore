@@ -27,6 +27,12 @@ data/dev/*
 # MODELS — too large for git
 models/*
 !models/.gitkeep
+!models/dev/
+models/dev/*
+!models/dev/*.json
+!models/prod/
+models/prod/*
+!models/prod/*.json
 
 # OUTPUTS
 outputs/*
