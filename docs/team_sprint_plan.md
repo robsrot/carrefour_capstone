@@ -20,23 +20,136 @@ Fill in names before sending.
 
 ## Shared Files — Where They Go
 
-Robyn will share files via [OneDrive/WhatsApp/USB]. Place them exactly as shown before running anything.
+ZIP via [OneDrive/WhatsApp/USB]. Complete **both steps** before running anything.
 
-**Required for reproducibility — must be identical across all machines:**
+---
+
+### Step A — Delete stale artifacts first
+
+If you have run the pipeline before, or have any files left over from a previous session, delete these directories first. Stale cached Parquet files cause the notebook to silently skip rebuilds and you will get different outputs from the rest of the team.
+
+```powershell
+# Run from the carrefour_capstone root
+Remove-Item -Recurse -Force data\dev -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force models\dev -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force outputs\dev -ErrorAction SilentlyContinue
+```
+
+Then recreate the empty folder structure:
+
+```powershell
+New-Item -ItemType Directory -Force data\dev | Out-Null
+New-Item -ItemType Directory -Force models\dev | Out-Null
+New-Item -ItemType Directory -Force outputs\dev\model_selection | Out-Null
+```
+
+---
+
+### Step B — Place shared files exactly as shown
+
+All files below are canonical outputs from the `perf` branch. Place them at the exact paths listed — the pipeline has no fallback for missing cached artifacts.
+
+**Source of truth and metadata** — required for every member:
 
 ```
 carrefour_capstone/
 ├── data/
 │   ├── dev/
-│   │   └── df_combined.parquet          ← 96 MB  (source of truth; M1 and M5 rebuild from this)
-│   │   └── subset_metadata.json         ← <1 MB  (dev subset parameters)
+│   │   ├── df_combined.parquet          ← ~96 MB   never modify; M1 and M5 rebuild from this
+│   │   └── subset_metadata.json         ← <1 MB    dev subset parameters and random seed
 │   └── processed/
-│       └── customer_kpis.parquet        ← 114 MB (required by profile_tribes — will crash without it)
+│       └── customer_kpis.parquet        ← ~114 MB  required by profile_tribes() — crash without it
 ```
 
-`customer_kpis.parquet` lives in `data/processed/` even though the sprint runs in dev mode — the pipeline looks there as its fallback.
+> `customer_kpis.parquet` lives in `data/processed/` even in dev mode — the pipeline looks there as its fallback.
 
-All other pipeline artifacts (`product_embeddings`, `customer_vectors_weighted`, `umap_cluster_item2vec`, cluster labels, tribe profiles) will be built by running the notebook. Expect ~50 min for a full rebuild from `df_combined.parquet` before you can start your experiments.
+**Phase 1 — Embeddings** — required for M2 to start without a full rebuild:
+
+```
+data/dev/
+├── basket_sentences.parquet
+├── product_popularity.parquet
+└── product_embeddings.parquet                                     ← 100-dim Item2Vec, 55,974 products
+
+models/dev/
+└── word2vec_product.model                                         ← trained Item2Vec model (55,974 vocab, 100 dims)
+```
+
+**Phase 2 — Customer vectors** — required for M3's UMAP sweep and bisecting K-Means:
+
+```
+data/dev/
+├── customer_product_weights.parquet
+├── customer_product_share_features.parquet
+├── customer_vectors_weighted.parquet                              ← PRIMARY: recency+frequency-weighted mean
+├── customer_vectors_mean.parquet
+├── customer_vectors_tfidf_svd.parquet
+├── customer_vectors_hybrid_product_only.parquet
+└── customer_store_features.parquet
+```
+
+**Phase 3 — Dimensionality reduction** — required for M3 Part A (no rebuild needed):
+
+```
+data/dev/
+├── umap_cluster_item2vec.parquet                                  ← PRIMARY: 50-dim UMAP (full population)
+├── umap_cluster_item2vec_bmark.parquet
+├── umap_cluster_tfidf_svd_bmark.parquet
+├── umap_cluster_hybrid_bmark.parquet
+├── umap_viz_item2vec_umap_2d.parquet                             ← 2-dim UMAP for scatter plots
+├── umap_viz_item2vec_umap_preview_2d.parquet
+├── pca_cluster_item2vec.parquet
+└── pca_model_item2vec.pkl
+```
+
+**Phase 4 — Clustering and tribe profiles** — required for M3 and M4 to start immediately:
+
+```
+data/dev/
+├── hdbscan_grid_item2vec_bmark.parquet
+├── hdbscan_grid_tfidf_svd_bmark.parquet
+├── hdbscan_grid_hybrid_bmark.parquet
+├── vector_source_hdbscan_comparison.parquet
+├── cluster_labels_hdbscan_item2vec_umap_mcs136_ms1_leaf.parquet  ← canonical HDBSCAN labels (11 tribes)
+├── cluster_labels_hdbscan_assigned_item2vec_bmark.parquet
+├── cluster_labels_hdbscan_assigned_tfidf_svd_bmark.parquet
+├── cluster_labels_hdbscan_assigned_hybrid_bmark.parquet
+├── cluster_labels_hdbscan_item2vec_bmark.parquet
+├── cluster_labels_hdbscan_tfidf_svd_bmark.parquet
+├── cluster_labels_hdbscan_hybrid_bmark.parquet
+├── cluster_labels_kmeans_item2vec_umap_k8.parquet
+├── cluster_labels_kmeans_item2vec_umap_k10.parquet
+├── cluster_labels_kmeans_item2vec_umap_k12.parquet
+├── cluster_labels_kmeans_item2vec_umap_k15.parquet
+├── cluster_labels_kmeans_item2vec_umap_k18.parquet
+├── kmeans_baseline_results_item2vec_umap.parquet
+├── tribe_profiles_hdbscan_assigned.parquet                        ← PRIMARY: baseline tribe profiles (11 tribes, 9.32× lift)
+├── tribe_profiles_kmeans_k8.parquet
+├── tribe_profiles_kmeans_k10.parquet
+├── tribe_profiles_kmeans_k12.parquet
+├── tribe_profiles_kmeans_k15.parquet
+└── tribe_profiles_kmeans_k18.parquet
+```
+
+**Model selection state** — required for the notebook to follow the same pipeline path without re-running benchmarks:
+
+```
+models/dev/
+├── vector_source_selection.json                                   ← winner: item2vec
+├── reducer_selection.json                                         ← winner: umap
+└── clusterer_selection.json                                       ← winner: hdbscan_assigned
+
+outputs/dev/model_selection/
+├── vector_source_selection.json
+├── reducer_selection.json
+└── clusterer_selection.json
+```
+
+> Without the selection JSONs the notebook will re-run the full multi-source benchmark (~45 min extra) instead of loading the pre-selected winner.
+
+---
+
+> **Note on `cluster_labels_hdbscan_assigned.parquet`**: The Step 0 backup and all safety rules reference this filename. It is created by the notebook's model-selection cell, which promotes `cluster_labels_hdbscan_item2vec_umap_mcs136_ms1_leaf.parquet` to the canonical live name. Run through the notebook's master cell after placing the shared files and this file will be created automatically — you do not need to rename anything manually.
 
 ---
 
@@ -54,8 +167,14 @@ all_ok = True
 # --- Required for reproducibility (must be identical across all machines) ---
 print("Required shared files:")
 required = {
-    DATA_PROCESSED / "df_combined.parquet":                    "source of truth — M1 and M5 rebuild from this",
-    ROOT / "data" / "processed" / "customer_kpis.parquet":     "required by profile_tribes() / experiment_scorecard()",
+    DATA_PROCESSED / "df_combined.parquet":                       "source of truth — M1 and M5 rebuild from this",
+    ROOT / "data" / "processed" / "customer_kpis.parquet":        "required by profile_tribes() / experiment_scorecard()",
+    DATA_PROCESSED / "product_embeddings.parquet":                "Phase 1 — M2 needs this to start without full rebuild",
+    DATA_PROCESSED / "customer_vectors_weighted.parquet":         "Phase 2 — M3 UMAP sweep and bisecting K-Means",
+    DATA_PROCESSED / "umap_cluster_item2vec.parquet":             "Phase 3 — M3 Part A starts here (no rebuild needed)",
+    DATA_PROCESSED / "tribe_profiles_hdbscan_assigned.parquet":   "Phase 4 — M4 baseline profiles",
+    ROOT / "models" / "dev" / "word2vec_product.model":           "models/dev — trained Item2Vec model",
+    ROOT / "models" / "dev" / "vector_source_selection.json":     "model selection — prevents benchmark re-run",
 }
 for path, reason in required.items():
     ok = path.exists()
