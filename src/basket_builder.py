@@ -8,7 +8,15 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
-from src.utils import collect_streaming, should_use_cache
+from src.utils import collect_streaming, file_fingerprint, should_use_cache, stable_hash, write_artifact_metadata
+
+
+def _deterministic_basket_order(ticket: str, products: list[str] | None) -> list[str]:
+    """Order basket tokens reproducibly without using product-id order as signal."""
+
+    if not products:
+        return []
+    return sorted([str(product) for product in products], key=lambda product: stable_hash(f"{ticket}|{product}"))
 
 
 def build_basket_sentences(
@@ -23,7 +31,16 @@ def build_basket_sentences(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.artifact_path("baskets", "output")
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "basket_sentences",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "repeat_product_by_quantity": repeat_product_by_quantity
+        if repeat_product_by_quantity is not None
+        else bool(cfg.get("baskets.repeat_product_by_quantity", False)),
+        "ordering": "deterministic_ticket_hash",
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
         return output
 
     repeat = (
@@ -68,7 +85,17 @@ def build_basket_sentences(
         )
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    collect_streaming(basket_lf.sort("ticket")).write_parquet(output)
+    baskets = collect_streaming(basket_lf.sort("ticket"))
+    baskets = baskets.with_columns(
+        pl.struct(["ticket", "products"])
+        .map_elements(
+            lambda row: _deterministic_basket_order(row["ticket"], row["products"]),
+            return_dtype=pl.List(pl.Utf8),
+        )
+        .alias("products")
+    )
+    baskets.write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 import polars as pl
@@ -16,8 +16,68 @@ def ensure_parent(path: Path) -> Path:
     return path
 
 
-def should_use_cache(path: Path, force: bool = False, use_cached: bool = True) -> bool:
-    return use_cached and not force and path.exists()
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
+def metadata_hash(metadata: Mapping[str, Any]) -> str:
+    payload = json.dumps(_json_safe(metadata), sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def artifact_metadata_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.meta.json")
+
+
+def file_fingerprint(path: str | Path) -> dict[str, Any]:
+    file_path = Path(path)
+    if not file_path.exists():
+        return {"path": str(file_path), "exists": False}
+    stat = file_path.stat()
+    return {
+        "path": str(file_path),
+        "exists": True,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def should_use_cache(
+    path: Path,
+    force: bool = False,
+    use_cached: bool = True,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    if not use_cached or force or not path.exists():
+        return False
+    if metadata is None:
+        return True
+
+    meta_path = artifact_metadata_path(path)
+    if not meta_path.exists():
+        return False
+    try:
+        cached = read_json(meta_path)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return cached.get("metadata_hash") == metadata_hash(metadata)
+
+
+def write_artifact_metadata(path: Path, metadata: Mapping[str, Any]) -> Path:
+    meta_path = artifact_metadata_path(path)
+    payload = {
+        "metadata_hash": metadata_hash(metadata),
+        "metadata": _json_safe(metadata),
+    }
+    return write_json(meta_path, payload)
 
 
 def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:

@@ -10,7 +10,14 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
-from src.utils import collect_streaming, numeric_feature_columns, schema_names, should_use_cache
+from src.utils import (
+    collect_streaming,
+    file_fingerprint,
+    numeric_feature_columns,
+    schema_names,
+    should_use_cache,
+    write_artifact_metadata,
+)
 
 
 def _promo_flag(columns: set[str]) -> pl.Expr:
@@ -37,7 +44,19 @@ def build_behavioral_features(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.artifact_path("behavioral_features", "output")
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "behavioral_features",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "promo_definition": "promo_line_share plus promo_basket_share; promo_share aliases line share",
+        "reference_date": cfg.get("behavioral_features.reference_date"),
+    }
+    if should_use_cache(
+        output,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ):
         return output
 
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
@@ -55,6 +74,7 @@ def build_behavioral_features(
             pl.col("unidades").sum().alias("_basket_units"),
             pl.len().alias("_basket_lines"),
             pl.col("_promo_flag").sum().alias("_basket_promo_lines"),
+            (pl.col("_promo_flag").sum() > 0).cast(pl.UInt8).alias("_basket_has_promo"),
             pl.col("fecha").max().alias("_basket_date"),
         ]
     )
@@ -65,7 +85,8 @@ def build_behavioral_features(
             pl.col("_basket_units").sum().alias("total_units"),
             pl.col("_basket_spend").mean().alias("avg_basket_value"),
             pl.col("_basket_units").mean().alias("avg_items_per_basket"),
-            (pl.col("_basket_promo_lines").sum() / pl.col("_basket_lines").sum()).alias("promo_share"),
+            (pl.col("_basket_promo_lines").sum() / pl.col("_basket_lines").sum()).alias("promo_line_share"),
+            pl.col("_basket_has_promo").mean().alias("promo_basket_share"),
             pl.col("_basket_date").max().alias("last_purchase_date"),
             pl.col("_basket_date").min().alias("first_purchase_date"),
         ]
@@ -81,6 +102,7 @@ def build_behavioral_features(
         basket_features.join(diversity, on="cliente", how="left")
         .with_columns(
             [
+                pl.col("promo_line_share").alias("promo_share"),
                 (pl.lit(reference_date) - pl.col("last_purchase_date")).dt.total_days().alias("recency_days"),
                 (
                     pl.col("ticket_count")
@@ -95,6 +117,7 @@ def build_behavioral_features(
 
     output.parent.mkdir(parents=True, exist_ok=True)
     collect_streaming(result).write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output
 
 
@@ -112,7 +135,20 @@ def build_feature_set(
     force = cfg.get("cache.force", False) if force is None else force
     outputs = cfg.get("feature_sets.outputs", {})
     output = Path(output_path) if output_path else cfg.data_processed / outputs.get(variant, f"feature_set_{variant}.parquet")
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "feature_set",
+        "mode": cfg.mode,
+        "variant": variant,
+        "customer_embeddings": file_fingerprint(customer_embeddings_path),
+        "behavior": file_fingerprint(behavior_path) if behavior_path else None,
+        "standardize_behavior": bool(cfg.get("feature_sets.standardize_behavior", True)),
+    }
+    if should_use_cache(
+        output,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ):
         return output
 
     embeddings = pl.read_parquet(customer_embeddings_path)
@@ -145,4 +181,5 @@ def build_feature_set(
 
     output.parent.mkdir(parents=True, exist_ok=True)
     result.write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output

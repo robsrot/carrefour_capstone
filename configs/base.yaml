@@ -40,6 +40,7 @@ baskets:
 word2vec:
   vector_size: 100
   window: 5
+  full_basket_context: true
   min_count: 10
   negative: 10
   sample: 0.001
@@ -89,9 +90,16 @@ modeling:
   feature_set_for_selection: embeddings_only
   evaluation_sample_size: 25000
   fit_sample_size: 300000
-  min_cluster_share: 0.005
   client_hypothesis_min: 10
   client_hypothesis_max: 15
+
+quality_gates:
+  min_clusters: 2
+  min_silhouette: 0.0
+  max_noise_pct: 60.0
+  max_cluster_size_cv: 1.5
+  require_profile_lift: false
+  min_strong_product_lifts_per_cluster: 1.0
 
 gmm:
   components_min: 6

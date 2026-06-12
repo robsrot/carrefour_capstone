@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.utils import collect_streaming, should_use_cache
+from src.utils import collect_streaming, file_fingerprint, should_use_cache, write_artifact_metadata
 
 
 class BasketSentenceCorpus:
@@ -73,6 +73,7 @@ def _basket_training_summary(basket_path: Path) -> dict[str, float | int | None]
                     pl.col("n_product_tokens").sum().alias("product_tokens"),
                     pl.col("n_product_tokens").mean().alias("avg_tokens_per_basket"),
                     pl.col("n_product_tokens").median().alias("median_tokens_per_basket"),
+                    pl.col("n_product_tokens").max().alias("max_tokens_per_basket"),
                 ]
             )
         ).row(0, named=True)
@@ -83,12 +84,28 @@ def _basket_training_summary(basket_path: Path) -> dict[str, float | int | None]
                 "product_tokens": None,
                 "avg_tokens_per_basket": None,
                 "median_tokens_per_basket": None,
+                "max_tokens_per_basket": None,
             }
         )
     return row
 
 
-def _print_training_config(basket_path: Path, output: Path, cfg: PipelineConfig, cached: bool) -> None:
+def _effective_window(basket_path: Path, cfg: PipelineConfig) -> int:
+    configured_window = int(cfg.get("word2vec.window"))
+    if not bool(cfg.get("word2vec.full_basket_context", False)):
+        return configured_window
+    summary = _basket_training_summary(basket_path)
+    max_tokens = summary.get("max_tokens_per_basket") or configured_window
+    return max(configured_window, int(max_tokens))
+
+
+def _print_training_config(
+    basket_path: Path,
+    output: Path,
+    cfg: PipelineConfig,
+    cached: bool,
+    effective_window: int,
+) -> None:
     summary = _basket_training_summary(basket_path)
     mode = "loading cached model" if cached else "training model"
     print(f"Item2Vec: {mode}", flush=True)
@@ -104,7 +121,9 @@ def _print_training_config(basket_path: Path, output: Path, cfg: PipelineConfig,
     print(
         "  config: "
         f"vector_size={cfg.get('word2vec.vector_size')}, "
-        f"window={cfg.get('word2vec.window')}, "
+        f"window={effective_window} "
+        f"(configured={cfg.get('word2vec.window')}, "
+        f"full_basket_context={cfg.get('word2vec.full_basket_context')}), "
         f"min_count={cfg.get('word2vec.min_count')}, "
         f"negative={cfg.get('word2vec.negative')}, "
         f"sample={cfg.get('word2vec.sample')}, "
@@ -132,9 +151,33 @@ def train_item2vec(
     verbose = bool(cfg.get("word2vec.report_progress", True)) if verbose is None else verbose
     basket_file = Path(basket_path)
     output = Path(model_path) if model_path else cfg.models / cfg.get("word2vec.model_name")
-    cached = should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True))
+    effective_window = _effective_window(basket_file, cfg)
+    cache_metadata = {
+        "stage": "item2vec_model",
+        "mode": cfg.mode,
+        "basket_sentences": file_fingerprint(basket_file),
+        "word2vec": {
+            "vector_size": int(cfg.get("word2vec.vector_size")),
+            "window": effective_window,
+            "configured_window": int(cfg.get("word2vec.window")),
+            "full_basket_context": bool(cfg.get("word2vec.full_basket_context", False)),
+            "min_count": int(cfg.get("word2vec.min_count")),
+            "negative": int(cfg.get("word2vec.negative")),
+            "sample": float(cfg.get("word2vec.sample")),
+            "epochs": int(cfg.get("word2vec.epochs")),
+            "sg": int(cfg.get("word2vec.sg")),
+            "workers": int(cfg.get("word2vec.workers")),
+            "seed": cfg.random_seed,
+        },
+    }
+    cached = should_use_cache(
+        output,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    )
     if verbose:
-        _print_training_config(basket_file, output, cfg, cached=cached)
+        _print_training_config(basket_file, output, cfg, cached=cached, effective_window=effective_window)
     if cached:
         model = Word2Vec.load(str(output))
         if verbose:
@@ -150,7 +193,7 @@ def train_item2vec(
     model = Word2Vec(
         sentences=corpus,
         vector_size=int(cfg.get("word2vec.vector_size")),
-        window=int(cfg.get("word2vec.window")),
+        window=effective_window,
         min_count=int(cfg.get("word2vec.min_count")),
         negative=int(cfg.get("word2vec.negative")),
         sample=float(cfg.get("word2vec.sample")),
@@ -164,6 +207,7 @@ def train_item2vec(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     model.save(str(output))
+    write_artifact_metadata(output, cache_metadata)
     if verbose:
         print(
             f"Item2Vec model saved: vocab={len(model.wv):,}, "
@@ -184,7 +228,19 @@ def save_product_embeddings(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.artifact_path("word2vec", "embeddings_output")
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "product_embeddings",
+        "mode": cfg.mode,
+        "model_vector_size": int(model.vector_size),
+        "model_vocab": int(len(model.wv)),
+        "model_keys_head": list(model.wv.index_to_key[:10]),
+    }
+    if should_use_cache(
+        output,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ):
         return output
 
     keys = list(model.wv.index_to_key)
@@ -195,6 +251,7 @@ def save_product_embeddings(
 
     output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(data).sort("idarticu").write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output
 
 
