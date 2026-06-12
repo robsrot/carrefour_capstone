@@ -128,6 +128,8 @@ profiling:
   top_n_products: 15
   top_n_sectors: 10
   min_product_customers: 10
+  strong_product_lift_threshold: 1.5
+  strong_sector_lift_threshold: 1.2
   output_parquet: tribe_profiles.parquet
   output_csv_template: tribe_profiles_{mode}.csv
 

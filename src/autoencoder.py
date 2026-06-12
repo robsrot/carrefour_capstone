@@ -8,7 +8,7 @@ import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.utils import frame_to_numpy, numeric_feature_columns, should_use_cache
+from src.utils import file_fingerprint, frame_to_numpy, numeric_feature_columns, should_use_cache, write_artifact_metadata
 
 
 def build_autoencoder_latents(
@@ -27,7 +27,19 @@ def build_autoencoder_latents(
         if output_path
         else cfg.data_processed / f"{cfg.get('autoencoder.output_prefix')}_{latent_size}.parquet"
     )
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    model_path = cfg.models / f"autoencoder_latent_{latent_size}.pt"
+    cache_metadata = {
+        "stage": "autoencoder_latents",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "latent_size": latent_size,
+        "autoencoder": cfg.get("autoencoder", {}),
+        "random_seed": cfg.random_seed,
+    }
+    if (
+        should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
+        and model_path.exists()
+    ):
         return output
 
     import torch
@@ -108,7 +120,6 @@ def build_autoencoder_latents(
     output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(out).write_parquet(output)
 
-    model_path = cfg.models / f"autoencoder_latent_{latent_size}.pt"
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -122,4 +133,6 @@ def build_autoencoder_latents(
         },
         model_path,
     )
+    write_artifact_metadata(output, cache_metadata)
+    write_artifact_metadata(model_path, cache_metadata)
     return output

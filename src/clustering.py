@@ -194,19 +194,6 @@ def run_gmm_grid(
     return assignment_path, results_path, selected_row
 
 
-def _centroid_assign(X: np.ndarray, X_fit: np.ndarray, labels_fit: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    valid_labels = sorted({int(label) for label in labels_fit if int(label) >= 0})
-    if not valid_labels:
-        return np.full(X.shape[0], -1, dtype=np.int32), np.zeros(X.shape[0], dtype=np.float32)
-    centroids = np.vstack([X_fit[labels_fit == label].mean(axis=0) for label in valid_labels])
-    distances = ((X[:, None, :] - centroids[None, :, :]) ** 2).sum(axis=2)
-    nearest = distances.argmin(axis=1)
-    labels = np.asarray([valid_labels[idx] for idx in nearest], dtype=np.int32)
-    scale = np.maximum(np.median(np.sqrt(distances.min(axis=1))), 1e-6)
-    probabilities = np.exp(-np.sqrt(distances.min(axis=1)) / scale).astype(np.float32)
-    return labels, probabilities
-
-
 def run_hdbscan(
     feature_path: str | Path,
     output_prefix: str = "hdbscan",
@@ -329,7 +316,20 @@ def run_pca_kmeans_grid(
     force = cfg.get("cache.force", False) if force is None else force
     assignment_path = cfg.data_processed / f"cluster_assignments_{output_prefix}.parquet"
     results_path = cfg.data_processed / f"{output_prefix}_grid_results.parquet"
-    if should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True)) and results_path.exists():
+    cache_metadata = {
+        "stage": "pca_kmeans_grid",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "output_prefix": output_prefix,
+        "pca": cfg.get("pca", {}),
+        "kmeans": cfg.get("kmeans", {}),
+        "modeling": cfg.get("modeling", {}),
+        "quality_gates": cfg.get("quality_gates", {}),
+    }
+    if (
+        should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
+        and should_use_cache(results_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
+    ):
         results = pl.read_parquet(results_path).sort("selection_rank")
         return assignment_path, results_path, results.row(0, named=True)
 
@@ -347,8 +347,6 @@ def run_pca_kmeans_grid(
     Z_fit = Z[fit_idx]
 
     rows = []
-    best: dict[str, Any] | None = None
-    best_payload: tuple[MiniBatchKMeans, np.ndarray] | None = None
     for k in range(int(cfg.get("kmeans.k_min", 6)), int(cfg.get("kmeans.k_max", 25)) + 1):
         if k >= X_fit.shape[0]:
             continue
@@ -361,6 +359,7 @@ def run_pca_kmeans_grid(
         model.fit(Z_fit)
         labels = model.predict(Z)
         metrics = evaluate_labels(Z, labels, cfg=cfg)
+        passes_gate, gate_reason = quality_gate_result(metrics, cfg=cfg)
         row = {
             "model": "Benchmark",
             "model_name": "PCA_KMeans",
@@ -368,26 +367,61 @@ def run_pca_kmeans_grid(
             "feature_space": "pca_customer_embeddings",
             "pca_explained_variance": float(pca.explained_variance_ratio_.sum()),
             **metrics,
+            "passes_quality_gate": passes_gate,
+            "quality_gate_reason": gate_reason,
             "assignment_path": str(assignment_path),
         }
         rows.append(row)
-        current_sil = row["silhouette"] if row["silhouette"] is not None else -999.0
-        best_sil = best["silhouette"] if best and best["silhouette"] is not None else -999.0
-        if best is None or current_sil > best_sil:
-            best = row
-            best_payload = (model, labels)
 
-    if best is None or best_payload is None:
+    if not rows:
         raise RuntimeError("PCA-KMeans grid did not produce a valid model.")
 
-    ranked = sorted(rows, key=lambda row: (row["silhouette"] is None, -(row["silhouette"] or -999)))
+    def _rank_key(row: dict[str, Any]) -> tuple[float, float, float, float]:
+        silhouette = row.get("coverage_adjusted_silhouette")
+        if silhouette is None:
+            silhouette = row.get("silhouette")
+        db = row.get("davies_bouldin")
+        balance = row.get("cluster_size_cv")
+        noise = row.get("noise_pct")
+        return (
+            -float(silhouette) if silhouette is not None else 999.0,
+            float(db) if db is not None else 999.0,
+            float(balance) if balance is not None else 999.0,
+            float(noise) if noise is not None else 999.0,
+        )
+
+    valid_rows = [row for row in rows if row["passes_quality_gate"]]
+    ranked = sorted(valid_rows, key=_rank_key) + sorted(
+        [row for row in rows if not row["passes_quality_gate"]],
+        key=_rank_key,
+    )
     for rank, row in enumerate(ranked, start=1):
         row["selection_rank"] = rank
-        row["selected_within_family"] = rank == 1
+        row["selected_within_family"] = rank == 1 and row["passes_quality_gate"]
 
-    model, labels = best_payload
-    _assignment_frame(clientes, labels, None, "PCA_KMeans", best["model_variant"]).write_parquet(assignment_path)
+    selected_row = ranked[0]
+    selected_k = int(str(selected_row["model_variant"]).split("_k")[-1])
+    model = MiniBatchKMeans(
+        n_clusters=selected_k,
+        random_state=cfg.random_seed,
+        batch_size=int(cfg.get("kmeans.batch_size", 4096)),
+        n_init=int(cfg.get("kmeans.n_init", 10)),
+    )
+    model.fit(Z_fit)
+    labels = model.predict(Z)
+
+    _assignment_frame(
+        clientes,
+        labels,
+        None,
+        "PCA_KMeans",
+        selected_row["model_variant"],
+        assignment_confidence_type=None,
+        assignment_source="kmeans_predict",
+    ).write_parquet(assignment_path)
     pl.DataFrame(ranked).write_parquet(results_path)
+    write_artifact_metadata(assignment_path, cache_metadata)
+    write_artifact_metadata(results_path, cache_metadata)
     _save_model(
         cfg.models / f"{output_prefix}_model.pkl",
         {
@@ -395,7 +429,7 @@ def run_pca_kmeans_grid(
             "pca": pca,
             "scaler": scaler,
             "feature_columns": feature_cols,
-            "selection": best,
+            "selection": selected_row,
         },
     )
-    return assignment_path, results_path, best
+    return assignment_path, results_path, selected_row

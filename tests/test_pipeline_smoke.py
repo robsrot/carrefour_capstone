@@ -47,7 +47,8 @@ def test_basket_builder_uses_ticket_sentences():
     baskets = pl.read_parquet(output).sort("ticket")
     assert baskets.shape[0] == 3
     products = baskets.filter(pl.col("ticket") == "t1").select("products").row(0)[0]
-    assert products == ["101", "102"]
+    assert set(products) == {"101", "102"}
+    assert len(products) == 2
 
 
 def test_behavioral_features_parse_no_promo():
@@ -58,5 +59,9 @@ def test_behavioral_features_parse_no_promo():
     c1 = features.filter(pl.col("cliente") == "c1").row(0, named=True)
     c2 = features.filter(pl.col("cliente") == "c2").row(0, named=True)
     assert c1["ticket_count"] == 2
+    assert c1["promo_line_share"] == 1 / 3
+    assert c1["promo_basket_share"] == 1 / 2
     assert c1["promo_share"] == 1 / 3
+    assert c2["promo_line_share"] == 1.0
+    assert c2["promo_basket_share"] == 1.0
     assert c2["promo_share"] == 1.0

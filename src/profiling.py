@@ -9,7 +9,7 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
-from src.utils import collect_streaming, schema_names, should_use_cache
+from src.utils import collect_streaming, file_fingerprint, schema_names, should_use_cache, write_artifact_metadata
 
 
 def _join_list(values: list[Any], fmt: str = "{}") -> str:
@@ -31,7 +31,17 @@ def profile_tribes(
     assignments_file = Path(assignments_path)
     stem = assignments_file.stem.replace("cluster_assignments_", "")
     output = Path(output_path) if output_path else cfg.data_processed / f"tribe_profiles_{stem}.parquet"
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    candidate_behavior_path = Path(behavior_path) if behavior_path else cfg.artifact_path("behavioral_features", "output")
+    cache_metadata = {
+        "stage": "tribe_profiles",
+        "mode": cfg.mode,
+        "assignments": file_fingerprint(assignments_file),
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "behavior": file_fingerprint(candidate_behavior_path),
+        "profiling": cfg.get("profiling", {}),
+        "population_definition": "all_assigned_customers_including_noise",
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
         return output
 
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
@@ -41,24 +51,33 @@ def profile_tribes(
         if col in columns:
             product_cols.append(col)
 
-    assignments = (
+    assignments_all = (
         pl.scan_parquet(assignments_file)
-        .select(["cliente", "tribe_id", "model_name", "model_variant", "assignment_probability"])
-        .filter(pl.col("tribe_id") >= 0)
+        .select(["cliente", "tribe_id"])
+        .unique(subset=["cliente"], keep="first")
     )
-    clustered = lf.select(product_cols).join(assignments.select(["cliente", "tribe_id"]), on="cliente", how="inner")
+    clustered_assignments = assignments_all.filter(pl.col("tribe_id") >= 0)
+    assignment_customers = assignments_all.select("cliente")
+    population = lf.select(product_cols).join(assignment_customers, on="cliente", how="inner")
+    clustered = population.join(clustered_assignments, on="cliente", how="inner")
 
     cluster_sizes = collect_streaming(
-        assignments.group_by("tribe_id").agg(pl.col("cliente").n_unique().alias("n_customers")).sort("tribe_id")
+        clustered_assignments.group_by("tribe_id").agg(pl.col("cliente").n_unique().alias("n_customers")).sort("tribe_id")
     )
-    total_customers = int(cluster_sizes["n_customers"].sum())
-    cluster_size_lookup = {row["tribe_id"]: row["n_customers"] for row in cluster_sizes.iter_rows(named=True)}
+    total_customers = int(
+        collect_streaming(assignments_all.select(pl.col("cliente").n_unique().alias("n_customers")))[0, "n_customers"]
+    )
+    clustered_customers = int(cluster_sizes["n_customers"].sum()) if cluster_sizes.height else 0
+    noise_customers = max(total_customers - clustered_customers, 0)
 
     customer_product = clustered.select(
         ["tribe_id", "cliente", "idarticu"]
         + [col for col in ["desc_larga_articulo", "desc_sector"] if col in product_cols]
     ).unique(subset=["tribe_id", "cliente", "idarticu"])
-    population_product = customer_product.group_by("idarticu").agg(
+    population_customer_product = population.select(
+        ["cliente", "idarticu"] + [col for col in ["desc_larga_articulo", "desc_sector"] if col in product_cols]
+    ).unique(subset=["cliente", "idarticu"])
+    population_product = population_customer_product.group_by("idarticu").agg(
         [
             pl.col("cliente").n_unique().alias("population_customers"),
             pl.col("desc_larga_articulo").first().alias("product_description")
@@ -78,7 +97,7 @@ def profile_tribes(
         .with_columns(
             [
                 (pl.col("cluster_customers") / pl.col("n_customers")).alias("cluster_rate"),
-                (pl.col("population_customers") / total_customers).alias("population_rate"),
+                (pl.col("population_customers") / max(total_customers, 1)).alias("population_rate"),
             ]
         )
         .with_columns((pl.col("cluster_rate") / pl.col("population_rate")).alias("lift"))
@@ -87,9 +106,9 @@ def profile_tribes(
     )
 
     if "desc_sector" in product_cols:
-        population_sector = clustered.group_by("desc_sector").agg(pl.len().alias("population_lines"))
+        population_sector = population.group_by("desc_sector").agg(pl.len().alias("population_lines"))
         cluster_sector_totals = clustered.group_by("tribe_id").agg(pl.len().alias("cluster_lines_total"))
-        population_total = collect_streaming(clustered.select(pl.len().alias("n_lines")))[0, "n_lines"]
+        population_total = collect_streaming(population.select(pl.len().alias("n_lines")))[0, "n_lines"]
         sector_lifts = collect_streaming(
             clustered.group_by(["tribe_id", "desc_sector"])
             .agg(pl.len().alias("cluster_lines"))
@@ -98,7 +117,7 @@ def profile_tribes(
             .with_columns(
                 [
                     (pl.col("cluster_lines") / pl.col("cluster_lines_total")).alias("cluster_sector_share"),
-                    (pl.col("population_lines") / population_total).alias("population_sector_share"),
+                    (pl.col("population_lines") / max(population_total, 1)).alias("population_sector_share"),
                 ]
             )
             .with_columns((pl.col("cluster_sector_share") / pl.col("population_sector_share")).alias("lift"))
@@ -108,13 +127,12 @@ def profile_tribes(
         sector_lifts = pl.DataFrame({"tribe_id": [], "desc_sector": [], "lift": []})
 
     behavior_summary = None
-    candidate_behavior_path = Path(behavior_path) if behavior_path else cfg.artifact_path("behavioral_features", "output")
     if candidate_behavior_path.exists():
         behavior = pl.scan_parquet(candidate_behavior_path)
         behavior_cols = [col for col in schema_names(behavior) if col != "cliente"]
         aggregations = [pl.col(col).mean().alias(f"avg_{col}") for col in behavior_cols if col != "tribe_id"]
         behavior_summary = collect_streaming(
-            assignments.select(["cliente", "tribe_id"]).join(behavior, on="cliente", how="left").group_by("tribe_id").agg(aggregations)
+            clustered_assignments.join(behavior, on="cliente", how="left").group_by("tribe_id").agg(aggregations)
         )
 
     rows = []
@@ -126,6 +144,9 @@ def profile_tribes(
             "tribe_id": tribe_id,
             "n_customers": int(cluster_row["n_customers"]),
             "population_share": float(cluster_row["n_customers"] / max(total_customers, 1)),
+            "profile_population": "all_assigned_customers_including_noise",
+            "profile_population_customers": total_customers,
+            "profile_noise_customers": noise_customers,
             "top_product_ids": products["idarticu"].to_list() if products.height else [],
             "top_products": products["product_description"].to_list() if "product_description" in products.columns else [],
             "top_product_lifts": products["lift"].round(3).to_list() if products.height else [],
@@ -141,9 +162,28 @@ def profile_tribes(
                         row[col] = behavior_match[0, col]
         rows.append(row)
 
-    profiles = pl.DataFrame(rows).sort("tribe_id")
+    if rows:
+        profiles = pl.DataFrame(rows).sort("tribe_id")
+    else:
+        profiles = pl.DataFrame(
+            schema={
+                "tribe_id": pl.Int32,
+                "n_customers": pl.Int64,
+                "population_share": pl.Float64,
+                "profile_population": pl.Utf8,
+                "profile_population_customers": pl.Int64,
+                "profile_noise_customers": pl.Int64,
+                "top_product_ids": pl.List(pl.Utf8),
+                "top_products": pl.List(pl.Utf8),
+                "top_product_lifts": pl.List(pl.Float64),
+                "top_product_customer_counts": pl.List(pl.Int64),
+                "top_sectors": pl.List(pl.Utf8),
+                "top_sector_lifts": pl.List(pl.Float64),
+            }
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     profiles.write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output
 
 
@@ -162,16 +202,18 @@ def flatten_profiles_for_csv(profile_path: str | Path, output_csv: str | Path) -
     return output
 
 
-def profile_quality_summary(profile_path: str | Path) -> dict[str, Any]:
+def profile_quality_summary(profile_path: str | Path, cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
     profiles = pl.read_parquet(profile_path)
+    strong_product_lift = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+    strong_sector_lift = float(cfg.get("profiling.strong_sector_lift_threshold", 1.2))
     product_lift_counts = []
     sector_lift_counts = []
     max_product_lifts = []
     for row in profiles.iter_rows(named=True):
         product_lifts = row.get("top_product_lifts") or []
         sector_lifts = row.get("top_sector_lifts") or []
-        product_lift_counts.append(sum(1 for value in product_lifts if value and value >= 1.5))
-        sector_lift_counts.append(sum(1 for value in sector_lifts if value and value >= 1.2))
+        product_lift_counts.append(sum(1 for value in product_lifts if value and value >= strong_product_lift))
+        sector_lift_counts.append(sum(1 for value in sector_lifts if value and value >= strong_sector_lift))
         max_product_lifts.append(max(product_lifts) if product_lifts else 0.0)
     return {
         "profiled_clusters": profiles.height,

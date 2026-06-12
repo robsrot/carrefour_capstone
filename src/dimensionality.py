@@ -7,7 +7,7 @@ from pathlib import Path
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.utils import frame_to_numpy, numeric_feature_columns, should_use_cache
+from src.utils import file_fingerprint, frame_to_numpy, numeric_feature_columns, should_use_cache, write_artifact_metadata
 
 
 def build_pca_representation(
@@ -23,19 +23,28 @@ def build_pca_representation(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.data_processed / "feature_set_pca.parquet"
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    requested_components = n_components or int(cfg.get("pca.n_components", 32))
+    cache_metadata = {
+        "stage": "pca_representation",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "n_components": requested_components,
+        "random_seed": cfg.random_seed,
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
         return output
 
     df = pl.read_parquet(feature_path).sort("cliente")
     feature_cols = numeric_feature_columns(df)
     X = StandardScaler().fit_transform(frame_to_numpy(df, feature_cols))
-    dims = min(n_components or int(cfg.get("pca.n_components", 32)), X.shape[1], X.shape[0] - 1)
+    dims = min(requested_components, X.shape[1], X.shape[0] - 1)
     coords = PCA(n_components=dims, random_state=cfg.random_seed).fit_transform(X)
     out = {"cliente": df["cliente"].to_list()}
     for idx in range(coords.shape[1]):
         out[f"pca_{idx:03d}"] = coords[:, idx].astype("float32")
     output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(out).write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output
 
 
@@ -51,13 +60,22 @@ def build_umap_visualization(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.data_processed / "umap_visualization.parquet"
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "umap_visualization",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "n_components": 2,
+        "random_seed": cfg.random_seed,
+        "n_jobs": 1,
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
         return output
 
     df = pl.read_parquet(feature_path).sort("cliente")
     feature_cols = numeric_feature_columns(df)
     X = StandardScaler().fit_transform(frame_to_numpy(df, feature_cols))
     coords = umap.UMAP(n_components=2, random_state=cfg.random_seed, n_jobs=1).fit_transform(X)
+    output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(
         {
             "cliente": df["cliente"].to_list(),
@@ -65,4 +83,5 @@ def build_umap_visualization(
             "y": coords[:, 1].astype("float32"),
         }
     ).write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output

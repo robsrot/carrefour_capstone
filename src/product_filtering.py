@@ -8,7 +8,7 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
-from src.utils import collect_streaming, schema_names, should_use_cache
+from src.utils import collect_streaming, file_fingerprint, schema_names, should_use_cache, write_artifact_metadata
 
 
 def build_product_popularity(
@@ -20,7 +20,12 @@ def build_product_popularity(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.data_processed / "product_popularity.parquet"
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True)):
+    cache_metadata = {
+        "stage": "product_popularity",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
         return output
 
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
@@ -60,4 +65,5 @@ def build_product_popularity(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     collect_streaming(popularity).write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
     return output

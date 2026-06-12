@@ -79,7 +79,7 @@ def build_basket_sentences(
             "ticket"
         ).agg(
             [
-                pl.col("_product_token").unique().sort().alias("products"),
+                pl.col("_product_token").unique().alias("products"),
                 pl.col("_product_token").n_unique().alias("n_product_tokens"),
             ]
         )
