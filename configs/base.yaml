@@ -1,0 +1,133 @@
+run:
+  mode_env: CARREFOUR_MODE
+  default_mode: prod
+  random_seed: 42
+
+paths:
+  raw_csv: data/raw/csv
+  raw_parquet: data/raw/parquet
+  processed: data/processed
+  dev: data/dev
+  models: models
+  outputs: outputs
+
+data:
+  prepared_transactions: df_combined.parquet
+  product_master: maestra_articulos.parquet
+  customer_kpis: customer_kpis.parquet
+  required_columns:
+    - cliente
+    - ticket
+    - fecha
+    - idarticu
+    - importe
+    - unidades
+  optional_columns:
+    - idpromoc
+    - idtiprod
+    - desc_larga_articulo
+    - idsector
+    - desc_sector
+
+cache:
+  force: false
+  use_cached: true
+
+baskets:
+  repeat_product_by_quantity: false
+  output: basket_sentences.parquet
+
+word2vec:
+  vector_size: 100
+  window: 5
+  min_count: 10
+  negative: 10
+  sample: 0.001
+  epochs: 5
+  sg: 1
+  workers: 1
+  report_progress: true
+  compute_loss: false
+  model_name: word2vec_product.model
+  embeddings_output: product_embeddings.parquet
+
+embedding_validation:
+  sample_size: 25
+  neighbors: 8
+  output_csv: embedding_validation.csv
+  output_md: embedding_validation.md
+
+customer_embeddings:
+  output: customer_embeddings.parquet
+  weight_priority:
+    - importe
+    - unidades
+    - equal
+
+behavioral_features:
+  output: customer_behavior_features.parquet
+  reference_date: null
+
+feature_sets:
+  default: embeddings_only
+  standardize_behavior: true
+  outputs:
+    embeddings_only: feature_set_embeddings_only.parquet
+    embeddings_behavior: feature_set_embeddings_behavior.parquet
+
+autoencoder:
+  enabled: true
+  latent_sizes: [8, 16, 32]
+  hidden_multiplier: 2
+  epochs: 25
+  batch_size: 1024
+  learning_rate: 0.001
+  patience: 5
+  output_prefix: autoencoder_latent
+
+modeling:
+  feature_set_for_selection: embeddings_only
+  evaluation_sample_size: 25000
+  fit_sample_size: 300000
+  min_cluster_share: 0.005
+  client_hypothesis_min: 10
+  client_hypothesis_max: 15
+
+gmm:
+  components_min: 6
+  components_max: 25
+  covariance_type: diag
+  max_iter: 300
+  n_init: 2
+
+hdbscan:
+  min_cluster_size: 500
+  min_samples: 10
+  cluster_selection_method: eom
+  allow_noise_assignment: false
+
+pca:
+  n_components: 32
+  random_state: 42
+
+kmeans:
+  k_min: 6
+  k_max: 25
+  batch_size: 4096
+  n_init: 10
+
+profiling:
+  top_n_products: 15
+  top_n_sectors: 10
+  min_product_customers: 10
+  output_parquet: tribe_profiles.parquet
+  output_csv_template: tribe_profiles_{mode}.csv
+
+exports:
+  assignments_template: customer_tribe_assignments_{mode}.parquet
+  model_comparison_template: model_comparison_{mode}.csv
+  decision_log_template: decision_log_{mode}.md
+
+visualization:
+  max_scatter_points: 50000
+  random_state: 42

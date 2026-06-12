@@ -1,0 +1,28 @@
+word2vec:
+  vector_size: 64
+  epochs: 3
+  workers: 1
+
+modeling:
+  evaluation_sample_size: 12000
+  fit_sample_size: null
+
+gmm:
+  max_iter: 200
+  n_init: 1
+
+hdbscan:
+  min_cluster_size: 150
+  min_samples: 5
+  cluster_selection_method: leaf
+
+autoencoder:
+  epochs: 12
+  batch_size: 512
+  patience: 3
+
+pca:
+  n_components: 24
+
+kmeans:
+  batch_size: 2048
