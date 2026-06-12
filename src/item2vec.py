@@ -10,6 +10,7 @@ import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
+from src.progress import log_event
 from src.utils import collect_streaming, file_fingerprint, should_use_cache, write_artifact_metadata
 
 
@@ -227,7 +228,11 @@ def save_product_embeddings(
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    output = Path(output_path) if output_path else cfg.artifact_path("word2vec", "embeddings_output")
+    output = Path(output_path) if output_path else cfg.artifact_path(
+        "word2vec",
+        "embeddings_output",
+        directory=cfg.outputs / "embeddings",
+    )
     cache_metadata = {
         "stage": "product_embeddings",
         "mode": cfg.mode,
@@ -241,6 +246,7 @@ def save_product_embeddings(
         use_cached=cfg.get("cache.use_cached", True),
         metadata=cache_metadata,
     ):
+        log_event("Stage 2 product embeddings", "cache hit", cfg=cfg, path=output)
         return output
 
     keys = list(model.wv.index_to_key)
@@ -252,11 +258,16 @@ def save_product_embeddings(
     output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(data).sort("idarticu").write_parquet(output)
     write_artifact_metadata(output, cache_metadata)
+    log_event("Stage 2 product embeddings", "wrote artifact", cfg=cfg, products=len(keys), path=output)
     return output
 
 
 def load_product_embeddings(path: str | Path | None = None, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
-    embedding_path = Path(path) if path else cfg.artifact_path("word2vec", "embeddings_output")
+    embedding_path = Path(path) if path else cfg.artifact_path(
+        "word2vec",
+        "embeddings_output",
+        directory=cfg.outputs / "embeddings",
+    )
     if not embedding_path.exists():
         raise FileNotFoundError(f"Product embeddings not found: {embedding_path}")
     return pl.read_parquet(embedding_path)

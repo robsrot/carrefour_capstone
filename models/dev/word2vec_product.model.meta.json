@@ -1,0 +1,26 @@
+{
+  "metadata_hash": "06e93629b55f6db87055620e6ff1096a4ea029d7a2ec26f7147af5164c68bd6f",
+  "metadata": {
+    "stage": "item2vec_model",
+    "mode": "dev",
+    "basket_sentences": {
+      "path": "C:\\Users\\rothl\\Desktop\\IE Capstone\\carrefour_capstone\\data\\dev\\basket_sentences.parquet",
+      "exists": true,
+      "size": 27364590,
+      "mtime_ns": 1781285749820424600
+    },
+    "word2vec": {
+      "vector_size": 64,
+      "window": 190,
+      "configured_window": 5,
+      "full_basket_context": true,
+      "min_count": 10,
+      "negative": 10,
+      "sample": 0.001,
+      "epochs": 3,
+      "sg": 1,
+      "workers": 1,
+      "seed": 42
+    }
+  }
+}

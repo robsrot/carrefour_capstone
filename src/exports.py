@@ -10,6 +10,7 @@ import polars as pl
 from src.config import CONFIG, PipelineConfig
 from src.profiling import flatten_profiles_for_csv, profile_quality_summary
 from src.evaluation import quality_gate_result
+from src.progress import log_event, stage_timer
 
 
 def build_model_comparison(
@@ -21,37 +22,46 @@ def build_model_comparison(
     """Write a client-readable model comparison table."""
 
     cfg.ensure_directories()
-    rows = []
-    for result in candidate_results:
-        row = dict(result)
-        profile_key = f"{row.get('model_name')}::{row.get('model_variant')}"
-        profile_path = (profile_paths or {}).get(profile_key) or (profile_paths or {}).get(row.get("model_name"))
-        if profile_path and Path(profile_path).exists():
-            quality = profile_quality_summary(profile_path, cfg=cfg)
-            row.update(quality)
-            row["interpretability_summary"] = (
-                f"{quality['clusters_with_product_lift']}/{quality['profiled_clusters']} tribes have strong product lift; "
-                f"{quality['clusters_with_sector_lift']}/{quality['profiled_clusters']} have sector lift."
+    with stage_timer("Stage 8 exports", "building model comparison", cfg=cfg, candidates=len(candidate_results)):
+        rows = []
+        for result in candidate_results:
+            row = dict(result)
+            profile_key = f"{row.get('model_name')}::{row.get('model_variant')}"
+            profile_path = (profile_paths or {}).get(profile_key) or (profile_paths or {}).get(row.get("model_name"))
+            if profile_path and Path(profile_path).exists():
+                quality = profile_quality_summary(profile_path, cfg=cfg)
+                row.update(quality)
+                row["interpretability_summary"] = (
+                    f"{quality['clusters_with_product_lift']}/{quality['profiled_clusters']} tribes have strong product lift; "
+                    f"{quality['clusters_with_sector_lift']}/{quality['profiled_clusters']} have sector lift."
+                )
+                row["profile_path"] = str(profile_path)
+            else:
+                row["interpretability_summary"] = "Not profiled yet."
+                row["profile_path"] = None
+            row["cluster_balance"] = (
+                f"min share={_fmt_pct(row.get('min_cluster_share'))}, "
+                f"max share={_fmt_pct(row.get('max_cluster_share'))}, "
+                f"noise={row.get('noise_pct', 0):.2f}%"
             )
-            row["profile_path"] = str(profile_path)
-        else:
-            row["interpretability_summary"] = "Not profiled yet."
-            row["profile_path"] = None
-        row["cluster_balance"] = (
-            f"min share={_fmt_pct(row.get('min_cluster_share'))}, "
-            f"max share={_fmt_pct(row.get('max_cluster_share'))}, "
-            f"noise={row.get('noise_pct', 0):.2f}%"
-        )
-        rows.append(row)
+            rows.append(row)
 
-    ranked = _rank_rows(rows, cfg=cfg)
-    output = (
-        Path(output_path)
-        if output_path
-        else cfg.reports / cfg.get("exports.model_comparison_template").format(mode=cfg.mode)
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    pl.DataFrame(ranked).write_csv(output)
+        ranked = _rank_rows(rows, cfg=cfg)
+        output = (
+            Path(output_path)
+            if output_path
+            else cfg.reports / cfg.get("exports.model_comparison_template").format(mode=cfg.mode)
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(ranked).write_csv(output)
+        selected = next((row for row in ranked if row.get("recommendation") == "Selected"), None)
+        log_event(
+            "Stage 8 exports",
+            "wrote model comparison",
+            cfg=cfg,
+            selected=selected.get("model_variant") if selected else "none",
+            path=output,
+        )
     return output
 
 
@@ -177,6 +187,7 @@ def export_final_assignments(
     assignments = assignments.select(columns)
     output.parent.mkdir(parents=True, exist_ok=True)
     assignments.write_parquet(output)
+    log_event("Stage 8 exports", "wrote final assignments", cfg=cfg, rows=assignments.height, path=output)
     return output
 
 
@@ -190,7 +201,9 @@ def export_final_profiles(
         if output_path
         else cfg.reports / cfg.get("profiling.output_csv_template").format(mode=cfg.mode)
     )
-    return flatten_profiles_for_csv(selected_profile_path, output)
+    exported = flatten_profiles_for_csv(selected_profile_path, output)
+    log_event("Stage 8 exports", "wrote final profiles", cfg=cfg, path=exported)
+    return exported
 
 
 def write_decision_log(
@@ -229,6 +242,7 @@ def write_decision_log(
             )
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(lines), encoding="utf-8")
+        log_event("Stage 8 exports", "wrote no-selection decision log", cfg=cfg, path=output)
         return output
 
     selected = selected_rows.sort("final_rank").row(0, named=True)
@@ -323,6 +337,7 @@ def write_decision_log(
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
+    log_event("Stage 8 exports", "wrote decision log", cfg=cfg, path=output)
     return output
 
 

@@ -1,14 +1,19 @@
 from datetime import date
 from pathlib import Path
+from dataclasses import replace
 
 import polars as pl
 
 from src.basket_builder import build_basket_sentences
+from src.customer_embeddings import build_customer_embeddings
 from src.config import load_config
-from src.feature_engineering import build_behavioral_features
+from src.feature_engineering import build_behavioral_features, build_feature_set
+from src.model_selection import build_candidate_model_diagnostics
+from src.profiling import flatten_profiles_for_csv
+from src.visualization import plot_stage6_model_diagnostics
 
 
-ARTIFACT_DIR = Path("data/dev/test_smoke")
+ARTIFACT_DIR = Path("outputs/dev/test_smoke")
 
 
 def _tiny_transactions() -> pl.LazyFrame:
@@ -33,6 +38,38 @@ def test_load_config_dev_paths():
     assert cfg.mode == "dev"
     assert cfg.data_processed.name == "dev"
     assert cfg.models.name == "dev"
+
+
+def test_default_ml_artifacts_use_output_folders():
+    cfg = replace(load_config("dev"), root=ARTIFACT_DIR / "path_contract_root")
+    transactions = _tiny_transactions()
+
+    basket_path = build_basket_sentences(transactions=transactions, cfg=cfg, force=True)
+    assert basket_path.parent == cfg.outputs / "embeddings"
+
+    product_embeddings_path = cfg.outputs / "embeddings" / "product_embeddings.parquet"
+    product_embeddings_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "idarticu": [101, 102, 103],
+            "emb_000": [1.0, 0.0, 0.5],
+            "emb_001": [0.0, 1.0, 0.5],
+        }
+    ).write_parquet(product_embeddings_path)
+
+    customer_embedding_path = build_customer_embeddings(
+        product_embeddings_path,
+        transactions=transactions,
+        cfg=cfg,
+        force=True,
+    )
+    assert customer_embedding_path.parent == cfg.outputs / "features"
+
+    behavior_path = build_behavioral_features(transactions=transactions, cfg=cfg, force=True)
+    assert behavior_path.parent == cfg.outputs / "features"
+
+    feature_set_path = build_feature_set(customer_embedding_path, cfg=cfg, force=True)
+    assert feature_set_path.parent == cfg.outputs / "features"
 
 
 def test_basket_builder_uses_ticket_sentences():
@@ -65,3 +102,83 @@ def test_behavioral_features_parse_no_promo():
     assert c2["promo_line_share"] == 1.0
     assert c2["promo_basket_share"] == 1.0
     assert c2["promo_share"] == 1.0
+
+
+def test_flatten_profiles_for_csv_serializes_nested_columns():
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    profile_path = ARTIFACT_DIR / "nested_profiles.parquet"
+    csv_path = ARTIFACT_DIR / "nested_profiles.csv"
+    pl.DataFrame(
+        {
+            "tribe_id": [0],
+            "n_customers": [12],
+            "top_product_ids": [["101", "102"]],
+            "top_products": [["Milk", "Bread"]],
+            "top_product_lifts": [[2.5, 1.8]],
+            "top_product_customer_counts": [[10, 8]],
+            "top_sectors": [["Fresh", "Grocery"]],
+            "top_sector_lifts": [[1.4, 1.2]],
+        }
+    ).write_parquet(profile_path)
+
+    flatten_profiles_for_csv(profile_path, csv_path)
+    exported = pl.read_csv(csv_path)
+
+    row = exported.row(0, named=True)
+    assert row["top_products"] == "Milk; Bread"
+    assert row["top_product_customer_counts"] == "10; 8"
+
+
+def test_stage6_diagnostics_collects_and_plots_candidates():
+    cfg = replace(load_config("dev"), root=ARTIFACT_DIR / "diagnostics_root")
+    result_dir = cfg.outputs / "model_selection"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    gmm_results = result_dir / "model_a_gmm_grid_results.parquet"
+    hdbscan_results = result_dir / "model_b_hdbscan_results.parquet"
+
+    pl.DataFrame(
+        {
+            "model": ["Model A", "Model A"],
+            "model_id": ["model_a_gmm", "model_a_gmm"],
+            "model_name": ["model_a_gmm", "model_a_gmm"],
+            "algorithm_name": ["GaussianMixture", "GaussianMixture"],
+            "model_variant": ["gmm_k6", "gmm_k7"],
+            "cluster_count": [6, 7],
+            "coverage_adjusted_silhouette": [0.2, 0.3],
+            "silhouette": [0.2, 0.3],
+            "davies_bouldin": [1.4, 1.1],
+            "cluster_size_cv": [0.5, 0.4],
+            "noise_pct": [0.0, 0.0],
+            "coverage_pct": [100.0, 100.0],
+            "passes_quality_gate": [True, True],
+            "selected_within_family": [False, True],
+        }
+    ).write_parquet(gmm_results)
+    pl.DataFrame(
+        {
+            "model": ["Model B"],
+            "model_id": ["model_b_hdbscan"],
+            "model_name": ["model_b_hdbscan"],
+            "algorithm_name": ["HDBSCAN"],
+            "model_variant": ["hdbscan_mcs150_ms5_leaf"],
+            "cluster_count": [0],
+            "coverage_adjusted_silhouette": [None],
+            "silhouette": [None],
+            "davies_bouldin": [None],
+            "cluster_size_cv": [None],
+            "noise_pct": [100.0],
+            "coverage_pct": [0.0],
+            "passes_quality_gate": [False],
+            "selected_within_family": [False],
+        }
+    ).write_parquet(hdbscan_results)
+
+    diagnostics = build_candidate_model_diagnostics(
+        {"result_paths": {"a": gmm_results, "b": hdbscan_results}},
+        cfg=cfg,
+    )
+    figure = plot_stage6_model_diagnostics(diagnostics["parquet"], cfg=cfg)
+    ranked = pl.read_parquet(diagnostics["parquet"]).sort("stage6_rank")
+
+    assert ranked["candidate_id"].to_list()[0] == "model_a_gmm::gmm_k7"
+    assert figure.exists()

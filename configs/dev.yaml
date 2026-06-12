@@ -16,6 +16,10 @@ hdbscan:
   min_samples: 5
   cluster_selection_method: leaf
 
+umap:
+  n_components: 20
+  n_neighbors: 30
+
 autoencoder:
   epochs: 12
   batch_size: 512
@@ -25,4 +29,4 @@ pca:
   n_components: 24
 
 kmeans:
-  batch_size: 2048
+  batch_size: 4096

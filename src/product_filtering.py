@@ -19,7 +19,7 @@ def build_product_popularity(
 ) -> Path:
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    output = Path(output_path) if output_path else cfg.data_processed / "product_popularity.parquet"
+    output = Path(output_path) if output_path else cfg.reports / "product_popularity.parquet"
     cache_metadata = {
         "stage": "product_popularity",
         "mode": cfg.mode,

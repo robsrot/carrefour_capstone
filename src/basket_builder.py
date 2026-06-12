@@ -8,6 +8,7 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
+from src.progress import log_event, stage_timer
 from src.utils import collect_streaming, file_fingerprint, should_use_cache, stable_hash, write_artifact_metadata
 
 
@@ -30,7 +31,11 @@ def build_basket_sentences(
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    output = Path(output_path) if output_path else cfg.artifact_path("baskets", "output")
+    output = Path(output_path) if output_path else cfg.artifact_path(
+        "baskets",
+        "output",
+        directory=cfg.outputs / "embeddings",
+    )
     cache_metadata = {
         "stage": "basket_sentences",
         "mode": cfg.mode,
@@ -41,6 +46,7 @@ def build_basket_sentences(
         "ordering": "deterministic_ticket_hash",
     }
     if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 1 baskets", "cache hit", cfg=cfg, path=output)
         return output
 
     repeat = (
@@ -50,52 +56,54 @@ def build_basket_sentences(
     )
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
 
-    base = lf.select(["ticket", "idarticu"] + (["unidades"] if repeat else []))
-    if repeat:
-        token_lf = (
-            base.with_columns(
+    with stage_timer("Stage 1 baskets", "building basket sentences", cfg=cfg, output=output, repeat_products=repeat):
+        base = lf.select(["ticket", "idarticu"] + (["unidades"] if repeat else []))
+        if repeat:
+            token_lf = (
+                base.with_columns(
+                    [
+                        pl.col("idarticu").cast(pl.Utf8).alias("_product_token"),
+                        pl.when(pl.col("unidades").cast(pl.Float64) > 0)
+                        .then(pl.col("unidades").cast(pl.Int64))
+                        .otherwise(1)
+                        .clip(1, 20)
+                        .cast(pl.UInt32)
+                        .alias("_repeat_count"),
+                    ]
+                )
+                .with_columns(pl.col("_product_token").repeat_by("_repeat_count").alias("_tokens"))
+                .select(["ticket", "_tokens"])
+                .explode("_tokens")
+            )
+            basket_lf = token_lf.group_by("ticket").agg(
                 [
-                    pl.col("idarticu").cast(pl.Utf8).alias("_product_token"),
-                    pl.when(pl.col("unidades").cast(pl.Float64) > 0)
-                    .then(pl.col("unidades").cast(pl.Int64))
-                    .otherwise(1)
-                    .clip(1, 20)
-                    .cast(pl.UInt32)
-                    .alias("_repeat_count"),
+                    pl.col("_tokens").alias("products"),
+                    pl.len().alias("n_product_tokens"),
                 ]
             )
-            .with_columns(pl.col("_product_token").repeat_by("_repeat_count").alias("_tokens"))
-            .select(["ticket", "_tokens"])
-            .explode("_tokens")
-        )
-        basket_lf = token_lf.group_by("ticket").agg(
-            [
-                pl.col("_tokens").alias("products"),
-                pl.len().alias("n_product_tokens"),
-            ]
-        )
-    else:
-        basket_lf = base.with_columns(pl.col("idarticu").cast(pl.Utf8).alias("_product_token")).group_by(
-            "ticket"
-        ).agg(
-            [
-                pl.col("_product_token").unique().alias("products"),
-                pl.col("_product_token").n_unique().alias("n_product_tokens"),
-            ]
-        )
+        else:
+            basket_lf = base.with_columns(pl.col("idarticu").cast(pl.Utf8).alias("_product_token")).group_by(
+                "ticket"
+            ).agg(
+                [
+                    pl.col("_product_token").unique().alias("products"),
+                    pl.col("_product_token").n_unique().alias("n_product_tokens"),
+                ]
+            )
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    baskets = collect_streaming(basket_lf.sort("ticket"))
-    baskets = baskets.with_columns(
-        pl.struct(["ticket", "products"])
-        .map_elements(
-            lambda row: _deterministic_basket_order(row["ticket"], row["products"]),
-            return_dtype=pl.List(pl.Utf8),
+        output.parent.mkdir(parents=True, exist_ok=True)
+        baskets = collect_streaming(basket_lf.sort("ticket"))
+        baskets = baskets.with_columns(
+            pl.struct(["ticket", "products"])
+            .map_elements(
+                lambda row: _deterministic_basket_order(row["ticket"], row["products"]),
+                return_dtype=pl.List(pl.Utf8),
+            )
+            .alias("products")
         )
-        .alias("products")
-    )
-    baskets.write_parquet(output)
-    write_artifact_metadata(output, cache_metadata)
+        baskets.write_parquet(output)
+        write_artifact_metadata(output, cache_metadata)
+        log_event("Stage 1 baskets", "wrote artifact", cfg=cfg, baskets=baskets.height, path=output)
     return output
 
 

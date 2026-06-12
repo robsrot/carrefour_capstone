@@ -125,7 +125,8 @@ class PipelineConfig:
             self.figures,
             self.outputs / "embeddings",
             self.outputs / "features",
-            self.outputs / "models",
+            self.outputs / "model_selection",
+            self.outputs / "profiles",
         ]:
             path.mkdir(parents=True, exist_ok=True)
 
