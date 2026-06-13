@@ -34,7 +34,23 @@ def metadata_hash(metadata: Mapping[str, Any]) -> str:
 
 
 def artifact_metadata_path(path: Path) -> Path:
+    file_path = Path(path)
+    parts = file_path.parts
+    for idx, part in enumerate(parts[:-1]):
+        if part.lower() == "outputs" and idx + 1 < len(parts):
+            return Path(*parts[: idx + 2]) / ".artifact_metadata.json"
+    return file_path.parent / ".artifact_metadata.json"
+
+
+def _legacy_artifact_metadata_path(path: Path) -> Path:
     return path.with_name(f"{path.name}.meta.json")
+
+
+def _artifact_metadata_key(path: Path, manifest_path: Path) -> str:
+    try:
+        return path.relative_to(manifest_path.parent).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def file_fingerprint(path: str | Path) -> dict[str, Any]:
@@ -62,18 +78,35 @@ def should_use_cache(
         return True
 
     meta_path = artifact_metadata_path(path)
-    if not meta_path.exists():
-        return False
     try:
-        cached = read_json(meta_path)
+        if meta_path.exists():
+            cached = read_json(meta_path)
+            key = _artifact_metadata_key(path, meta_path)
+            entry = cached.get("artifacts", {}).get(key)
+            if entry:
+                return entry.get("metadata_hash") == metadata_hash(metadata)
+
+        legacy_meta_path = _legacy_artifact_metadata_path(path)
+        if legacy_meta_path.exists():
+            cached = read_json(legacy_meta_path)
+            return cached.get("metadata_hash") == metadata_hash(metadata)
     except (OSError, json.JSONDecodeError):
         return False
-    return cached.get("metadata_hash") == metadata_hash(metadata)
+    return False
 
 
 def write_artifact_metadata(path: Path, metadata: Mapping[str, Any]) -> Path:
     meta_path = artifact_metadata_path(path)
-    payload = {
+    if meta_path.exists():
+        try:
+            payload = read_json(meta_path)
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+    else:
+        payload = {}
+    payload.setdefault("version", 1)
+    payload.setdefault("artifacts", {})
+    payload["artifacts"][_artifact_metadata_key(path, meta_path)] = {
         "metadata_hash": metadata_hash(metadata),
         "metadata": _json_safe(metadata),
     }

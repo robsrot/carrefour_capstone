@@ -8,13 +8,13 @@ paths:
   raw_parquet: data/raw/parquet
   processed: data/processed
   dev: data/dev
-  models: models
   outputs: outputs
 
 data:
   prepared_transactions: df_combined.parquet
   product_master: maestra_articulos.parquet
   customer_kpis: customer_kpis.parquet
+  min_tickets_per_customer: 3
   required_columns:
     - cliente
     - ticket
@@ -35,6 +35,9 @@ cache:
 
 progress:
   enabled: true
+
+experiments:
+  enabled: false
 
 baskets:
   repeat_product_by_quantity: false
@@ -63,10 +66,7 @@ embedding_validation:
 
 customer_embeddings:
   output: customer_embeddings.parquet
-  weight_priority:
-    - importe
-    - unidades
-    - equal
+  weight_strategy: quantity
 
 behavioral_features:
   output: customer_behavior_features.parquet
@@ -95,6 +95,18 @@ modeling:
   fit_sample_size: 300000
   client_hypothesis_min: 10
   client_hypothesis_max: 15
+
+official_model_suite:
+  include_gmm: true
+  include_raw_hdbscan: false
+  include_umap_hdbscan: true
+  include_autoencoder: false
+  include_pca_kmeans: true
+
+stability:
+  sample_size: 10000
+  repeats: 5
+  jitter_scale: 0.02
 
 quality_gates:
   min_clusters: 2

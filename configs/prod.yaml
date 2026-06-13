@@ -1,0 +1,41 @@
+# Production overrides for the committed pipeline settings selected in dev.
+# Keep the modeling recipe aligned with dev, but scale sample sizes and density
+# thresholds to the larger production population.
+
+experiments:
+  enabled: false
+
+word2vec:
+  vector_size: 64
+  epochs: 5
+  workers: 1
+
+modeling:
+  evaluation_sample_size: 50000
+  fit_sample_size: 300000
+
+gmm:
+  max_iter: 300
+  n_init: 2
+
+hdbscan:
+  # Dev uses 150 on ~44k customers. Prod HDBSCAN fits on a 300k sample, so
+  # 1000 keeps roughly the same minimum density share.
+  min_cluster_size: 1000
+  min_samples: 1
+  cluster_selection_method: leaf
+
+umap:
+  n_components: 20
+  n_neighbors: 30
+
+autoencoder:
+  epochs: 25
+  batch_size: 1024
+  patience: 5
+
+pca:
+  n_components: 24
+
+kmeans:
+  batch_size: 4096

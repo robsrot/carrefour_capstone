@@ -97,6 +97,8 @@ def run_gmm_grid(
     algorithm_name: str = "GaussianMixture",
     feature_space: str = "raw_customer_embeddings",
     variant_prefix: str | None = None,
+    output_dir: str | Path | None = None,
+    model_dir: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path, dict[str, Any]]:
@@ -104,7 +106,8 @@ def run_gmm_grid(
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    model_selection_dir = cfg.outputs / "model_selection"
+    model_selection_dir = Path(output_dir) if output_dir else cfg.model_selection_cache
+    fitted_model_dir = Path(model_dir) if model_dir else cfg.models
     assignment_path = model_selection_dir / f"cluster_assignments_{output_prefix}.parquet"
     results_path = model_selection_dir / f"{output_prefix}_grid_results.parquet"
     cache_metadata = {
@@ -126,7 +129,9 @@ def run_gmm_grid(
     ):
         log_event("Stage 6 GMM", "cache hit", cfg=cfg, model=model_name, results=results_path)
         results = pl.read_parquet(results_path).sort("selection_rank")
-        return assignment_path, results_path, results.row(0, named=True)
+        best = results.row(0, named=True)
+        best["assignment_path"] = str(assignment_path)
+        return assignment_path, results_path, best
 
     from sklearn.mixture import GaussianMixture
 
@@ -225,7 +230,7 @@ def run_gmm_grid(
     write_artifact_metadata(assignment_path, cache_metadata)
     write_artifact_metadata(results_path, cache_metadata)
     _save_model(
-        cfg.models / f"{output_prefix}_model.pkl",
+        fitted_model_dir / f"{output_prefix}_model.pkl",
         {"model": model, "scaler": scaler, "feature_columns": feature_cols, "selection": selected_row},
     )
     log_event(
@@ -241,21 +246,25 @@ def run_gmm_grid(
 
 def run_hdbscan(
     feature_path: str | Path,
-    output_prefix: str = "hdbscan",
-    model_label: str = "Model B",
-    model_name: str = "model_b_hdbscan",
+    output_prefix: str = "model_x_raw_hdbscan",
+    model_label: str = "Model X",
+    model_name: str = "model_x_raw_hdbscan",
     algorithm_name: str = "HDBSCAN",
     feature_space: str = "raw_customer_embeddings",
+    trial_name: str | None = None,
     variant_prefix: str | None = None,
     scale_features: bool = True,
+    output_dir: str | Path | None = None,
+    model_dir: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path, dict[str, Any]]:
-    """Model B: HDBSCAN organic tribe discovery."""
+    """HDBSCAN organic tribe discovery on the supplied feature representation."""
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    model_selection_dir = cfg.outputs / "model_selection"
+    model_selection_dir = Path(output_dir) if output_dir else cfg.model_selection_cache
+    fitted_model_dir = Path(model_dir) if model_dir else cfg.models
     assignment_path = model_selection_dir / f"cluster_assignments_{output_prefix}.parquet"
     results_path = model_selection_dir / f"{output_prefix}_results.parquet"
     cache_metadata = {
@@ -267,6 +276,7 @@ def run_hdbscan(
         "model_name": model_name,
         "algorithm_name": algorithm_name,
         "feature_space": feature_space,
+        "trial_name": trial_name,
         "scale_features": scale_features,
         "hdbscan": cfg.get("hdbscan", {}),
         "modeling": cfg.get("modeling", {}),
@@ -279,6 +289,7 @@ def run_hdbscan(
     ):
         log_event("Stage 6 HDBSCAN", "cache hit", cfg=cfg, results=results_path)
         result = pl.read_parquet(results_path).row(0, named=True)
+        result["assignment_path"] = str(assignment_path)
         return assignment_path, results_path, result
 
     with stage_timer(
@@ -358,6 +369,9 @@ def run_hdbscan(
         "algorithm_name": algorithm_name,
         "model_variant": variant,
         "feature_space": feature_space,
+        "trial_name": trial_name,
+        "hdbscan_backend": assignment_source,
+        "scale_features": scale_features,
         **metrics,
         "passes_quality_gate": passes_gate,
         "quality_gate_reason": gate_reason,
@@ -378,7 +392,7 @@ def run_hdbscan(
     write_artifact_metadata(assignment_path, cache_metadata)
     write_artifact_metadata(results_path, cache_metadata)
     _save_model(
-        cfg.models / f"{output_prefix}_model.pkl",
+        fitted_model_dir / f"{output_prefix}_model.pkl",
         {"model": model, "scaler": scaler, "feature_columns": feature_cols, "selection": result},
     )
     log_event(
@@ -395,10 +409,12 @@ def run_hdbscan(
 
 def run_pca_kmeans_grid(
     feature_path: str | Path,
-    output_prefix: str = "model_e_pca_kmeans",
-    model_label: str = "Model E",
-    model_name: str = "model_e_pca_kmeans",
+    output_prefix: str = "model_c_pca_kmeans",
+    model_label: str = "Model C",
+    model_name: str = "model_c_pca_kmeans",
     algorithm_name: str = "PCA_MiniBatchKMeans",
+    output_dir: str | Path | None = None,
+    model_dir: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path, dict[str, Any]]:
@@ -406,7 +422,8 @@ def run_pca_kmeans_grid(
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
-    model_selection_dir = cfg.outputs / "model_selection"
+    model_selection_dir = Path(output_dir) if output_dir else cfg.model_selection_cache
+    fitted_model_dir = Path(model_dir) if model_dir else cfg.models
     assignment_path = model_selection_dir / f"cluster_assignments_{output_prefix}.parquet"
     results_path = model_selection_dir / f"{output_prefix}_grid_results.parquet"
     cache_metadata = {
@@ -428,7 +445,9 @@ def run_pca_kmeans_grid(
     ):
         log_event("Stage 6 PCA-KMeans", "cache hit", cfg=cfg, results=results_path)
         results = pl.read_parquet(results_path).sort("selection_rank")
-        return assignment_path, results_path, results.row(0, named=True)
+        best = results.row(0, named=True)
+        best["assignment_path"] = str(assignment_path)
+        return assignment_path, results_path, best
 
     from sklearn.cluster import MiniBatchKMeans
     from sklearn.decomposition import PCA
@@ -535,7 +554,7 @@ def run_pca_kmeans_grid(
     write_artifact_metadata(assignment_path, cache_metadata)
     write_artifact_metadata(results_path, cache_metadata)
     _save_model(
-        cfg.models / f"{output_prefix}_model.pkl",
+        fitted_model_dir / f"{output_prefix}_model.pkl",
         {
             "model": model,
             "pca": pca,

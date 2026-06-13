@@ -5,13 +5,462 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from textwrap import shorten
+from typing import Mapping
 
 import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.progress import log_event, stage_timer
-from src.utils import deterministic_sample_indices, frame_to_numpy, numeric_feature_columns
+from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns, scan_if_path, schema_names
+
+
+def _pca_2d(X: np.ndarray, cfg: PipelineConfig) -> np.ndarray:
+    from sklearn.decomposition import PCA
+
+    if X.shape[0] == 0:
+        return np.empty((0, 2), dtype=np.float32)
+    n_components = min(2, X.shape[0], X.shape[1])
+    if n_components <= 0:
+        return np.zeros((X.shape[0], 2), dtype=np.float32)
+    coords = PCA(n_components=n_components, random_state=cfg.random_seed).fit_transform(X)
+    if n_components == 1:
+        coords = np.column_stack([coords[:, 0], np.zeros(X.shape[0], dtype=coords.dtype)])
+    return coords.astype(np.float32, copy=False)
+
+
+def _sample_frame(df: pl.DataFrame, max_rows: int, cfg: PipelineConfig) -> pl.DataFrame:
+    idx = deterministic_sample_indices(df.height, int(max_rows), int(cfg.get("visualization.random_state", cfg.random_seed)))
+    return df[idx]
+
+
+def _promo_flag_expr() -> pl.Expr:
+    promo = pl.col("idpromoc").cast(pl.Utf8).str.strip_chars().str.to_lowercase()
+    no_promo_values = ["", "0", "none", "null", "nan", "no promo", "no_promo", "sin promo", "sin promocion"]
+    return pl.when(promo.is_not_null() & (~promo.is_in(no_promo_values))).then(1).otherwise(0)
+
+
+def _save_figure(fig, output: Path, cfg: PipelineConfig, stage: str, message: str) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=160)
+    log_event(stage, message, cfg=cfg, path=output)
+    return output
+
+
+def plot_prepared_data_overview(
+    transactions: pl.DataFrame | pl.LazyFrame | str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Create a compact overview of the prepared transaction data consumed by Notebook 03."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    lf = scan_if_path(transactions)
+    columns = set(schema_names(lf))
+    output = Path(output_path) if output_path else cfg.figures / "stage0_prepared_data_overview.png"
+
+    exprs = [pl.len().alias("ticket_lines")]
+    if "cliente" in columns:
+        exprs.append(pl.col("cliente").n_unique().alias("customers"))
+    if "ticket" in columns:
+        exprs.append(pl.col("ticket").n_unique().alias("baskets"))
+    if "idarticu" in columns:
+        exprs.append(pl.col("idarticu").n_unique().alias("products"))
+    if "importe" in columns:
+        exprs.append(pl.col("importe").cast(pl.Float64).sum().alias("revenue"))
+    overview = collect_streaming(lf.select(exprs)).row(0, named=True)
+
+    monthly = pl.DataFrame()
+    if {"fecha", "ticket"}.issubset(columns):
+        month_expr = pl.col("fecha").dt.truncate("1mo").alias("month")
+        aggregations = [pl.col("ticket").n_unique().alias("baskets")]
+        if "importe" in columns:
+            aggregations.append(pl.col("importe").cast(pl.Float64).sum().alias("revenue"))
+        monthly = collect_streaming(
+            lf.with_columns(month_expr)
+            .group_by("month")
+            .agg(aggregations)
+            .sort("month")
+        )
+
+    sector_col = "desc_sector" if "desc_sector" in columns else "idsector" if "idsector" in columns else None
+    sectors = pl.DataFrame()
+    if sector_col:
+        sector_metric = pl.col("importe").cast(pl.Float64).sum().alias("value") if "importe" in columns else pl.len().alias("value")
+        sectors = collect_streaming(
+            lf.group_by(sector_col)
+            .agg(sector_metric)
+            .sort("value", descending=True)
+            .head(10)
+            .rename({sector_col: "sector"})
+        )
+
+    promo = pl.DataFrame()
+    if "idpromoc" in columns:
+        promo = collect_streaming(
+            lf.with_columns(_promo_flag_expr().alias("_promo_flag"))
+            .group_by("_promo_flag")
+            .agg(pl.len().alias("lines"))
+            .sort("_promo_flag")
+        )
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.2))
+    ax_metrics, ax_monthly, ax_sector, ax_promo = axes.ravel()
+
+    metric_lines = []
+    for key, label in [
+        ("ticket_lines", "Ticket lines"),
+        ("customers", "Customers"),
+        ("baskets", "Baskets"),
+        ("products", "Products"),
+        ("revenue", "Revenue"),
+    ]:
+        if key in overview and overview[key] is not None:
+            value = overview[key]
+            metric_lines.append(f"{label}: {value:,.0f}" if isinstance(value, (int, float)) else f"{label}: {value}")
+    ax_metrics.text(0.02, 0.95, "\n".join(metric_lines), va="top", ha="left", fontsize=12)
+    ax_metrics.set_title("Prepared Data Snapshot")
+    ax_metrics.axis("off")
+
+    if monthly.height:
+        pdf = monthly.to_pandas()
+        y_col = "revenue" if "revenue" in pdf.columns else "baskets"
+        ax_monthly.plot(pdf["month"], pdf[y_col], color="#2b6f6d", linewidth=2)
+        ax_monthly.fill_between(pdf["month"], pdf[y_col], color="#2b6f6d", alpha=0.15)
+        ax_monthly.set_title(f"Monthly {y_col.title()}")
+        ax_monthly.tick_params(axis="x", rotation=30)
+        ax_monthly.grid(alpha=0.25)
+    else:
+        ax_monthly.text(0.5, 0.5, "No date field available", ha="center", va="center")
+        ax_monthly.set_title("Monthly Trend")
+        ax_monthly.axis("off")
+
+    if sectors.height:
+        pdf = sectors.to_pandas().iloc[::-1]
+        ax_sector.barh(pdf["sector"].astype(str), pdf["value"], color="#4f7cac")
+        ax_sector.set_title("Top Product Sectors")
+        ax_sector.grid(axis="x", alpha=0.25)
+    else:
+        ax_sector.text(0.5, 0.5, "No sector field available", ha="center", va="center")
+        ax_sector.set_title("Product Sectors")
+        ax_sector.axis("off")
+
+    if promo.height:
+        promo_pdf = promo.to_pandas()
+        labels = ["No promo" if int(flag) == 0 else "Promo" for flag in promo_pdf["_promo_flag"]]
+        ax_promo.bar(labels, promo_pdf["lines"], color=["#7f8c8d", "#c65d3b"])
+        ax_promo.set_title("Promo Line Mix")
+        ax_promo.grid(axis="y", alpha=0.25)
+    else:
+        ax_promo.text(0.5, 0.5, "No promo field available", ha="center", va="center")
+        ax_promo.set_title("Promo Mix")
+        ax_promo.axis("off")
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 0 figures", "wrote prepared data overview")
+    plt.close(fig)
+    return path
+
+
+def plot_basket_summary(
+    basket_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Visualize ticket sentence lengths used for Item2Vec training."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage1_basket_sentence_lengths.png"
+    baskets = pl.read_parquet(basket_path, columns=["n_product_tokens"])
+    values = baskets["n_product_tokens"].to_numpy().astype(float)
+    if len(values) == 0:
+        raise ValueError(f"No basket rows found in {basket_path}")
+    clip_max = max(1.0, float(np.nanpercentile(values, 99)))
+    clipped = np.clip(values, 0, clip_max)
+
+    fig, (ax_hist, ax_summary) = plt.subplots(1, 2, figsize=(12, 4.8), gridspec_kw={"width_ratios": [1.4, 1.0]})
+    ax_hist.hist(clipped, bins=min(40, max(5, int(clip_max))), color="#3f6fb5", alpha=0.85)
+    ax_hist.set_title("Basket Sentence Lengths")
+    ax_hist.set_xlabel("Unique product tokens per ticket")
+    ax_hist.set_ylabel("Baskets")
+    ax_hist.grid(axis="y", alpha=0.25)
+
+    summary = {
+        "Baskets": len(values),
+        "Mean": float(np.mean(values)),
+        "Median": float(np.median(values)),
+        "P90": float(np.percentile(values, 90)),
+        "P99": float(np.percentile(values, 99)),
+        "Max": float(np.max(values)),
+    }
+    ax_summary.text(
+        0.02,
+        0.95,
+        "\n".join(f"{key}: {value:,.2f}" if key != "Baskets" else f"{key}: {value:,.0f}" for key, value in summary.items()),
+        va="top",
+        ha="left",
+        fontsize=12,
+    )
+    ax_summary.set_title("Basket Construction Summary")
+    ax_summary.axis("off")
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 1 figures", "wrote basket summary")
+    plt.close(fig)
+    return path
+
+
+def plot_product_embedding_diagnostics(
+    embeddings_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot product embedding norm distribution and a sampled PCA map."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage2_product_embedding_diagnostics.png"
+    embeddings = pl.read_parquet(embeddings_path).sort("idarticu")
+    feature_cols = numeric_feature_columns(embeddings, exclude=("idarticu",))
+    if not feature_cols:
+        raise ValueError(f"No product embedding columns found in {embeddings_path}")
+
+    X = frame_to_numpy(embeddings, feature_cols)
+    norms = np.linalg.norm(X, axis=1)
+    sample = _sample_frame(embeddings, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+    X_sample = frame_to_numpy(sample, feature_cols)
+    coords = _pca_2d(X_sample, cfg)
+
+    fig, (ax_norm, ax_pca) = plt.subplots(1, 2, figsize=(12, 5))
+    ax_norm.hist(norms, bins=40, color="#8a5a44", alpha=0.85)
+    ax_norm.set_title("Product Vector Norms")
+    ax_norm.set_xlabel("L2 norm")
+    ax_norm.set_ylabel("Products")
+    ax_norm.grid(axis="y", alpha=0.25)
+
+    ax_pca.scatter(coords[:, 0], coords[:, 1], s=5, color="#2b6f6d", alpha=0.55, linewidths=0)
+    ax_pca.set_title("Product Embedding PCA Preview")
+    ax_pca.set_xlabel("PC1")
+    ax_pca.set_ylabel("PC2")
+    ax_pca.grid(alpha=0.2)
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 2 figures", "wrote product embedding diagnostics")
+    plt.close(fig)
+    return path
+
+
+def plot_embedding_validation_summary(
+    validation_csv: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Summarize nearest-neighbor validation similarities and sector coherence."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage3_embedding_validation_summary.png"
+    report = pl.read_csv(validation_csv)
+    if report.height == 0:
+        raise ValueError(f"No validation rows found in {validation_csv}")
+    pdf = report.to_pandas()
+    ranks = sorted(pdf["neighbor_rank"].dropna().unique())
+
+    fig, (ax_box, ax_sector) = plt.subplots(1, 2, figsize=(12, 5))
+    groups = [pdf.loc[pdf["neighbor_rank"] == rank, "cosine_similarity"].astype(float).to_numpy() for rank in ranks]
+    ax_box.boxplot(groups, tick_labels=[str(rank) for rank in ranks], patch_artist=True)
+    for patch in ax_box.patches:
+        patch.set_facecolor("#4f7cac")
+        patch.set_alpha(0.65)
+    ax_box.set_title("Neighbor Similarity by Rank")
+    ax_box.set_xlabel("Neighbor rank")
+    ax_box.set_ylabel("Cosine similarity")
+    ax_box.grid(axis="y", alpha=0.25)
+
+    if {"product_sector", "neighbor_sector"}.issubset(pdf.columns):
+        same = []
+        for rank in ranks:
+            subset = pdf[pdf["neighbor_rank"] == rank]
+            valid = subset["product_sector"].notna() & subset["neighbor_sector"].notna()
+            same.append(float((subset.loc[valid, "product_sector"] == subset.loc[valid, "neighbor_sector"]).mean() * 100.0) if valid.any() else 0.0)
+        ax_sector.bar([str(rank) for rank in ranks], same, color="#c65d3b", alpha=0.82)
+        ax_sector.set_ylabel("Same sector share (%)")
+        ax_sector.set_ylim(0, 100)
+    else:
+        ax_sector.text(0.5, 0.5, "Sector fields unavailable", ha="center", va="center")
+    ax_sector.set_title("Nearest-Neighbor Sector Coherence")
+    ax_sector.set_xlabel("Neighbor rank")
+    ax_sector.grid(axis="y", alpha=0.25)
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 3 figures", "wrote embedding validation summary")
+    plt.close(fig)
+    return path
+
+
+def plot_customer_embedding_diagnostics(
+    customer_embeddings_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot customer-vector norm distribution and a sampled PCA preview."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage4_customer_embedding_diagnostics.png"
+    embeddings = pl.read_parquet(customer_embeddings_path).sort("cliente")
+    feature_cols = [col for col in embeddings.columns if col.startswith("emb_")]
+    if not feature_cols:
+        raise ValueError(f"No customer embedding columns found in {customer_embeddings_path}")
+
+    sample = _sample_frame(embeddings, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+    X = frame_to_numpy(sample, feature_cols)
+    norms = np.linalg.norm(X, axis=1)
+    coords = _pca_2d(X, cfg)
+
+    fig, (ax_norm, ax_pca) = plt.subplots(1, 2, figsize=(12, 5))
+    ax_norm.hist(norms, bins=40, color="#7a4e8a", alpha=0.82)
+    ax_norm.set_title("Customer Vector Norms")
+    ax_norm.set_xlabel("L2 norm")
+    ax_norm.set_ylabel("Sampled customers")
+    ax_norm.grid(axis="y", alpha=0.25)
+
+    color = sample["embedded_unique_products"].to_numpy() if "embedded_unique_products" in sample.columns else norms
+    scatter = ax_pca.scatter(coords[:, 0], coords[:, 1], c=color, s=4, cmap="viridis", alpha=0.6, linewidths=0)
+    ax_pca.set_title("Customer Embedding PCA Preview")
+    ax_pca.set_xlabel("PC1")
+    ax_pca.set_ylabel("PC2")
+    ax_pca.grid(alpha=0.2)
+    fig.colorbar(scatter, ax=ax_pca, fraction=0.046, pad=0.04, label="Embedded unique products" if "embedded_unique_products" in sample.columns else "Vector norm")
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 4 figures", "wrote customer embedding diagnostics")
+    plt.close(fig)
+    return path
+
+
+def plot_behavioral_feature_summary(
+    behavior_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Create a compact distribution dashboard for non-demographic behavioral features."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage5_behavioral_feature_summary.png"
+    behavior = pl.read_parquet(behavior_path).sort("cliente")
+    plot_cols = [
+        col
+        for col in [
+            "ticket_count",
+            "total_spend",
+            "avg_basket_value",
+            "promo_share",
+            "unique_products",
+            "unique_sectors",
+            "recency_days",
+            "frequency_per_30d",
+        ]
+        if col in behavior.columns
+    ]
+    if not plot_cols:
+        raise ValueError(f"No expected behavioral feature columns found in {behavior_path}")
+
+    sample = _sample_frame(behavior, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+    ncols = 4
+    nrows = math.ceil(len(plot_cols) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.1 * ncols, 3.3 * nrows), squeeze=False)
+    axes_flat = axes.ravel()
+    log_scaled = {"ticket_count", "total_spend", "avg_basket_value", "unique_products", "unique_sectors", "recency_days", "frequency_per_30d"}
+
+    for ax, col in zip(axes_flat, plot_cols):
+        values = sample[col].to_numpy().astype(float)
+        values = values[np.isfinite(values)]
+        if col in log_scaled:
+            values = np.log1p(np.maximum(values, 0))
+            xlabel = f"log1p({col})"
+        else:
+            xlabel = col
+        ax.hist(values, bins=35, color="#2b6f6d", alpha=0.82)
+        ax.set_title(col)
+        ax.set_xlabel(xlabel)
+        ax.grid(axis="y", alpha=0.22)
+
+    for ax in axes_flat[len(plot_cols) :]:
+        ax.axis("off")
+
+    fig.suptitle("Stage 5 Behavioral Feature Distributions", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    path = _save_figure(fig, output, cfg, "Stage 5 figures", "wrote behavioral feature summary")
+    plt.close(fig)
+    return path
+
+
+def plot_feature_set_summary(
+    feature_paths: Mapping[str, str | Path],
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Compare feature-set dimensionality and PCA concentration."""
+
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage5_feature_set_summary.png"
+    rows = []
+    for name, path in feature_paths.items():
+        df = pl.read_parquet(path).sort("cliente")
+        feature_cols = numeric_feature_columns(df)
+        if not feature_cols:
+            continue
+        sample = _sample_frame(df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+        X = frame_to_numpy(sample, feature_cols)
+        n_components = min(2, X.shape[0], X.shape[1])
+        pc1_share = (
+            float(PCA(n_components=n_components, random_state=cfg.random_seed).fit(X).explained_variance_ratio_[0])
+            if n_components > 0
+            else 0.0
+        )
+        rows.append(
+            {
+                "name": str(name),
+                "rows": int(df.height),
+                "feature_count": int(len(feature_cols)),
+                "pc1_variance_share": pc1_share,
+            }
+        )
+    if not rows:
+        raise ValueError("No feature-set rows were available for plotting.")
+
+    pdf = pl.DataFrame(rows).to_pandas()
+    fig, (ax_count, ax_pc) = plt.subplots(1, 2, figsize=(12, 4.8))
+    ax_count.bar(pdf["name"], pdf["feature_count"], color="#4f7cac", alpha=0.85)
+    ax_count.set_title("Feature Count by Set")
+    ax_count.set_ylabel("Numeric features")
+    ax_count.tick_params(axis="x", rotation=20)
+    ax_count.grid(axis="y", alpha=0.25)
+
+    ax_pc.bar(pdf["name"], pdf["pc1_variance_share"], color="#c65d3b", alpha=0.82)
+    ax_pc.set_title("PCA Concentration Preview")
+    ax_pc.set_ylabel("PC1 explained variance share")
+    ax_pc.set_ylim(0, 1)
+    ax_pc.tick_params(axis="x", rotation=20)
+    ax_pc.grid(axis="y", alpha=0.25)
+
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 5 figures", "wrote feature-set summary")
+    plt.close(fig)
+    return path
 
 
 def _fit_umap_2d(X: np.ndarray, cfg: PipelineConfig) -> np.ndarray:

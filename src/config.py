@@ -81,11 +81,19 @@ class PipelineConfig:
 
     @property
     def models(self) -> Path:
-        return self.root / self.get("paths.models") / self.mode
+        return self.outputs / "models"
 
     @property
     def outputs(self) -> Path:
         return self.root / self.get("paths.outputs") / self.mode
+
+    @property
+    def experiments(self) -> Path:
+        return self.outputs / "experiments"
+
+    @property
+    def experiments_enabled(self) -> bool:
+        return bool(self.get("experiments.enabled", self.mode == "dev"))
 
     @property
     def reports(self) -> Path:
@@ -94,6 +102,14 @@ class PipelineConfig:
     @property
     def figures(self) -> Path:
         return self.outputs / "figures"
+
+    @property
+    def model_selection(self) -> Path:
+        return self.reports / "model_selection"
+
+    @property
+    def model_selection_cache(self) -> Path:
+        return self.models / "model_selection"
 
     @property
     def prepared_transactions_path(self) -> Path:
@@ -117,7 +133,7 @@ class PipelineConfig:
         return (directory or self.data_processed) / str(name).format(mode=self.mode)
 
     def ensure_directories(self) -> None:
-        for path in [
+        paths = [
             self.data_processed,
             self.models,
             self.outputs,
@@ -125,9 +141,13 @@ class PipelineConfig:
             self.figures,
             self.outputs / "embeddings",
             self.outputs / "features",
-            self.outputs / "model_selection",
             self.outputs / "profiles",
-        ]:
+            self.model_selection,
+            self.model_selection_cache,
+        ]
+        if self.experiments_enabled:
+            paths.append(self.experiments)
+        for path in paths:
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -146,6 +166,7 @@ CONFIG = load_config()
 MODE = CONFIG.mode
 RUN_MODE = CONFIG.mode
 RANDOM_SEED = CONFIG.random_seed
+MIN_TICKETS_PER_CUSTOMER = int(CONFIG.get("data.min_tickets_per_customer", 3))
 
 DATA_PROCESSED = CONFIG.data_processed
 DATA_PROD = CONFIG.data_prod
@@ -155,7 +176,54 @@ MODELS = CONFIG.models
 OUTPUTS = CONFIG.outputs
 REPORTS = CONFIG.reports
 FIGURES = CONFIG.figures
+MODEL_SELECTION_CACHE = CONFIG.model_selection_cache
 
 PREPARED_TRANSACTIONS = CONFIG.prepared_transactions_path
 CUSTOMER_KPIS = CONFIG.customer_kpis_path
 PRODUCT_MASTER = CONFIG.product_master_path
+
+
+def configure_mode(mode: str) -> PipelineConfig:
+    """Make an explicit mode authoritative for notebooks and interactive runs."""
+
+    global CONFIG
+    global MODE
+    global RUN_MODE
+    global RANDOM_SEED
+    global MIN_TICKETS_PER_CUSTOMER
+    global DATA_PROCESSED
+    global DATA_PROD
+    global RAW_PARQUET
+    global RAW_CSV
+    global MODELS
+    global OUTPUTS
+    global REPORTS
+    global FIGURES
+    global MODEL_SELECTION_CACHE
+    global PREPARED_TRANSACTIONS
+    global CUSTOMER_KPIS
+    global PRODUCT_MASTER
+
+    cfg = load_config(mode)
+    os.environ[str(cfg.get("run.mode_env", "CARREFOUR_MODE"))] = cfg.mode
+
+    CONFIG = cfg
+    MODE = cfg.mode
+    RUN_MODE = cfg.mode
+    RANDOM_SEED = cfg.random_seed
+    MIN_TICKETS_PER_CUSTOMER = int(cfg.get("data.min_tickets_per_customer", 3))
+
+    DATA_PROCESSED = cfg.data_processed
+    DATA_PROD = cfg.data_prod
+    RAW_PARQUET = cfg.raw_parquet
+    RAW_CSV = cfg.raw_csv
+    MODELS = cfg.models
+    OUTPUTS = cfg.outputs
+    REPORTS = cfg.reports
+    FIGURES = cfg.figures
+    MODEL_SELECTION_CACHE = cfg.model_selection_cache
+
+    PREPARED_TRANSACTIONS = cfg.prepared_transactions_path
+    CUSTOMER_KPIS = cfg.customer_kpis_path
+    PRODUCT_MASTER = cfg.product_master_path
+    return cfg

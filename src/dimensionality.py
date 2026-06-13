@@ -52,6 +52,7 @@ def build_pca_representation(
 def build_umap_representation(
     feature_path: str | Path,
     output_path: str | Path | None = None,
+    umap_overrides: dict | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
@@ -62,15 +63,15 @@ def build_umap_representation(
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
+    umap_cfg = {**(cfg.get("umap", {}) or {}), **(umap_overrides or {})}
     output = Path(output_path) if output_path else cfg.outputs / "features" / str(
-        cfg.get("umap.output", "feature_set_umap_cluster.parquet")
+        umap_cfg.get("output", "feature_set_umap_cluster.parquet")
     )
-    umap_cfg = cfg.get("umap", {})
-    n_components = int(cfg.get("umap.n_components", 20))
-    n_neighbors = int(cfg.get("umap.n_neighbors", 30))
-    min_dist = float(cfg.get("umap.min_dist", 0.0))
-    metric = str(cfg.get("umap.metric", "cosine"))
-    standardize_input = bool(cfg.get("umap.standardize_input", False))
+    n_components = int(umap_cfg.get("n_components", 20))
+    n_neighbors = int(umap_cfg.get("n_neighbors", 30))
+    min_dist = float(umap_cfg.get("min_dist", 0.0))
+    metric = str(umap_cfg.get("metric", "cosine"))
+    standardize_input = bool(umap_cfg.get("standardize_input", False))
     cache_metadata = {
         "stage": "umap_representation",
         "mode": cfg.mode,
@@ -105,8 +106,8 @@ def build_umap_representation(
             min_dist=min_dist,
             metric=metric,
             random_state=cfg.random_seed,
-            low_memory=bool(cfg.get("umap.low_memory", True)),
-            n_jobs=int(cfg.get("umap.n_jobs", 1)),
+            low_memory=bool(umap_cfg.get("low_memory", True)),
+            n_jobs=int(umap_cfg.get("n_jobs", 1)),
         )
         coords = reducer.fit_transform(X).astype("float32")
         out = {"cliente": df["cliente"].to_list()}

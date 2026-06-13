@@ -1,94 +1,101 @@
 # Cross-Machine Reproducibility
 
-## Problem
+Last updated: 2026-06-13
 
-Running Notebooks 02 and 03 on different laptops produced different results despite
-fixed random seeds. The seeds controlled shuffle order but not floating-point
-summation order, which varies by machine.
+This project aims for deterministic source behavior and stable tribe structure across machines. Exact bit-for-bit equality is realistic for prepared-data checksums and many cached tables, but not guaranteed for UMAP/HDBSCAN boundary assignments across different CPUs.
 
-## Root Causes
+## Environment Guardrail
 
-### Critical — recency weight streaming sum (fixed)
+Use the project Conda environment:
 
-**File:** `src/customer_vectors.py` — `_build_interactions()`
+```powershell
+conda env create -f environment.yml
+conda activate carrefour
+python -m ipykernel install --user --name=carrefour --display-name "Python (carrefour)"
+```
 
-Polars streams `df_combined.parquet` in chunks. Chunk boundaries depend on available
-RAM and OS scheduling, so the order in which partial sums are merged differs between
-machines. Floating-point addition is not associative, so `(a + b) + c ≠ a + (b + c)`
-when values are close in magnitude. This caused `customer_product_weights.parquet` to
-differ, which cascaded through every downstream artifact.
+Verify the HDBSCAN-compatible dependency set:
 
-**Fix applied (this branch):** multiply `recency_weight` by `_WEIGHT_SCALE = 1e8`,
-round to `Int64`, sum as integers (associative and exact), then divide back. The same
-pattern was already used for sector spend in `generate_dev_subset.py`.
+```powershell
+python -c "import sklearn, hdbscan; print(sklearn.__version__); print('hdbscan ok')"
+```
 
-### Accepted — UMAP and HDBSCAN platform variation (not fixed)
+Expected pairing:
 
-UMAP uses `pynndescent` for nearest-neighbor graph construction. Even with
-`random_state` fixed and `n_jobs=1`, distance calculations hit CPU-specific
-floating-point paths (AVX2 vs AVX512 vs SSE). Results are stable within a single
-machine but not bit-identical across different CPUs. HDBSCAN noise-point assignment
-also uses nearest-neighbor distances, so tie-breaking can flip on different hardware.
+- `scikit-learn=1.7.2`
+- `hdbscan==0.8.40`
 
-These are documented limitations of the libraries and cannot be fixed without
-replacing UMAP with a deterministic reducer (e.g., PCA-only). For this capstone
-the cluster *structure* (tribe profiles, top-product lift) is stable across machines
-even when individual cluster assignments shift at boundaries.
+If `sklearn.__version__` reports `1.8.x`, reconcile the environment before running or interpreting UMAP-HDBSCAN. The external `hdbscan` package version used here is not compatible with the sklearn 1.8 API change in sampled production HDBSCAN.
 
-### Residual — customer KPI float sums (fixed)
+## Deterministic Inputs
 
-`customer_kpis.parquet` is built from streaming float sums (`avg_basket_size`,
-`total_spend_6m`). The same issue as the recency weight. Applied the same
-integer-quantization fix in Notebook 02 cell `bd862d2b`: `importe` is multiplied
-by `_EUR_SCALE = 100` and cast to `Int64` before any streaming aggregation.
-`total_spend_6m` and `avg_basket_size` are accumulated as integer eurocents and
-converted back to EUR only at the final `.with_columns()` step.
-Both `strata_assignment_sha256` and `selected_customer_sha256` should now be
-bit-identical across machines after a clean re-run.
+The prepared-data stage should be reproducible when the same raw files and source code are used.
 
-## Verification Checksums
+Key files to compare after Notebook 02 and dev-subset generation:
 
-After running Notebook 02 and regenerating the dev subset, compare these two files
-against the committed versions:
+| File | Purpose |
+|---|---|
+| `data/processed/quality_report.json` | Full data quality gate output |
+| `data/dev/subset_metadata.json` | Dev subset parameters and validation hashes |
 
-**`data/processed/quality_report.json`** — depends only on raw parquets, must be
-identical across machines.
+Important hash fields in `subset_metadata.json`:
 
-**`data/dev/subset_metadata.json`** — two hashes to check:
+| Hash field | Meaning |
+|---|---|
+| `selected_customer_sha256` | Identifies the dev customers selected into `data/dev/df_combined.parquet` |
+| `strata_assignment_sha256` | Identifies the stratification assignment used during sampling |
 
-| Hash field | Required | Notes |
+If these hashes differ across machines, do not compare downstream model results until the prepared data mismatch is resolved.
+
+## Current Modeling Reproducibility Contract
+
+Official customer vectors are quantity-only aggregations of product embeddings:
+
+- Include product identity from Item2Vec.
+- Include product quantities through `unidades`.
+- Exclude `importe`, total spend, average basket value, and revenue tier.
+
+Spend and KPIs are still used after clustering for profiling and business interpretation.
+
+The latest quantity-only vectorization change invalidates generated Stage 4+ artifacts from older runs. Rebuild from Stage 4 onward before interpreting Stage 6+ comparisons.
+
+## Known Sources of Variation
+
+| Source | Guardrail | Residual risk |
 |---|---|---|
-| `selected_customer_sha256` | must match | determines which rows are in `df_combined.parquet` dev |
-| `strata_assignment_sha256` | must match | KPI float fix applied; mismatch means `customer_kpis.parquet` was not rebuilt |
+| Word2Vec training | Fixed seed and deterministic worker settings | Small numeric drift if worker/thread settings change |
+| Polars streaming aggregation | Stable sorting and integer-style accumulation where needed | Rebuild prepared data if source code changes |
+| UMAP nearest-neighbor graph | Fixed seed and single-job settings | CPU-specific floating-point paths can shift boundary points |
+| HDBSCAN density assignment | Fixed seed where applicable and deterministic input order | Noise and low-confidence boundary labels may vary slightly |
+| Sampling | YAML seed and centralized config | Any changed sampling config invalidates downstream caches |
 
-Both files are tracked in git (gitignore exceptions added for `*.json` rule).
+For this capstone, evaluate reproducibility at the level of cluster structure, stability diagnostics, and product-lift profiles, not only exact row-level labels.
 
-## Workflow for Sharing Artifacts Between Machines
+## Artifact Sharing Between Machines
 
-Only one machine needs to run Notebook 02. Once it completes:
+Use git for source-controlled files only:
 
-1. Verify `selected_customer_sha256` matches the committed value.
-2. Share these two files with teammates:
-   - `data/dev/df_combined.parquet`
-   - `data/processed/customer_kpis.parquet`
-3. Teammates place them in the correct directories and run Notebook 03 directly.
-   Notebook 03 uses `data/dev/df_combined.parquet` as its transaction source and
-   `data/processed/customer_kpis.parquet` for tribe profiling.
-4. UMAP and clustering results will vary slightly by CPU but tribe structure is stable.
+- source code
+- notebooks
+- configs
+- tests
+- docs
+- `environment.yml`
 
-## If the Hashes Don't Match
+Share local data artifacts outside git:
 
-**`selected_customer_sha256` differs:** the dev subset contains different customers.
-All Notebook 03 caches are invalid. Likely cause: the residual KPI float issue grew
-large enough to change tertile bin assignments for enough customers to shift the
-final selection. Apply the integer-quantization fix to the KPI aggregations in
-Notebook 02 Section 2.8 (the `avg_basket_size` and `total_spend_6m` streaming sums).
+```text
+data/dev/df_combined.parquet
+data/dev/subset_metadata.json
+data/processed/customer_kpis.parquet
+```
 
-**`strata_assignment_sha256` differs but `selected_customer_sha256` matches:**
-this should no longer happen after the integer-quantization fix. If it does,
-check whether `customer_kpis.parquet` was regenerated with the updated cell;
-delete the cache and re-run Notebook 02 Section 4.1.
+Generated ML artifacts under `outputs/<mode>/` should usually be rebuilt locally. If they are shared for speed, treat them as caches tied to the exact code, config, environment, and prepared data used to create them.
 
-**`quality_report.json` differs:** something changed in production preprocessing.
-The raw parquets may differ between machines, or `src/data_quality.py` changed.
-Investigate before proceeding.
+## If Results Differ
+
+1. Check `git status --short` and confirm teammates are using the same source revision.
+2. Verify the environment, especially `scikit-learn` and `hdbscan`.
+3. Compare `data/dev/subset_metadata.json` hashes.
+4. Delete or force-rebuild generated Stage 4+ artifacts after vectorization or feature changes.
+5. Compare product-lift profiles and stability diagnostics before concluding that a model is materially different.
