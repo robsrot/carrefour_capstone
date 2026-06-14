@@ -2,6 +2,10 @@
 
 Data files are local artifacts and are not committed to this repository.
 
+## Purpose
+
+`data/` holds raw inputs and prepared transaction tables only. The ML pipeline writes generated embeddings, features, models, reports, figures, profiles, and experiments to `outputs/<mode>/`.
+
 ## Expected Layout
 
 ```text
@@ -9,8 +13,8 @@ data/
 |-- raw/
 |   |-- csv/          Original source CSV files
 |   `-- parquet/      Generated raw Parquet files
-|-- processed/        Production-mode pipeline artifacts
-`-- dev/              Stratified dev subset and dev-mode ML artifacts
+|-- processed/        Production prepared data
+`-- dev/              Stratified dev subset
 ```
 
 ## Required Raw Files
@@ -20,7 +24,7 @@ Place these files in `data/raw/csv/` after cloning:
 | File | Description |
 |---|---|
 | `ie_maestra_articulos.csv` | Product master / article catalogue |
-| `ie_linea_ticket.csv` | Transactional ticket lines, around 26 GB as CSV |
+| `ie_linea_ticket.csv` | Transactional ticket lines |
 
 Then run:
 
@@ -31,7 +35,7 @@ verify_csv_checksums()
 convert_csv_to_parquet()
 ```
 
-## Main Generated Artifacts
+## Prepared Data Artifacts
 
 Production preprocessing writes to `data/processed/`:
 
@@ -39,29 +43,35 @@ Production preprocessing writes to `data/processed/`:
 |---|---|
 | `quality_report.json` | Full data quality gate results |
 | `df_combined.parquet` | Clean joined ticket/product table |
-| `customer_kpis.parquet` | Per-customer spend, visit, promo, and basket metrics |
-| `product_eda_*.parquet` | Product demand, repeat, pair-lift, and temporal EDA tables |
+| `customer_kpis.parquet` | Per-customer spend, visit, promo, and basket metrics for profiling |
+| `product_eda_*.parquet` | Optional product EDA tables |
 
-Dev-mode ML runs write to `data/dev/`:
+Dev subset generation writes to `data/dev/`:
 
 | Artifact | Purpose |
 |---|---|
-| `subset_metadata.json` | Stratified 44k-customer subset validation |
-| `basket_sentences.parquet` | Ticket-level product lists for Item2Vec |
-| `product_embeddings.parquet` | Product vectors from Word2Vec |
-| `customer_vectors_weighted.parquet` | Primary recency/frequency-weighted customer vectors |
-| `customer_vectors_mean.parquet` | Simple-mean baseline customer vectors |
-| `customer_store_features.parquet` | Store spend-share features by customer |
-| `umap_cluster_<source>.parquet` | UMAP clustering embedding (dims set by `umap.cluster_dims` in base.yaml) |
-| `umap_viz_<source>_umap_2d.parquet` | 2D UMAP map for visualization |
-| `pca_cluster_<source>.parquet` | PCA baseline embedding |
-| `cluster_labels_hdbscan.parquet` | Primary density-based cluster labels |
-| `cluster_labels_kmeans_k*.parquet` | Fixed-K K-Means baseline labels |
-| `hdbscan_grid_results.parquet` | HDBSCAN hyperparameter sweep results |
-| `kmeans_baseline_results.parquet` | K-Means baseline comparison table |
+| `df_combined.parquet` | Stratified dev transaction subset |
+| `subset_metadata.json` | Dev subset parameters and validation hashes |
+
+## Generated ML Artifacts
+
+Generated ML artifacts belong under:
+
+```text
+outputs/<mode>/
+  embeddings/
+  features/
+  figures/
+  models/
+  profiles/
+  reports/
+  experiments/   # dev only
+```
+
+If embeddings, cluster labels, figures, model binaries, or reports appear under `data/dev/` or `data/processed/`, treat them as stale local clutter unless a current source module explicitly reads them.
 
 ## Rules
 
 - Never commit files under `data/raw/`, `data/processed/`, or `data/dev/` except `.gitkeep` and documentation.
-- Regenerate caches with the relevant `force=True` flag when changing upstream feature definitions or hyperparameters.
-- Keep prod and dev artifacts separate by setting `CARREFOUR_MODE` before running pipeline code.
+- Keep prod and dev prepared data separate by setting `CARREFOUR_MODE` before running pipeline code.
+- Regenerate downstream caches with the relevant `force=True` flag after changing upstream feature definitions or hyperparameters.

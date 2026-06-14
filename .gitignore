@@ -24,17 +24,10 @@ data/dev/*
 !data/processed/quality_report.json
 !data/dev/subset_metadata.json
 
-# MODELS — too large for git
-models/*
-!models/.gitkeep
-!models/dev/
-models/dev/*
-!models/dev/*.json
-!models/prod/
-models/prod/*
-!models/prod/*.json
+# Legacy local artifacts from the old root-level model path
+models/
 
-# OUTPUTS
+# Generated pipeline artifacts, including mode-scoped models and experiments
 outputs/*
 !outputs/.gitkeep
 
@@ -42,6 +35,7 @@ outputs/*
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pt/
 .venv/
 venv/
 .env

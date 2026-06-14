@@ -1,96 +1,175 @@
-global:
+run:
+  mode_env: CARREFOUR_MODE
+  default_mode: prod
   random_seed: 42
+
+paths:
+  raw_csv: data/raw/csv
+  raw_parquet: data/raw/parquet
+  processed: data/processed
+  dev: data/dev
+  outputs: outputs
+
+data:
+  prepared_transactions: df_combined.parquet
+  product_master: maestra_articulos.parquet
+  customer_kpis: customer_kpis.parquet
   min_tickets_per_customer: 3
-  sample_size: 100000
+  required_columns:
+    - cliente
+    - ticket
+    - fecha
+    - idarticu
+    - importe
+    - unidades
+  optional_columns:
+    - idpromoc
+    - idtiprod
+    - desc_larga_articulo
+    - idsector
+    - desc_sector
+
+cache:
+  force: false
+  use_cached: true
+
+progress:
+  enabled: true
+
+experiments:
+  enabled: false
+
+baskets:
+  repeat_product_by_quantity: false
+  output: basket_sentences.parquet
 
 word2vec:
   vector_size: 100
-  window: 10
-  min_count: 3
-  epochs: 10
-  sg: 1          # skip-gram (better than CBOW for rare products)
-  workers: 1     # workers=1 required for bit-exact reproducibility across runs and devices (gensim thread-race)
+  window: 5
+  full_basket_context: true
+  min_count: 10
+  negative: 10
+  sample: 0.001
+  epochs: 5
+  sg: 1
+  workers: 1
+  report_progress: true
+  compute_loss: false
+  model_name: word2vec_product.model
+  embeddings_output: product_embeddings.parquet
 
-product_embeddings:
-  method: word2vec
-  candidates: [word2vec]  # Add future Phase 1 embedding models here when implemented.
+embedding_validation:
+  sample_size: 25
+  neighbors: 8
+  output_csv: embedding_validation.csv
+  output_md: embedding_validation.md
 
-customer_vectors:
-  recency_halflife_days: 60   # 30 was too aggressive for a 6-month window
-  recency_reference_date: "2022-06-30"   # last day in dataset — update if data window changes
-  weight_transform: log1p     # none | sqrt | log1p; dampens repeated staple purchases.
-  normalize_product_embeddings: true
-  tfidf_svd_dims: 100
-  hybrid_include_store_shares: false  # Experiment 0 baseline is product-only; store shares are an explicit ablation.
-  hybrid_weights:
-    item2vec: 1.0
-    tfidf_svd: 1.0
-    category_shares: 1.0
+customer_embeddings:
+  output: customer_embeddings.parquet
+  weight_strategy: quantity
 
-product_popularity:
-  enabled: true               # Remove ultra-common products from embedding/vector inputs.
-  max_basket_share: 0.15      # Hard-remove products appearing in >15% of baskets.
-  max_customer_share: 0.40    # Hard-remove products bought by >40% of customers.
-  idf_weighting: true         # Soft-downweight common remaining products in customer vectors.
-  idf_min_weight: 0.25        # Floor so staples are muted, not erased.
-  idf_max_weight: 3.0         # Cap so very rare products do not dominate vectors.
+behavioral_features:
+  output: customer_behavior_features.parquet
+  reference_date: null
 
-feature_weights:
-  promo: 0.0  # Product-only segmentation; profile promo sensitivity after clustering.
-  store: 0.0  # Product-only segmentation; profile store affinity after clustering.
-  kpi: 0.0    # Product-only segmentation; profile KPIs after clustering.
+feature_sets:
+  default: embeddings_only
+  standardize_behavior: true
+  outputs:
+    embeddings_only: feature_set_embeddings_only.parquet
+    embeddings_behavior: feature_set_embeddings_behavior.parquet
 
-umap:
-  cluster_dims: 50
-  viz_dims: 2
-  n_neighbors: 20
-  min_dist_cluster: 0.05   # 0.0 preserves tighter local structure for clustering
-  min_dist_viz: 0.1
-  metric: cosine
-  fit_sample: 300000       # fit on sample → transform full population (O(n) for transform)
+autoencoder:
+  enabled: true
+  latent_sizes: [8, 16, 32]
+  hidden_multiplier: 2
+  epochs: 25
+  batch_size: 1024
+  learning_rate: 0.001
+  patience: 5
+  output_prefix: autoencoder_latent
+
+modeling:
+  feature_set_for_selection: embeddings_only
+  evaluation_sample_size: 25000
+  fit_sample_size: 300000
+  client_hypothesis_min: 10
+  client_hypothesis_max: 15
+
+official_model_suite:
+  include_gmm: true
+  include_raw_hdbscan: false
+  include_umap_hdbscan: true
+  include_autoencoder: false
+  include_pca_kmeans: true
+
+stability:
+  sample_size: 10000
+  repeats: 5
+  jitter_scale: 0.02
+
+quality_gates:
+  min_clusters: 2
+  min_silhouette: 0.0
+  max_noise_pct: 60.0
+  max_cluster_size_cv: 1.5
+  require_profile_lift: false
+  min_strong_product_lifts_per_cluster: 1.0
+
+gmm:
+  components_min: 6
+  components_max: 25
+  covariance_type: diag
+  max_iter: 300
+  n_init: 2
 
 hdbscan:
-  min_cluster_size: 5000   # ~0.34% of 1.48M population → ~74k customers per tribe floor
+  min_cluster_size: 500
   min_samples: 10
-  metric: euclidean
-  cluster_method: eom
-  fit_sample: 300000       # match umap.fit_sample — 27.8% of 1.08M gives representative density structure
-  silhouette_sample: 50000 # silhouette is O(n²) — sample for tractability
+  cluster_selection_method: eom
+  allow_noise_assignment: false
 
-hdbscan_grid:
-  min_cluster_size: [500, 1000, 2500, 5000]
-  min_samples: [5, 10, 25]
-  cluster_method: [eom, leaf]
+umap:
+  enabled: true
+  output: feature_set_umap_cluster.parquet
+  n_components: 20
+  n_neighbors: 30
+  min_dist: 0.0
+  metric: cosine
+  standardize_input: false
+  low_memory: true
+  n_jobs: 1
+
+pca:
+  n_components: 32
+  random_state: 42
 
 kmeans:
-  baseline_clusters: [12, 15, 18, 20]
-  batch_size: 10000
-  n_init: 5
-  max_iter: 300
+  k_min: 6
+  k_max: 25
+  batch_size: 4096
+  n_init: 10
 
-pipeline:
-  # Set a component to "auto" to benchmark configured candidates and select a winner.
-  # Set a concrete value to lock that model for a reproducible rerun.
-  selection_mode: auto     # auto | config
-  vector_source: auto      # auto | item2vec | tfidf_svd | hybrid | hybrid_with_store | mean
-  reducer: auto            # auto | umap | pca
-  clusterer: auto          # auto | hdbscan_assigned | hdbscan_core | kmeans
-  fallback_vector_source: hybrid
-  fallback_reducer: umap
-  fallback_clusterer: hdbscan_assigned
+profiling:
+  top_n_products: 15
+  top_n_sectors: 10
+  min_product_customers: 10
+  strong_product_lift_threshold: 1.5
+  strong_sector_lift_threshold: 1.2
+  output_parquet: tribe_profiles.parquet
+  output_csv_template: tribe_profiles_{mode}.csv
 
-model_selection:
-  target_tribe_count: 15
-  vector_sources: [item2vec, tfidf_svd, hybrid]
-  reducers: [umap, pca]
-  clusterers: [hdbscan_assigned, kmeans]
-  target_kmeans_k: 15
-  reduction_benchmark_sample: 50000
-  n_neighbors_candidates: [10, 15, 20, 30, 50]
+exports:
+  assignments_template: customer_tribe_assignments_{mode}.parquet
+  model_comparison_template: model_comparison_{mode}.csv
+  decision_log_template: decision_log_{mode}.md
 
-vector_source_benchmark:
-  n_sample: 30000   # customers to use for the comparison UMAP+HDBSCAN (prod); full run in Section 3.3
-
-tribe_namer:
-  model: claude-haiku-4-5-20251001
-  max_tokens: 300
+visualization:
+  max_scatter_points: 50000
+  random_state: 42
+  umap:
+    n_neighbors: 30
+    min_dist: 0.05
+    metric: cosine
+    standardize_input: false
+    n_jobs: 1
