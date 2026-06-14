@@ -2,7 +2,8 @@ experiments:
   enabled: true
 
 word2vec:
-  vector_size: 64
+  vector_size: 100
+  sample: 0.0005
   epochs: 3
   workers: 1
 
