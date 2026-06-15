@@ -226,8 +226,6 @@ def profile_tribes(
         )
         clustered_assignments = assignments_all.filter(pl.col("tribe_id") >= 0)
         assignment_customers = assignments_all.select("cliente")
-        population = lf.select(product_cols).join(assignment_customers, on="cliente", how="inner")
-        clustered = population.join(clustered_assignments, on="cliente", how="inner")
         assignment_meta = collect_streaming(
             assignments_all.select(
                 [
@@ -272,29 +270,62 @@ def profile_tribes(
             variant=assignment_meta.get("model_variant"),
         )
 
-        customer_product = clustered.select(
-            ["tribe_id", "cliente", "idarticu"]
-            + [col for col in ["desc_larga_articulo", "desc_sector"] if col in product_cols]
-        ).unique(subset=["tribe_id", "cliente", "idarticu"])
-        population_customer_product = population.select(
-            ["cliente", "idarticu"] + [col for col in ["desc_larga_articulo", "desc_sector"] if col in product_cols]
-        ).unique(subset=["cliente", "idarticu"])
-        population_product = population_customer_product.group_by("idarticu").agg(
-            [
-                pl.col("cliente").n_unique().alias("population_customers"),
-                pl.col("desc_larga_articulo").first().alias("product_description")
-                if "desc_larga_articulo" in product_cols
-                else pl.lit(None).alias("product_description"),
-                pl.col("desc_sector").first().alias("sector_description")
-                if "desc_sector" in product_cols
-                else pl.lit(None).alias("sector_description"),
-            ]
+        min_product_customers = int(cfg.get("profiling.min_product_customers", 10))
+        min_term_customers = int(cfg.get("profiling.min_term_customers", 20))
+        min_term_population_customers = int(cfg.get("profiling.min_term_population_customers", 30))
+        # Reduce transaction rows to customer-product evidence before adding tribe labels.
+        profile_line_cols = ["cliente", "idarticu"] + [
+            col for col in ["desc_larga_articulo", "desc_sector"] if col in product_cols
+        ]
+        assigned_line_items = lf.select(profile_line_cols).join(assignment_customers, on="cliente", how="inner")
+        clustered_keys = clustered_assignments.select(["cliente", "tribe_id"])
+        customer_product = assigned_line_items.select(["cliente", "idarticu"]).unique(subset=["cliente", "idarticu"])
+
+        log_event(
+            "Stage 8 profiling",
+            "aggregating population product counts",
+            cfg=cfg,
+            min_product_customers=min_product_customers,
         )
-        cluster_product = customer_product.group_by(["tribe_id", "idarticu"]).agg(
-            pl.col("cliente").n_unique().alias("cluster_customers")
+        population_product = collect_streaming(
+            customer_product.group_by("idarticu").agg(pl.len().alias("population_customers"))
+        )
+        if "desc_larga_articulo" in product_cols or "desc_sector" in product_cols:
+            metadata_cols = []
+            metadata_exprs = []
+            if "desc_larga_articulo" in product_cols:
+                metadata_cols.append("desc_larga_articulo")
+                metadata_exprs.append(pl.col("desc_larga_articulo").first().alias("product_description"))
+            if "desc_sector" in product_cols:
+                metadata_cols.append("desc_sector")
+                metadata_exprs.append(pl.col("desc_sector").first().alias("sector_description"))
+            log_event("Stage 8 profiling", "aggregating product metadata", cfg=cfg)
+            product_metadata = collect_streaming(
+                assigned_line_items.select(["idarticu"] + metadata_cols)
+                .group_by("idarticu")
+                .agg(metadata_exprs)
+            )
+            population_product = population_product.join(product_metadata, on="idarticu", how="left")
+        if "product_description" not in population_product.columns:
+            population_product = population_product.with_columns(pl.lit(None).alias("product_description"))
+        if "sector_description" not in population_product.columns:
+            population_product = population_product.with_columns(pl.lit(None).alias("sector_description"))
+        log_event(
+            "Stage 8 profiling",
+            "population product counts ready",
+            cfg=cfg,
+            products=population_product.height,
+        )
+
+        log_event("Stage 8 profiling", "aggregating tribe product lifts", cfg=cfg)
+        cluster_product = (
+            customer_product.join(clustered_keys, on="cliente", how="inner")
+            .group_by(["tribe_id", "idarticu"])
+            .agg(pl.len().alias("cluster_customers"))
+            .filter(pl.col("cluster_customers") >= min_product_customers)
         )
         product_lifts = collect_streaming(
-            cluster_product.join(population_product, on="idarticu", how="left")
+            cluster_product.join(population_product.lazy(), on="idarticu", how="left")
             .join(cluster_sizes.lazy(), on="tribe_id", how="left")
             .with_columns(
                 [
@@ -303,30 +334,41 @@ def profile_tribes(
                 ]
             )
             .with_columns((pl.col("cluster_rate") / pl.col("population_rate")).alias("lift"))
-            .filter(pl.col("cluster_customers") >= int(cfg.get("profiling.min_product_customers", 10)))
             .sort(["tribe_id", "lift", "cluster_customers"], descending=[False, True, True])
         )
+        log_event("Stage 8 profiling", "tribe product lifts ready", cfg=cfg, rows=product_lifts.height)
 
         theme_lifts = pl.DataFrame()
         term_lifts = pl.DataFrame()
         if "desc_larga_articulo" in product_cols:
-            product_theme_map = _build_product_theme_map(population_product)
+            log_event("Stage 8 profiling", "building product theme map", cfg=cfg)
+            product_theme_map = _build_product_theme_map(population_product.lazy())
+            log_event("Stage 8 profiling", "product theme map ready", cfg=cfg, rows=product_theme_map.height)
             if product_theme_map.height:
-                population_theme = (
-                    population_customer_product.join(product_theme_map.lazy(), on="idarticu", how="inner")
-                    .select(["cliente", "strategic_theme"])
-                    .unique()
+                population_theme_events = customer_product.join(
+                    product_theme_map.lazy(), on="idarticu", how="inner"
+                ).select(["cliente", "strategic_theme"])
+                log_event("Stage 8 profiling", "aggregating population theme counts", cfg=cfg)
+                population_theme_counts = collect_streaming(
+                    population_theme_events.group_by("strategic_theme").agg(
+                        pl.col("cliente").n_unique().alias("population_customers")
+                    )
                 )
-                population_theme_counts = population_theme.group_by("strategic_theme").agg(
-                    pl.col("cliente").n_unique().alias("population_customers")
+                log_event(
+                    "Stage 8 profiling",
+                    "population theme counts ready",
+                    cfg=cfg,
+                    rows=population_theme_counts.height,
                 )
+                log_event("Stage 8 profiling", "aggregating tribe theme lifts", cfg=cfg)
                 cluster_theme = (
-                    clustered_assignments.join(population_theme, on="cliente", how="inner")
+                    population_theme_events.join(clustered_keys, on="cliente", how="inner")
                     .group_by(["tribe_id", "strategic_theme"])
                     .agg(pl.col("cliente").n_unique().alias("cluster_customers"))
+                    .filter(pl.col("cluster_customers") >= min_product_customers)
                 )
                 theme_lifts = collect_streaming(
-                    cluster_theme.join(population_theme_counts, on="strategic_theme", how="left")
+                    cluster_theme.join(population_theme_counts.lazy(), on="strategic_theme", how="left")
                     .join(cluster_sizes.lazy(), on="tribe_id", how="left")
                     .with_columns(
                         [
@@ -335,27 +377,48 @@ def profile_tribes(
                         ]
                     )
                     .with_columns((pl.col("cluster_rate") / pl.col("population_rate")).alias("lift"))
-                    .filter(pl.col("cluster_customers") >= int(cfg.get("profiling.min_product_customers", 10)))
                     .sort(["tribe_id", "lift", "cluster_customers"], descending=[False, True, True])
                 )
+                log_event("Stage 8 profiling", "tribe theme lifts ready", cfg=cfg, rows=theme_lifts.height)
 
-            product_term_map = _build_product_term_map(population_product, cfg=cfg)
+            log_event("Stage 8 profiling", "building product term map", cfg=cfg)
+            product_term_map = _build_product_term_map(population_product.lazy(), cfg=cfg)
+            log_event("Stage 8 profiling", "product term map ready", cfg=cfg, rows=product_term_map.height)
             if product_term_map.height:
-                population_term = (
-                    population_customer_product.join(product_term_map.lazy(), on="idarticu", how="inner")
-                    .select(["cliente", "product_term"])
-                    .unique()
+                population_term_events = customer_product.join(product_term_map.lazy(), on="idarticu", how="inner").select(
+                    ["cliente", "product_term"]
                 )
-                population_term_counts = population_term.group_by("product_term").agg(
-                    pl.col("cliente").n_unique().alias("population_customers")
+                log_event(
+                    "Stage 8 profiling",
+                    "aggregating population term counts",
+                    cfg=cfg,
+                    min_population_customers=min_term_population_customers,
+                )
+                population_term_counts = collect_streaming(
+                    population_term_events.group_by("product_term")
+                    .agg(pl.col("cliente").n_unique().alias("population_customers"))
+                    .filter(pl.col("population_customers") >= min_term_population_customers)
+                )
+                log_event(
+                    "Stage 8 profiling",
+                    "population term counts ready",
+                    cfg=cfg,
+                    rows=population_term_counts.height,
+                )
+                log_event(
+                    "Stage 8 profiling",
+                    "aggregating tribe term lifts",
+                    cfg=cfg,
+                    min_term_customers=min_term_customers,
                 )
                 cluster_term = (
-                    clustered_assignments.join(population_term, on="cliente", how="inner")
+                    population_term_events.join(clustered_keys, on="cliente", how="inner")
                     .group_by(["tribe_id", "product_term"])
                     .agg(pl.col("cliente").n_unique().alias("cluster_customers"))
+                    .filter(pl.col("cluster_customers") >= min_term_customers)
                 )
                 term_lifts = collect_streaming(
-                    cluster_term.join(population_term_counts, on="product_term", how="left")
+                    cluster_term.join(population_term_counts.lazy(), on="product_term", how="inner")
                     .join(cluster_sizes.lazy(), on="tribe_id", how="left")
                     .with_columns(
                         [
@@ -364,29 +427,53 @@ def profile_tribes(
                         ]
                     )
                     .with_columns((pl.col("cluster_rate") / pl.col("population_rate")).alias("lift"))
-                    .filter(pl.col("cluster_customers") >= int(cfg.get("profiling.min_term_customers", 20)))
-                    .filter(pl.col("population_customers") >= int(cfg.get("profiling.min_term_population_customers", 30)))
                     .sort(["tribe_id", "lift", "cluster_customers"], descending=[False, True, True])
                 )
+                log_event("Stage 8 profiling", "tribe term lifts ready", cfg=cfg, rows=term_lifts.height)
 
         if "desc_sector" in product_cols:
-            population_sector = population.group_by("desc_sector").agg(pl.len().alias("population_lines"))
-            cluster_sector_totals = clustered.group_by("tribe_id").agg(pl.len().alias("cluster_lines_total"))
-            population_total = collect_streaming(population.select(pl.len().alias("n_lines")))[0, "n_lines"]
-            sector_lifts = collect_streaming(
-                clustered.group_by(["tribe_id", "desc_sector"])
-                .agg(pl.len().alias("cluster_lines"))
-                .join(population_sector, on="desc_sector", how="left")
-                .join(cluster_sector_totals, on="tribe_id", how="left")
-                .with_columns(
-                    [
-                        (pl.col("cluster_lines") / pl.col("cluster_lines_total")).alias("cluster_sector_share"),
-                        (pl.col("population_lines") / max(population_total, 1)).alias("population_sector_share"),
-                    ]
-                )
-                .with_columns((pl.col("cluster_sector_share") / pl.col("population_sector_share")).alias("lift"))
-                .sort(["tribe_id", "lift", "cluster_lines"], descending=[False, True, True])
+            log_event("Stage 8 profiling", "aggregating population sector line counts", cfg=cfg)
+            population_sector = collect_streaming(
+                assigned_line_items.select("desc_sector").group_by("desc_sector").agg(pl.len().alias("population_lines"))
             )
+            population_total = int(population_sector["population_lines"].sum()) if population_sector.height else 0
+            log_event(
+                "Stage 8 profiling",
+                "population sector counts ready",
+                cfg=cfg,
+                rows=population_sector.height,
+                population_lines=population_total,
+            )
+            log_event(
+                "Stage 8 profiling",
+                "aggregating tribe sector line counts",
+                cfg=cfg,
+            )
+            cluster_sector = collect_streaming(
+                lf.select(["cliente", "desc_sector"])
+                .join(clustered_keys, on="cliente", how="inner")
+                .group_by(["tribe_id", "desc_sector"])
+                .agg(pl.len().alias("cluster_lines"))
+            )
+            if cluster_sector.height:
+                cluster_sector_totals = cluster_sector.group_by("tribe_id").agg(
+                    pl.col("cluster_lines").sum().alias("cluster_lines_total")
+                )
+                sector_lifts = (
+                    cluster_sector.join(population_sector, on="desc_sector", how="left")
+                    .join(cluster_sector_totals, on="tribe_id", how="left")
+                    .with_columns(
+                        [
+                            (pl.col("cluster_lines") / pl.col("cluster_lines_total")).alias("cluster_sector_share"),
+                            (pl.col("population_lines") / max(population_total, 1)).alias("population_sector_share"),
+                        ]
+                    )
+                    .with_columns((pl.col("cluster_sector_share") / pl.col("population_sector_share")).alias("lift"))
+                    .sort(["tribe_id", "lift", "cluster_lines"], descending=[False, True, True])
+                )
+            else:
+                sector_lifts = pl.DataFrame({"tribe_id": [], "desc_sector": [], "lift": []})
+            log_event("Stage 8 profiling", "tribe sector lifts ready", cfg=cfg, rows=sector_lifts.height)
         else:
             sector_lifts = pl.DataFrame({"tribe_id": [], "desc_sector": [], "lift": []})
 
@@ -395,10 +482,13 @@ def profile_tribes(
             behavior = pl.scan_parquet(candidate_behavior_path)
             behavior_cols = [col for col in schema_names(behavior) if col != "cliente"]
             aggregations = [pl.col(col).mean().alias(f"avg_{col}") for col in behavior_cols if col != "tribe_id"]
+            log_event("Stage 8 profiling", "aggregating tribe KPI profiles", cfg=cfg, fields=len(aggregations))
             behavior_summary = collect_streaming(
                 clustered_assignments.join(behavior, on="cliente", how="left").group_by("tribe_id").agg(aggregations)
             )
+            log_event("Stage 8 profiling", "tribe KPI profiles ready", cfg=cfg, rows=behavior_summary.height)
 
+        log_event("Stage 8 profiling", "assembling tribe profile rows", cfg=cfg, clusters=cluster_sizes.height)
         rows = []
         for cluster_row in cluster_sizes.iter_rows(named=True):
             tribe_id = int(cluster_row["tribe_id"])
