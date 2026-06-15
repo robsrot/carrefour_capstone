@@ -1,6 +1,6 @@
 # Notebook Contract
 
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 The notebooks should orchestrate the pipeline, show compact diagnostics, and explain decisions. Reusable logic belongs in `src/`.
 
@@ -56,15 +56,19 @@ Required handoff artifacts:
 
 Stages:
 
-1. Mode setup and input validation.
-2. Basket sentence generation.
-3. Item2Vec product embedding training/export.
-4. Product embedding validation.
-5. Customer embedding aggregation.
-6. Feature-set construction and dimensionality representations.
-7. Official candidate model comparison.
-8. Cluster validity and perturbation-stability diagnostics.
-9. Tribe profiling and final exports.
+0. Mode setup, path validation, cache audit, and prepared-data overview.
+1. Basket sentence generation.
+2. Item2Vec product embedding training/export.
+3. Product embedding validation.
+4. Customer embedding aggregation.
+5. Feature-set construction and dimensionality representations.
+6. Official candidate model comparison.
+7. Cluster validity and perturbation-stability diagnostics.
+8. Tribe profiling and interpretability.
+9. Final model selection, selected assignment/profile exports, and shopping-mission microtribes.
+10. Additional business lens for campaign opportunity and financial-sizing scenarios.
+
+The decision-log section follows the stage flow and writes the final model-selection rationale.
 
 Official customer embeddings are quantity weighted:
 
@@ -77,6 +81,10 @@ Official clustering should default to the product/quantity feature set. Feature 
 Official Stage 6 compares configured model families without forcing the client hypothesis of 10-15 tribes. The final selected number of tribes is judged after evaluation through metrics, stability, cluster balance, product/sector lift, and commercial interpretability.
 
 UMAP is a dimensionality-reduction aid. It is useful when it improves clustering evidence; it is not automatically selected because it exists.
+
+Stage 8 can be slow in prod on a cache miss because it scans prepared transactions and computes product, sector, strategic-theme, product-term, and KPI evidence for the selected assignment. In the current local workspace, `outputs/prod/profiles/` may be empty until that cold build completes.
+
+Official visual outputs belong under `outputs/<mode>/figures/`; presentation-ready figures go under `outputs/<mode>/figures/presentation/`, model-selection views under `outputs/<mode>/figures/model_selection/`, and per-tribe lift plots under `outputs/<mode>/figures/tribe_lifts/`.
 
 ## Notebook 4: Experiment Sandbox
 
@@ -115,7 +123,7 @@ df_combined
 -> cluster assignments
 -> validity/stability diagnostics
 -> tribe profiles
--> exports and figures
+-> final exports, figures, shopping missions, and business lens
 ```
 
 The latest quantity-only vectorization change requires rerunning from Stage 4 onward before interpreting new clustering results.

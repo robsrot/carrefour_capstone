@@ -62,13 +62,20 @@ outputs/<mode>/
   embeddings/
   features/
   figures/
+    model_selection/
+    presentation/
+    tribe_lifts/
   models/
+    model_selection/
   profiles/
   reports/
+    evidence/
+    model_selection/
+    presentation/
   experiments/   # dev only
 ```
 
-If embeddings, cluster labels, figures, model binaries, or reports appear under `data/dev/` or `data/processed/`, treat them as stale local clutter unless a current source module explicitly reads them.
+If embeddings, cluster labels, figures, model binaries, profile outputs, or reports appear under `data/dev/` or `data/processed/`, treat them as stale local clutter unless a current source module explicitly reads them.
 
 ## Rules
 

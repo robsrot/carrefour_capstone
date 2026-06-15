@@ -200,7 +200,29 @@ profiling:
   output_parquet: tribe_profiles.parquet
   output_csv_template: tribe_profiles_{mode}.csv
 
+mission_microtribes:
+  min_customers: 20
+  min_presented_customers: 1000
+  min_presented_avg_matching_products: 1.4
+  min_presented_confidence: medium
+  max_presented_missions: 10
+  top_n_core_tribes: 4
+  top_n_products: 5
+  write_companion_files: false
+  exclude_from_presentation:
+    - baby
+    - kids
+    - pet_dog
+    - pet_cat
+    - world_foods_asian
+    - world_foods_mexican
+    - world_foods_middle_eastern
+    - world_foods_latin
+
 exports:
+  presentation_dir: presentation
+  evidence_dir: evidence
+  write_table_companions: false
   assignments_template: customer_tribe_assignments_{mode}.parquet
   model_comparison_template: model_comparison_{mode}.csv
   cluster_summary_template: cluster_summary_{mode}.csv

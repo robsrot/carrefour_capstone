@@ -11,7 +11,14 @@ import polars as pl
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
 from src.progress import log_event, stage_timer
-from src.utils import collect_streaming, deterministic_sample_indices, numeric_feature_columns
+from src.utils import (
+    collect_streaming,
+    deterministic_sample_indices,
+    file_fingerprint,
+    numeric_feature_columns,
+    should_use_cache,
+    write_artifact_metadata,
+)
 
 
 def _product_metadata(transactions: pl.LazyFrame) -> pl.DataFrame:
@@ -29,13 +36,39 @@ def validate_product_embeddings(
     sample_product_ids: Sequence[int] | None = None,
     output_csv: str | Path | None = None,
     output_md: str | Path | None = None,
+    force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path]:
     """Create a nearest-neighbor report for sampled products."""
 
     cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
     csv_path = Path(output_csv) if output_csv else cfg.reports / cfg.get("embedding_validation.output_csv")
     md_path = Path(output_md) if output_md else cfg.reports / cfg.get("embedding_validation.output_md")
+    cache_metadata = {
+        "stage": "embedding_validation",
+        "mode": cfg.mode,
+        "product_embeddings": file_fingerprint(embeddings_path),
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "sample_product_ids": [int(pid) for pid in sample_product_ids] if sample_product_ids else None,
+        "sample_size": int(cfg.get("embedding_validation.sample_size", 25)),
+        "neighbors": int(cfg.get("embedding_validation.neighbors", 8)),
+        "random_seed": cfg.random_seed,
+    }
+    if should_use_cache(
+        csv_path,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ) and should_use_cache(
+        md_path,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ):
+        log_event("Stage 3 embedding validation", "cache hit", cfg=cfg, csv=csv_path, markdown=md_path)
+        return csv_path, md_path
+
     with stage_timer("Stage 3 embedding validation", "building nearest-neighbor report", cfg=cfg, output=md_path):
         emb = pl.read_parquet(embeddings_path).sort("idarticu")
         feature_cols = numeric_feature_columns(emb, exclude=("idarticu",))
@@ -105,5 +138,7 @@ def validate_product_embeddings(
                 )
             lines.append("")
         md_path.write_text("\n".join(lines), encoding="utf-8")
+        write_artifact_metadata(csv_path, cache_metadata)
+        write_artifact_metadata(md_path, cache_metadata)
         log_event("Stage 3 embedding validation", "wrote reports", cfg=cfg, sampled_products=len(indices), csv=csv_path)
     return csv_path, md_path

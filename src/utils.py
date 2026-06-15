@@ -72,27 +72,73 @@ def should_use_cache(
     use_cached: bool = True,
     metadata: Mapping[str, Any] | None = None,
 ) -> bool:
+    return bool(cache_status(path, force=force, use_cached=use_cached, metadata=metadata)["cache_hit"])
+
+
+def cache_status(
+    path: Path | str,
+    force: bool = False,
+    use_cached: bool = True,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a readable cache decision for one artifact."""
+
+    path = Path(path)
+    status: dict[str, Any] = {
+        "path": path,
+        "exists": path.exists(),
+        "use_cached": bool(use_cached),
+        "force": bool(force),
+        "metadata_required": metadata is not None,
+        "metadata_manifest": None,
+        "metadata_status": "not_required" if metadata is None else "unchecked",
+        "cache_hit": False,
+        "reason": "",
+    }
     if not use_cached or force or not path.exists():
-        return False
+        if not use_cached:
+            status["reason"] = "cache disabled by config"
+        elif force:
+            status["reason"] = "force rebuild enabled"
+        else:
+            status["reason"] = "artifact missing"
+        return status
     if metadata is None:
-        return True
+        status["cache_hit"] = True
+        status["reason"] = "artifact exists and no metadata was required"
+        return status
 
     meta_path = artifact_metadata_path(path)
+    status["metadata_manifest"] = meta_path
     try:
         if meta_path.exists():
             cached = read_json(meta_path)
             key = _artifact_metadata_key(path, meta_path)
             entry = cached.get("artifacts", {}).get(key)
             if entry:
-                return entry.get("metadata_hash") == metadata_hash(metadata)
+                status["metadata_status"] = "match" if entry.get("metadata_hash") == metadata_hash(metadata) else "mismatch"
+                status["cache_hit"] = status["metadata_status"] == "match"
+                status["reason"] = "metadata matched" if status["cache_hit"] else "metadata hash mismatch"
+                return status
+            status["metadata_status"] = "missing_entry"
+            status["reason"] = "metadata manifest has no entry for this artifact"
+            return status
 
         legacy_meta_path = _legacy_artifact_metadata_path(path)
         if legacy_meta_path.exists():
             cached = read_json(legacy_meta_path)
-            return cached.get("metadata_hash") == metadata_hash(metadata)
+            status["metadata_manifest"] = legacy_meta_path
+            status["metadata_status"] = "match" if cached.get("metadata_hash") == metadata_hash(metadata) else "mismatch"
+            status["cache_hit"] = status["metadata_status"] == "match"
+            status["reason"] = "legacy metadata matched" if status["cache_hit"] else "legacy metadata hash mismatch"
+            return status
     except (OSError, json.JSONDecodeError):
-        return False
-    return False
+        status["metadata_status"] = "unreadable"
+        status["reason"] = "metadata could not be read"
+        return status
+    status["metadata_status"] = "missing_manifest"
+    status["reason"] = "metadata manifest missing"
+    return status
 
 
 def write_artifact_metadata(path: Path, metadata: Mapping[str, Any]) -> Path:

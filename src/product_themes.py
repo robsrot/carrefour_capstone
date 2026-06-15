@@ -352,7 +352,7 @@ STRATEGIC_THEME_PATTERNS: dict[str, list[str]] = {
         r"\bmatcha\b",
     ],
     "alcohol": [
-        r"\bvino(?:s)?\b",
+        r"(?<!vinagre de )\bvino(?:s)?\b",
         r"\bcerveza(?:s)?\b",
         r"\bsidra\b",
         r"\bcava\b",
@@ -364,6 +364,16 @@ STRATEGIC_THEME_PATTERNS: dict[str, list[str]] = {
         r"\blicor(?:es)?\b",
         r"\bvermut\b",
         r"\bbrandy\b",
+    ],
+    "alcohol_free": [
+        r"\bsin alcohol\b",
+        r"\b0[,\.]0\b",
+        r"\b0 ?% ?(?:alcohol|alc)\b",
+        r"\bcerveza(?:s)?\b.*\b0 ?%\b",
+        r"\bcerveza(?:s)?\b.*\bzero zero\b",
+        r"\bzero zero\b",
+        r"\bfree damm\b",
+        r"\bbuckler\b.*\b0 ?%\b",
     ],
     "frozen_ice_cream": [
         r"\bcongelad",

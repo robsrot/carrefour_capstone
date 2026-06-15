@@ -4,15 +4,17 @@ Product-first behavioral customer segmentation for Carrefour checkout data. The 
 
 ## Current Status
 
-As of 2026-06-13:
+As of 2026-06-15:
 
 - Production preprocessing and EDA are complete: raw CSVs have been converted, cleaned, joined, quality-checked, and summarized into `data/processed/`.
 - The ML pipeline is product-first: official customer vectors aggregate product embeddings using product quantities only, not spend. Spend remains available for profiling and business interpretation after clustering.
 - UMAP is used as a dimensionality-reduction aid and candidate clustering representation. It is not treated as an automatic winner.
 - Official Stage 6 compares committed model families without forcing a curated 10-15 cluster target. The client expectation is treated as a hypothesis checked after the model is evaluated.
+- Stage 7 validity/stability diagnostics and Stage 8 product-lift profiling are part of the official notebook flow before final presentation outputs.
+- Stage 9 exports the selected assignments/profiles plus shopping-mission microtribes; Stage 10 adds the business opportunity lens for campaign and financial sizing.
+- Visualization outputs now belong under `outputs/<mode>/figures/`, including `figures/model_selection/`, `figures/presentation/`, and `figures/tribe_lifts/`.
 - Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; IDF downweighting and broader UMAP-HDBSCAN sweeps belong there before any setting is promoted into YAML.
-- Generated Stage 4+ artifacts should be treated as stale unless rebuilt after the latest quantity-only vectorization update.
-- The production-scale ML run is still pending after the latest pipeline updates.
+- Local prod artifacts exist for embeddings/features/model-selection caches. If `outputs/prod/profiles/` is empty, prod Stage 8 is still a cold profile build and can take a long time on the 9.8 GB prepared transaction table.
 
 For the detailed status, gaps, and product-first improvement plan, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
@@ -104,7 +106,7 @@ pytest
 git status --short
 ```
 
-The source handoff must include the new config, notebook, and experiment modules. Generated data/model/output artifacts stay local and should not be committed.
+The source handoff must include configs, notebooks, docs, and all `src/*.py` modules. In the current local tree, `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` are present but not yet tracked; include them before another teammate runs Stage 0 or Stage 9/10. Generated data/model/output artifacts stay local and should not be committed.
 
 For experimentation:
 
@@ -117,13 +119,17 @@ For experimentation:
 ## Repository Layout
 
 ```text
-configs/       Hyperparameters and dev/prod overrides
-data/          Local raw, processed, and dev data artifacts; never committed
-docs/          Project context, current status, and roadmap
-notebooks/     Ordered analysis and pipeline notebooks
-outputs/       Mode-scoped generated artifacts; never committed
-src/           Reusable pipeline modules
-tests/         Reproducibility, data loader, and data quality tests
+configs/          Hyperparameters and dev/prod overrides
+data/             Local raw, processed, and dev data artifacts; never committed
+  raw/csv/        Source CSVs supplied outside git
+  raw/parquet/    Raw Parquet conversions
+  processed/      Production prepared data from Notebook 02
+  dev/            Stratified dev subset
+docs/             Project context, current status, run contracts, and inventory
+notebooks/        Ordered analysis, official pipeline, and sandbox notebooks
+outputs/          Mode-scoped generated artifacts; never committed
+src/              Reusable pipeline modules
+tests/            Test package placeholder; add source tests here
 ```
 
 Generated ML artifacts stay under `outputs/<mode>/`. Dev includes an experiment workbench; prod does not.
@@ -134,9 +140,16 @@ outputs/dev/
   embeddings/   Basket sentences and product embedding tables
   features/     Customer vectors and model-ready feature sets
   figures/      Client-facing plots and diagnostics
+    model_selection/
+    presentation/
+    tribe_lifts/
   models/       Trained local model binaries and internal model-selection caches
+    model_selection/
   profiles/     Tribe profile parquet outputs
   reports/      Human-readable summaries, exports, and final selection evidence
+    evidence/
+    model_selection/
+    presentation/
   experiments/  Optional sandbox runs, one flat folder per experiment
 
 outputs/prod/
@@ -144,9 +157,16 @@ outputs/prod/
   embeddings/   Basket sentences and product embedding tables
   features/     Customer vectors and model-ready feature sets
   figures/      Client-facing plots and diagnostics
+    model_selection/
+    presentation/
+    tribe_lifts/
   models/       Trained local model binaries and internal model-selection caches
+    model_selection/
   profiles/     Tribe profile parquet outputs
   reports/      Human-readable summaries, exports, and final selection evidence
+    evidence/
+    model_selection/
+    presentation/
 ```
 
 ## Operating Conventions
@@ -164,10 +184,13 @@ outputs/prod/
 - Stage 7 writes cluster validity and perturbation-stability diagnostics after Stage 6, so selection is based on more than silhouette/noise alone.
 - Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`.
 - Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`; avoid per-file `.meta.json` sidecars.
+- Stage 8 profiling can be the slowest interpretation step in prod because it scans prepared transactions to compute product, sector, theme, and term lift evidence.
 - Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
 
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) is the agent/operator guide for this repo.
 - [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md) is the current state, missing work, and next experiment plan.
+- [docs/PROJECT_FILE_INVENTORY.md](docs/PROJECT_FILE_INVENTORY.md) is the current source-file and artifact inventory.
+- [docs/notebook_contract.md](docs/notebook_contract.md) is the stage-by-stage notebook operating contract.
 - [docs/Carrefour_Data_Challenge_Project_Context.md](docs/Carrefour_Data_Challenge_Project_Context.md) preserves the original project brief and methodological constraints.

@@ -1,8 +1,10 @@
 # Project File Inventory
 
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
-This inventory lists the current source-controlled files that matter for operating and maintaining the Carrefour segmentation pipeline. Generated artifacts live outside the committed repo state.
+This inventory lists the current source and handoff-relevant files that matter for operating and maintaining the Carrefour segmentation pipeline. Generated artifacts live outside the committed repo state.
+
+Note: as of this update, `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` exist in the local working tree but are not yet tracked by git. Include them in the source handoff before another teammate relies on Stage 9/10 outputs.
 
 ## Root
 
@@ -32,6 +34,8 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `src/data_quality.py` | Production quality report. |
 | `src/generate_dev_subset.py` | Builds the stratified dev subset from production processed data. |
 | `src/basket_builder.py` | Lower-level basket construction helpers used by embedding stages. |
+| `src/business_lens.py` | Stage 10 business opportunity lens for campaign plays and financial sizing. Currently local/untracked. |
+| `src/cache_audit.py` | Cache and artifact-state audit helpers for notebook Stage 0. Currently local/untracked. |
 | `src/item2vec.py` | Item2Vec training and product embedding export. |
 | `src/embeddings.py` | Basket sentence construction and product embedding validation helpers. |
 | `src/embedding_validation.py` | Nearest-neighbor product embedding validation reports. |
@@ -43,6 +47,7 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `src/evaluation.py` | Shared cluster metric helpers. |
 | `src/model_selection.py` | Official Stage 6 candidate suite and focused UMAP-HDBSCAN experiments. |
 | `src/cluster_validation.py` | Stage 7 cluster validity and perturbation-stability report. |
+| `src/mission_microtribes.py` | Stage 9 shopping-mission microtribe tagging and summaries. Currently local/untracked. |
 | `src/experiment_reporting.py` | Compact experiment summaries for sandbox outputs. |
 | `src/experiment_sandbox.py` | Dev-only experiment helpers for embeddings, vectors, feature sets, and focused clustering. |
 | `src/profiling.py` | Product, sector, KPI, and lift-based tribe profiles. |
@@ -51,7 +56,7 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `src/tribe_namer.py` | Optional LLM-based tribe naming from lift profiles. |
 | `src/autoencoder.py` | Experimental autoencoder utilities; not part of the official default pipeline. |
 | `src/exports.py` | Final assignment/profile/report exports. |
-| `src/visualization.py` | Figure generation for pipeline diagnostics and final explanation. |
+| `src/visualization.py` | Shared Carrefour-style visualization theme plus figure generation for diagnostics and final explanation. |
 | `src/progress.py` | Lightweight progress logging. |
 | `src/utils.py` | Shared IO, metadata, sampling, and numeric helper utilities. |
 
@@ -74,6 +79,12 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `docs/Carrefour_Data_Challenge_Project_Context.md` | Original project context. |
 | `docs/team_sprint_plan.md` | Historical sprint-planning archive; not the current source of truth. |
 
+## Tests
+
+| File | Purpose |
+|---|---|
+| `tests/__init__.py` | Test package marker. Add source test modules here as coverage is restored or expanded. |
+
 ## Generated Artifacts
 
 Generated files are local and should not be committed.
@@ -84,9 +95,16 @@ outputs/<mode>/
   embeddings/
   features/
   figures/
+    model_selection/
+    presentation/
+    tribe_lifts/
   models/
+    model_selection/
   profiles/
   reports/
+    evidence/
+    model_selection/
+    presentation/
   experiments/   # dev only
 ```
 

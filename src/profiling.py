@@ -190,10 +190,10 @@ def profile_tribes(
         "population_definition": "all_assigned_customers_including_noise",
     }
     if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
-        log_event("Stage 7 profiling", "cache hit", cfg=cfg, assignments=assignments_file, path=output)
+        log_event("Stage 8 profiling", "cache hit", cfg=cfg, assignments=assignments_file, path=output)
         return output
 
-    with stage_timer("Stage 7 profiling", "building tribe profile", cfg=cfg, assignments=assignments_file):
+    with stage_timer("Stage 8 profiling", "building tribe profile", cfg=cfg, assignments=assignments_file):
         lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
         columns = set(schema_names(lf))
         product_cols = ["cliente", "idarticu"]
@@ -203,6 +203,14 @@ def profile_tribes(
 
         assignment_columns = set(schema_names(pl.scan_parquet(assignments_file)))
         assignment_select = [pl.col("cliente"), pl.col("tribe_id")]
+        if "model_name" in assignment_columns:
+            assignment_select.append(pl.col("model_name"))
+        else:
+            assignment_select.append(pl.lit(stem).alias("model_name"))
+        if "model_variant" in assignment_columns:
+            assignment_select.append(pl.col("model_variant"))
+        else:
+            assignment_select.append(pl.lit(None).cast(pl.Utf8).alias("model_variant"))
         if "assignment_source" in assignment_columns:
             assignment_select.append(pl.col("assignment_source"))
         else:
@@ -220,6 +228,14 @@ def profile_tribes(
         assignment_customers = assignments_all.select("cliente")
         population = lf.select(product_cols).join(assignment_customers, on="cliente", how="inner")
         clustered = population.join(clustered_assignments, on="cliente", how="inner")
+        assignment_meta = collect_streaming(
+            assignments_all.select(
+                [
+                    pl.col("model_name").drop_nulls().first().alias("model_name"),
+                    pl.col("model_variant").drop_nulls().first().alias("model_variant"),
+                ]
+            )
+        ).row(0, named=True)
 
         cluster_sizes = collect_streaming(
             clustered_assignments.group_by("tribe_id").agg(pl.col("cliente").n_unique().alias("n_customers")).sort("tribe_id")
@@ -246,12 +262,14 @@ def profile_tribes(
             )
         )
         log_event(
-            "Stage 7 profiling",
+            "Stage 8 profiling",
             "assignment population",
             cfg=cfg,
             clusters=cluster_sizes.height,
             customers=total_customers,
             noise_customers=noise_customers,
+            model=assignment_meta.get("model_name"),
+            variant=assignment_meta.get("model_variant"),
         )
 
         customer_product = clustered.select(
@@ -488,7 +506,7 @@ def profile_tribes(
         output.parent.mkdir(parents=True, exist_ok=True)
         profiles.write_parquet(output)
         write_artifact_metadata(output, cache_metadata)
-        log_event("Stage 7 profiling", "wrote profile", cfg=cfg, tribes=profiles.height, path=output)
+        log_event("Stage 8 profiling", "wrote profile", cfg=cfg, tribes=profiles.height, path=output)
     return output
 
 
@@ -604,7 +622,8 @@ def write_cluster_summary_artifacts(
         if output_csv
         else cfg.reports / str(cfg.get("exports.cluster_summary_template", "cluster_summary_{mode}.csv")).format(mode=cfg.mode)
     )
-    md_output = Path(output_md) if output_md else csv_output.with_suffix(".md")
+    write_companions = bool(cfg.get("exports.write_table_companions", False))
+    md_output = Path(output_md) if output_md else (csv_output.with_suffix(".md") if write_companions else None)
     rows = []
     for row in profiles.iter_rows(named=True):
         rows.append(
@@ -631,9 +650,110 @@ def write_cluster_summary_artifacts(
     summary = pl.DataFrame(rows) if rows else pl.DataFrame()
     csv_output.parent.mkdir(parents=True, exist_ok=True)
     summary.write_csv(csv_output)
-    md_output.write_text(_cluster_summary_markdown(summary, cfg=cfg), encoding="utf-8")
-    log_event("Stage 8 exports", "wrote cluster summary artifacts", cfg=cfg, csv=csv_output, markdown=md_output)
-    return {"csv": csv_output, "markdown": md_output}
+    paths = {"csv": csv_output}
+    log_kwargs: dict[str, Path] = {"csv": csv_output}
+    if md_output is not None:
+        md_output.write_text(_cluster_summary_markdown(summary, cfg=cfg), encoding="utf-8")
+        paths["markdown"] = md_output
+        log_kwargs["markdown"] = md_output
+    log_event("Stage 8 exports", "wrote cluster summary artifacts", cfg=cfg, **log_kwargs)
+    return paths
+
+
+def profile_overview_table(profile_path: str | Path, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
+    """Return a compact, notebook-friendly explanation table for selected tribes."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    rows = [_comparison_row(row, cfg=cfg) for row in profiles.iter_rows(named=True)]
+    if not rows:
+        return pl.DataFrame()
+    table = pl.DataFrame(rows)
+    display_cols = [
+        "tribe_id",
+        "working_tribe_name",
+        "label_confidence",
+        "n_customers",
+        "population_share_pct",
+        "soft_assigned_share_pct",
+        "top_theme_evidence",
+        "top_data_driven_term_evidence",
+        "top_product_evidence",
+        "interpretation_note",
+    ]
+    return table.select([col for col in display_cols if col in table.columns])
+
+
+def profile_evidence_metrics_table(profile_path: str | Path, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
+    """Return numeric evidence diagnostics for each selected tribe."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    rows = []
+    product_threshold = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+    sector_threshold = float(cfg.get("profiling.strong_sector_lift_threshold", 1.2))
+    theme_threshold = float(cfg.get("profiling.strong_theme_lift_threshold", 1.2))
+    term_threshold = float(cfg.get("profiling.strong_term_lift_threshold", 1.25))
+    for row in profiles.iter_rows(named=True):
+        product_lifts = [float(value) for value in (row.get("top_product_lifts") or []) if value is not None]
+        sector_lifts = [float(value) for value in (row.get("top_sector_lifts") or []) if value is not None]
+        theme_lifts = [float(value) for value in (row.get("top_theme_lifts") or []) if value is not None]
+        term_lifts = [float(value) for value in (row.get("top_product_term_lifts") or []) if value is not None]
+        rows.append(
+            {
+                "tribe_id": row.get("tribe_id"),
+                "working_tribe_name": fallback_tribe_name(row),
+                "n_customers": int(row.get("n_customers") or 0),
+                "population_share_pct": round(float(row.get("population_share") or 0.0) * 100.0, 2),
+                "soft_assigned_share_pct": round(float(row.get("soft_assigned_share") or 0.0) * 100.0, 2),
+                "strong_product_lift_count": sum(1 for value in product_lifts if value >= product_threshold),
+                "strong_sector_lift_count": sum(1 for value in sector_lifts if value >= sector_threshold),
+                "strong_theme_lift_count": sum(1 for value in theme_lifts if value >= theme_threshold),
+                "strong_term_lift_count": sum(1 for value in term_lifts if value >= term_threshold),
+                "max_product_lift": round(max(product_lifts), 3) if product_lifts else None,
+                "max_theme_lift": round(max(theme_lifts), 3) if theme_lifts else None,
+                "max_term_lift": round(max(term_lifts), 3) if term_lifts else None,
+                "label_confidence": _label_confidence(row, cfg=cfg),
+            }
+        )
+    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+
+def profile_subsegment_opportunity_table(
+    profile_path: str | Path,
+    *,
+    max_rows: int = 60,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Return evidence-backed within-tribe subgroup opportunities without writing artifacts."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    definitions = _subsegment_definitions(profiles, cfg=cfg)
+    if definitions.is_empty():
+        return definitions
+    return (
+        definitions.rename(
+            {
+                "profile_subsegment_customers": "subsegment_customers",
+                "profile_subsegment_coverage_pct": "subsegment_share_pct",
+            }
+        )
+        .select(
+            [
+                "tribe_id",
+                "working_tribe_name",
+                "subsegment_type",
+                "subsegment_label",
+                "subsegment_customers",
+                "subsegment_share_pct",
+                "subsegment_lift",
+                "subsegment_rank_in_tribe",
+            ]
+        )
+        .sort(
+            ["tribe_id", "subsegment_lift", "subsegment_customers"],
+            descending=[False, True, True],
+        )
+        .head(max_rows)
+    )
 
 
 def write_tribe_comparison_artifacts(

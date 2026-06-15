@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import shutil
 from pathlib import Path
 
 import polars as pl
@@ -73,6 +75,136 @@ def _normalize_embedding_columns(df: pl.DataFrame, emb_cols: list[str]) -> pl.Da
         )
         .drop("_vector_norm")
     )
+
+
+def _default_partition_count(cfg: PipelineConfig) -> int:
+    configured = int(cfg.get("customer_embeddings.partition_count", 32))
+    return max(1, configured)
+
+
+def _write_customer_embedding_partitions(
+    joined: pl.LazyFrame,
+    emb_cols: list[str],
+    normalize_vectors: bool,
+    parts_dir: Path,
+    partition_count: int,
+    cfg: PipelineConfig,
+) -> tuple[list[Path], int]:
+    weight_sum = pl.col("_weight").sum()
+    agg_exprs = [
+        ((pl.col(col).cast(pl.Float64) * pl.col("_weight")).sum() / weight_sum)
+        .cast(pl.Float32)
+        .alias(col)
+        for col in emb_cols
+    ]
+    agg_exprs.extend(
+        [
+            weight_sum.cast(pl.Float64).alias("embedding_weight_sum"),
+            pl.col("idarticu").n_unique().alias("embedded_unique_products"),
+        ]
+    )
+
+    cliente_type = joined.collect_schema().get("cliente")
+    numeric_cliente = cliente_type in {
+        pl.Int8,
+        pl.Int16,
+        pl.Int32,
+        pl.Int64,
+        pl.UInt8,
+        pl.UInt16,
+        pl.UInt32,
+        pl.UInt64,
+    }
+
+    part_paths: list[Path] = []
+    total_customers = 0
+
+    if numeric_cliente:
+        bounds = collect_streaming(
+            joined.select(
+                [
+                    pl.col("cliente").min().alias("cliente_min"),
+                    pl.col("cliente").max().alias("cliente_max"),
+                ]
+            )
+        )
+        cliente_min = int(bounds[0, "cliente_min"])
+        cliente_max = int(bounds[0, "cliente_max"])
+        total_span = (cliente_max - cliente_min) + 1
+        partition_count = max(1, min(partition_count, total_span))
+        step = max(1, math.ceil(total_span / partition_count))
+
+        for idx in range(partition_count):
+            start = cliente_min + idx * step
+            end = min(cliente_max + 1, start + step)
+            filter_expr = (
+                (pl.col("cliente") >= pl.lit(start)) & (pl.col("cliente") < pl.lit(end))
+                if idx < partition_count - 1
+                else (pl.col("cliente") >= pl.lit(start)) & (pl.col("cliente") <= pl.lit(cliente_max))
+            )
+            part_df = collect_streaming(joined.filter(filter_expr).group_by("cliente").agg(agg_exprs).sort("cliente"))
+            if part_df.is_empty():
+                log_event(
+                    "Stage 4 customer embeddings",
+                    "partition complete",
+                    cfg=cfg,
+                    partition=idx + 1,
+                    partitions=partition_count,
+                    customer_min=start,
+                    customer_max=end - 1,
+                    customers=0,
+                )
+                continue
+            if normalize_vectors:
+                part_df = _normalize_embedding_columns(part_df, emb_cols)
+            part_path = parts_dir / f"part_{idx:04d}.parquet"
+            part_df.write_parquet(part_path)
+            total_customers += part_df.height
+            part_paths.append(part_path)
+            log_event(
+                "Stage 4 customer embeddings",
+                "partition complete",
+                cfg=cfg,
+                partition=idx + 1,
+                partitions=partition_count,
+                customer_min=start,
+                customer_max=end - 1,
+                customers=part_df.height,
+                path=part_path,
+            )
+    else:
+        for idx in range(partition_count):
+            filter_expr = (pl.col("cliente").hash(seed=0) % pl.lit(partition_count)) == pl.lit(idx)
+            part_df = collect_streaming(joined.filter(filter_expr).group_by("cliente").agg(agg_exprs).sort("cliente"))
+            if part_df.is_empty():
+                log_event(
+                    "Stage 4 customer embeddings",
+                    "partition complete",
+                    cfg=cfg,
+                    partition=idx + 1,
+                    partitions=partition_count,
+                    hash_bucket=idx,
+                    customers=0,
+                )
+                continue
+            if normalize_vectors:
+                part_df = _normalize_embedding_columns(part_df, emb_cols)
+            part_path = parts_dir / f"part_{idx:04d}.parquet"
+            part_df.write_parquet(part_path)
+            total_customers += part_df.height
+            part_paths.append(part_path)
+            log_event(
+                "Stage 4 customer embeddings",
+                "partition complete",
+                cfg=cfg,
+                partition=idx + 1,
+                partitions=partition_count,
+                hash_bucket=idx,
+                customers=part_df.height,
+                path=part_path,
+            )
+
+    return part_paths, total_customers
 
 
 def build_customer_embeddings(
@@ -159,28 +291,35 @@ def build_customer_embeddings(
         )
         joined = customer_product_weights.join(embedding_lf, on="idarticu", how="inner")
 
-        weight_sum = pl.col("_weight").sum()
-        agg_exprs = [
-            ((pl.col(col).cast(pl.Float64) * pl.col("_weight")).sum() / weight_sum)
-            .cast(pl.Float32)
-            .alias(col)
-            for col in emb_cols
-        ]
-        agg_exprs.extend(
-            [
-                weight_sum.cast(pl.Float64).alias("embedding_weight_sum"),
-                pl.col("idarticu").n_unique().alias("embedded_unique_products"),
-            ]
-        )
-
-        log_event("Stage 4 customer embeddings", "collecting weighted customer vectors", cfg=cfg)
-        result = collect_streaming(joined.group_by("cliente").agg(agg_exprs).sort("cliente"))
-        if normalize_vectors:
-            result = _normalize_embedding_columns(result, emb_cols)
         output.parent.mkdir(parents=True, exist_ok=True)
-        result.write_parquet(output)
+        parts_dir = output.parent / f".{output.stem}_parts"
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+        partition_count = _default_partition_count(cfg)
+        log_event(
+            "Stage 4 customer embeddings",
+            "collecting weighted customer vectors in partitions",
+            cfg=cfg,
+            partitions=partition_count,
+        )
+        part_paths, total_customers = _write_customer_embedding_partitions(
+            joined=joined,
+            emb_cols=emb_cols,
+            normalize_vectors=normalize_vectors,
+            parts_dir=parts_dir,
+            partition_count=partition_count,
+            cfg=cfg,
+        )
+        if not part_paths:
+            raise ValueError("No customer embeddings were produced from weighted product vectors.")
+
+        # Range partitions are globally ordered by cliente; hash partitions are sorted within each part.
+        pl.scan_parquet(str(parts_dir / "part_*.parquet")).sink_parquet(str(output))
+        shutil.rmtree(parts_dir, ignore_errors=True)
         write_artifact_metadata(output, cache_metadata)
-        log_event("Stage 4 customer embeddings", "wrote artifact", cfg=cfg, customers=result.height, path=output)
+        log_event("Stage 4 customer embeddings", "wrote artifact", cfg=cfg, customers=total_customers, path=output)
     return output
 
 

@@ -1,8 +1,8 @@
 # Team Experiment Sprint Guide
 
-Last updated: 2026-06-13
+Last reviewed: 2026-06-15
 
-This guide explains how teammates should experiment without turning the project back into a messy cache maze. The goal is to think creatively, test ideas in a disciplined way, and promote only evidence-backed settings into the official pipeline.
+This is a historical sprint/experiment guide. Use it for disciplined experiment process, not as the current pipeline-status source of truth. The goal is to think creatively, test ideas in a disciplined way, and promote only evidence-backed settings into the official pipeline.
 
 Use these as the current source of truth:
 

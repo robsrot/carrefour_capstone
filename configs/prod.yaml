@@ -18,6 +18,10 @@ profiling:
   min_term_population_customers: 250
   min_subsegment_coverage: 0.005
 
+mission_microtribes:
+  min_customers: 100
+  min_presented_customers: 5000
+
 official_model_suite:
   umap_hdbscan:
     # Dev winner uses min_cluster_size=400 on the dev subset. Production fits

@@ -1,6 +1,6 @@
 # Project Status and Roadmap
 
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 ## Modeling Contract
 
@@ -25,6 +25,7 @@ Spend and business KPIs remain important, but only after clustering: they are us
 
 The clean ML workflow is:
 
+0. Validate mode, paths, cache state, and prepared-data readiness.
 1. Build basket sentences from prepared transactions.
 2. Train or load Item2Vec product embeddings.
 3. Validate product embeddings with nearest-neighbor diagnostics.
@@ -32,8 +33,9 @@ The clean ML workflow is:
 5. Build model-ready feature sets.
 6. Compare official clustering candidates without forcing a target number of clusters.
 7. Produce cluster validity and perturbation-stability diagnostics.
-8. Profile tribes by product, sector, KPI, promo, and business-readability metrics.
-9. Export final assignments, profiles, reports, and figures.
+8. Profile tribes by product, sector, theme, term, KPI, promo, and business-readability metrics.
+9. Export final assignments, profiles, reports, figures, and shopping-mission microtribes.
+10. Write an additional business lens for campaign opportunities and conservative financial sizing.
 
 UMAP is a dimensionality-reduction aid. It can improve density clustering, but it must earn its place through metrics, stability, interpretability, and clean product-lift profiles.
 
@@ -44,8 +46,8 @@ This repository is ready for colleague experimentation after the source changes 
 Current handoff notes:
 
 - Reconcile the environment before running UMAP-HDBSCAN. The project expects `scikit-learn=1.7.2` with `hdbscan==0.8.40`.
-- Generated Stage 4+ artifacts should be treated as stale unless rebuilt after the latest quantity-only customer-vector change.
-- Production artifacts are not complete after the latest pipeline updates.
+- Local prod embeddings, feature sets, and model-selection caches exist. Prod Stage 8 profile artifacts may still be absent or in progress; if `outputs/prod/profiles/` is empty, the selected tribe profile has not finished building.
+- Include local source modules `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` in any handoff; they are currently present locally but not yet tracked by git.
 - Use dev sandboxes for experimentation; do not change production YAML based on one unreviewed run.
 - Commit or otherwise share all source files, configs, notebooks, and docs. Do not share raw data, Parquet caches, trained models, figures, or `.env` files through git.
 
@@ -90,9 +92,16 @@ Generated artifacts stay under `outputs/<mode>/`:
 - `embeddings/`
 - `features/`
 - `figures/`
+  - `figures/model_selection/`
+  - `figures/presentation/`
+  - `figures/tribe_lifts/`
 - `models/`
+  - `models/model_selection/`
 - `profiles/`
 - `reports/`
+  - `reports/evidence/`
+  - `reports/model_selection/`
+  - `reports/presentation/`
 - `experiments/` in dev only
 
 The repo should not commit generated Parquet files, trained model binaries, plots, `.env`, or raw data.
@@ -100,8 +109,8 @@ The repo should not commit generated Parquet files, trained model binaries, plot
 ## Next Steps
 
 1. Reconcile the local environment to `environment.yml`.
-2. Re-run dev from Stage 4 onward after the quantity-only vectorization change.
-3. Inspect Stage 6 and Stage 7 outputs together: metrics, noise, balance, stability, and profile lift.
-4. Use the sandbox to test IDF and focused UMAP-HDBSCAN variants only if the official dev run shows weak product separation or unstable labels.
-5. Promote only the strongest evidence-backed settings into YAML.
-6. Run the full production pipeline once the dev modeling contract is stable.
+2. Let prod Stage 8 complete if it is currently building profiles; expect a cold profile build to scan the large prepared transaction table.
+3. Inspect Stage 6, Stage 7, and Stage 8 outputs together: metrics, noise, balance, stability, and product/theme/term lift.
+4. Run Stage 9 and Stage 10 after profiles exist to generate the selected exports, shopping missions, presentation pack, decision log, and business lens.
+5. Use the sandbox to test IDF and focused UMAP-HDBSCAN variants only if the official run shows weak product separation or unstable labels.
+6. Promote only the strongest evidence-backed settings into YAML.

@@ -13,6 +13,7 @@ from src.product_themes import detect_product_themes
 
 THEME_LABELS = {
     "alcohol": "Beer & Alcohol Buyers",
+    "alcohol_free": "Alcohol-Free Beer Buyers",
     "baby": "Baby Care Buyers",
     "halal": "Halal Product Buyers",
     "pet": "Pet Care Buyers",
@@ -30,7 +31,7 @@ THEME_LABELS = {
     "organic_bio": "Organic/Bio Buyers",
     "plant_based": "Plant-Based Buyers",
     "protein_fitness": "Protein & Fitness Buyers",
-    "gluten_free": "Special Diet Buyers",
+    "gluten_free": "Gluten-Free Buyers",
     "lactose_free": "Lactose-Free Buyers",
     "health_wellness": "Health & Wellness Buyers",
     "ready_meals": "Ready-Meal Buyers",

@@ -1,6 +1,6 @@
 # Cross-Machine Reproducibility
 
-Last updated: 2026-06-13
+Last updated: 2026-06-15
 
 This project aims for deterministic source behavior and stable tribe structure across machines. Exact bit-for-bit equality is realistic for prepared-data checksums and many cached tables, but not guaranteed for UMAP/HDBSCAN boundary assignments across different CPUs.
 
@@ -91,6 +91,21 @@ data/processed/customer_kpis.parquet
 ```
 
 Generated ML artifacts under `outputs/<mode>/` should usually be rebuilt locally. If they are shared for speed, treat them as caches tied to the exact code, config, environment, and prepared data used to create them.
+
+When sharing generated outputs outside git, keep the mode-scoped layout intact:
+
+```text
+outputs/<mode>/
+  .artifact_metadata.json
+  embeddings/
+  features/
+  figures/
+  models/
+  profiles/
+  reports/
+```
+
+Stage 8 profile artifacts are especially sensitive to the exact selected assignment file, prepared transaction table, product-theme rules, product-term rules, and profiling thresholds. If any of those change, rebuild profiles and downstream Stage 9/10 reports.
 
 ## If Results Differ
 

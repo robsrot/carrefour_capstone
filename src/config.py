@@ -139,11 +139,16 @@ class PipelineConfig:
             self.outputs,
             self.reports,
             self.figures,
+            self.figures / "model_selection",
+            self.figures / "presentation",
+            self.figures / "tribe_lifts",
             self.outputs / "embeddings",
             self.outputs / "features",
             self.outputs / "profiles",
             self.model_selection,
             self.model_selection_cache,
+            self.reports / str(self.get("exports.presentation_dir", "presentation")),
+            self.reports / str(self.get("exports.evidence_dir", "evidence")),
         ]
         if self.experiments_enabled:
             paths.append(self.experiments)
