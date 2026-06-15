@@ -7,6 +7,10 @@ word2vec:
   epochs: 3
   workers: 1
 
+customer_embeddings:
+  weight_strategy: quantity
+  normalize_vectors: true
+
 modeling:
   evaluation_sample_size: 12000
   fit_sample_size: null
