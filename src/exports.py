@@ -16,6 +16,81 @@ from src.evaluation import quality_gate_result
 from src.progress import log_event, stage_timer
 
 
+FIGURE_ARTIFACT_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".html"}
+
+
+def collect_cached_presentation_figures(
+    *,
+    cfg: PipelineConfig = CONFIG,
+    include_model_selection: bool = True,
+) -> dict[str, Path]:
+    """Return presentation-ready figure artifacts already present in the output cache."""
+
+    presentation_dir = cfg.figures / str(cfg.get("exports.presentation_dir", "presentation"))
+    model_selection_dir = cfg.figures / "model_selection"
+    figures: dict[str, Path] = {}
+    seen_paths: set[str] = set()
+
+    def add(label: str, path: Path) -> None:
+        if not path.exists() or path.suffix.lower() not in FIGURE_ARTIFACT_SUFFIXES:
+            return
+        path_key = _stage9_path_identity(path)
+        if path_key in seen_paths:
+            return
+        figures[_unique_stage9_label(label, figures)] = path
+        seen_paths.add(path_key)
+
+    known_presentation_files = [
+        ("Selected Tribe Vs Population Dashboard", f"00_selected_tribe_vs_population_dashboard_{cfg.mode}.png"),
+        ("Selected Tribe Theme Lift Heatmap", f"00_selected_tribe_theme_lift_heatmap_{cfg.mode}.png"),
+        ("Core Tribe Sizes", f"01_core_tribe_sizes_{cfg.mode}.png"),
+        ("Assignment Provenance", f"02_assignment_provenance_{cfg.mode}.png"),
+        ("Shopping Mission Overview", f"03_shopping_mission_overview_{cfg.mode}.png"),
+        ("Core Mission Lift Heatmap", f"04_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
+    ]
+    for label, filename in known_presentation_files:
+        add(label, presentation_dir / filename)
+
+    projection_dirs = [presentation_dir]
+    if include_model_selection:
+        projection_dirs.append(model_selection_dir)
+    projection_paths: list[Path] = []
+    for directory in projection_dirs:
+        if directory.exists():
+            projection_paths.extend(sorted(directory.glob("umap_selected_tribes_*.png")))
+    for directory in projection_dirs:
+        if directory.exists():
+            projection_paths.extend(sorted(directory.glob("pca_selected_tribes_*.png")))
+    for path in projection_paths:
+        add(_cached_stage9_figure_label(path, cfg), path)
+
+    cached_dirs = [presentation_dir]
+    if include_model_selection:
+        cached_dirs.append(model_selection_dir)
+    for directory in cached_dirs:
+        if not directory.exists():
+            continue
+        for path in sorted(directory.iterdir()):
+            add(_cached_stage9_figure_label(path, cfg), path)
+    return figures
+
+
+def merge_stage9_figure_paths(*figure_maps: Mapping[str, Any] | None) -> dict[str, Path]:
+    """Merge nested figure path maps while keeping the first label for each path."""
+
+    merged: dict[str, Path] = {}
+    seen_paths: set[str] = set()
+    for figure_map in figure_maps:
+        for label, path in _flatten_stage9_paths(figure_map or {}):
+            path = Path(path)
+            path_key = _stage9_path_identity(path)
+            if path_key in seen_paths:
+                continue
+            merged[_unique_stage9_label(label, merged)] = path
+            seen_paths.add(path_key)
+    return merged
+
+
 def build_model_comparison(
     candidate_results: list[dict[str, Any]],
     profile_paths: dict[str, Path] | None = None,
@@ -406,13 +481,17 @@ def write_stage9_presentation_pack(
     stats = _stage9_stats(core_summary_path, mission_summary_path)
     core = _read_csv(core_summary_path)
     missions = _read_csv(mission_summary_path)
+    figures_for_manifest = merge_stage9_figure_paths(
+        collect_cached_presentation_figures(cfg=cfg),
+        figure_paths or {},
+    )
     manifest = _stage9_artifact_manifest(
         core_summary_path=core_summary_path,
         mission_summary_path=mission_summary_path,
         clustering_atlas_path=clustering_atlas_path,
         assignment_path=assignment_path,
         profile_path=profile_path,
-        figure_paths=figure_paths or {},
+        figure_paths=figures_for_manifest,
         evidence_paths=evidence_paths or {},
         base_dir=out_dir,
     )
@@ -508,7 +587,7 @@ def _flatten_stage9_paths(value: Any, prefix: str = "") -> list[tuple[str, Path]
     if isinstance(value, Mapping):
         flattened: list[tuple[str, Path]] = []
         for key, nested in value.items():
-            label = f"{prefix} {str(key).replace('_', ' ').title()}".strip()
+            label = f"{prefix} {_stage9_label_from_key(key)}".strip()
             flattened.extend(_flatten_stage9_paths(nested, label))
         return flattened
     if isinstance(value, (list, tuple, set)):
@@ -520,6 +599,50 @@ def _flatten_stage9_paths(value: Any, prefix: str = "") -> list[tuple[str, Path]
     if isinstance(value, (str, Path)):
         return [(prefix or Path(value).stem.replace("_", " ").title(), Path(value))]
     return []
+
+
+def _stage9_label_from_key(key: Any) -> str:
+    label = str(key).replace("_", " ").strip()
+    return label if any(char.isupper() for char in label) else label.title()
+
+
+def _stage9_path_identity(path: str | Path) -> str:
+    path = Path(path)
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
+def _unique_stage9_label(label: str, existing: Mapping[str, Any]) -> str:
+    base = str(label).strip() or "Figure"
+    if base not in existing:
+        return base
+    idx = 2
+    while f"{base} {idx}" in existing:
+        idx += 1
+    return f"{base} {idx}"
+
+
+def _cached_stage9_figure_label(path: Path, cfg: PipelineConfig) -> str:
+    stem = path.stem
+    mode_suffix = f"_{cfg.mode}"
+    if stem.endswith(mode_suffix):
+        stem = stem[: -len(mode_suffix)]
+    if stem.startswith("umap_selected_tribes_"):
+        return "UMAP 2D Customer Map"
+    if stem.startswith("pca_selected_tribes_"):
+        return "PCA 2D Customer Map"
+    label = stem.replace("_", " ").title()
+    for old, new in {
+        "Pca": "PCA",
+        "Umap": "UMAP",
+        "Html": "HTML",
+        "2D": "2D",
+        "Vs": "Vs",
+    }.items():
+        label = label.replace(old, new)
+    return label
 
 
 def _stage9_purpose_for_label(label: str, tier: str) -> str:
@@ -624,7 +747,8 @@ def _stage9_storyboard_html(
     mission_preview = _mission_story_preview(missions)
     core_sizes = _stage9_manifest_href(manifest, "Core Tribe Sizes")
     provenance = _stage9_manifest_href(manifest, "Assignment Provenance")
-    customer_map = _stage9_manifest_href(manifest, "Selected 2D Customer Map")
+    umap_customer_map = _stage9_manifest_href(manifest, "UMAP 2D Customer Map")
+    pca_customer_map = _stage9_manifest_href(manifest, "PCA 2D Customer Map")
     mission_overview = _stage9_manifest_href(manifest, "Shopping Mission Overview")
     mission_heatmap = _stage9_manifest_href(manifest, "Core Mission Lift Heatmap")
     atlas = _stage9_manifest_href(manifest, "03 Clustering atlas")
@@ -686,7 +810,8 @@ a:hover {{ text-decoration: underline; }}
 <div class="visual-grid">
 {_stage9_visual_card("Core tribe size", core_sizes, "Shows the organic tribe count and customer distribution.")}
 {_stage9_visual_card("Assignment confidence", provenance, "Separates HDBSCAN core customers from soft-assigned coverage.")}
-{_stage9_visual_card("Selected 2D customer map", customer_map, "Visual review of the chosen segmentation in reduced feature space.")}
+{_stage9_visual_card("UMAP 2D customer map", umap_customer_map, "Visual review aid for local neighborhood structure; not an automatic model winner.")}
+{_stage9_visual_card("PCA 2D customer map", pca_customer_map, "Linear projection baseline for comparing whether the selected tribes remain readable.")}
 {_stage9_visual_card("Shopping mission overview", mission_overview, "Shows the size and confidence of each mission audience.")}
 {_stage9_visual_card("Mission concentration by core tribe", mission_heatmap, "Shows which missions are genuinely concentrated in which organic tribes.")}
 </div>
