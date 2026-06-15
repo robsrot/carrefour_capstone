@@ -49,7 +49,7 @@ word2vec:
   full_basket_context: true
   min_count: 10
   negative: 10
-  sample: 0.001
+  sample: 0.0005
   epochs: 5
   sg: 1
   workers: 1
@@ -67,6 +67,7 @@ embedding_validation:
 customer_embeddings:
   output: customer_embeddings.parquet
   weight_strategy: quantity
+  normalize_vectors: true
 
 behavioral_features:
   output: customer_behavior_features.parquet

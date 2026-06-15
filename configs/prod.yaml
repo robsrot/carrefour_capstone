@@ -6,9 +6,9 @@ experiments:
   enabled: false
 
 word2vec:
-  vector_size: 64
+  vector_size: 128
   epochs: 5
-  workers: 1
+  workers: 5
 
 modeling:
   evaluation_sample_size: 50000
