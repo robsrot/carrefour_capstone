@@ -44,7 +44,7 @@ baskets:
   output: basket_sentences.parquet
 
 word2vec:
-  vector_size: 100
+  vector_size: 128
   window: 5
   full_basket_context: true
   min_count: 10
@@ -103,6 +103,38 @@ official_model_suite:
   include_umap_hdbscan: true
   include_autoencoder: false
   include_pca_kmeans: true
+  gmm:
+    components_min: 10
+    components_max: 10
+  pca_kmeans:
+    pca:
+      n_components: 24
+    kmeans:
+      k_min: 10
+      k_max: 10
+  umap_hdbscan:
+    promoted_from_experiment: experiment_8_dimensionality_reduction_master_search
+    trial_name: u10_n75_leaf_mcs400_soft_q95
+    model_name: model_b_umap_hdbscan_soft
+    output_prefix: model_b_umap_hdbscan_soft
+    algorithm_name: UMAP_HDBSCAN_SoftNoiseAssignment
+    feature_space: umap_customer_embeddings_u10_n75_leaf_mcs400
+    variant_prefix: u10_n75_leaf_mcs400
+    umap:
+      output: feature_set_umap_u10_n75_leaf_mcs400.parquet
+      n_components: 10
+      n_neighbors: 75
+      min_dist: 0.0
+      metric: cosine
+      standardize_input: false
+      low_memory: true
+      n_jobs: 1
+    hdbscan:
+      min_cluster_size: 400
+      min_samples: 1
+      cluster_selection_method: leaf
+      allow_noise_assignment: true
+      noise_assignment_strategy: q95
 
 stability:
   sample_size: 10000
@@ -154,16 +186,28 @@ kmeans:
 profiling:
   top_n_products: 15
   top_n_sectors: 10
+  top_n_themes: 8
+  top_n_terms: 10
   min_product_customers: 10
+  min_term_customers: 20
+  min_term_population_customers: 30
+  min_subsegment_coverage: 0.01
+  max_terms_per_product: 18
   strong_product_lift_threshold: 1.5
   strong_sector_lift_threshold: 1.2
+  strong_theme_lift_threshold: 1.2
+  strong_term_lift_threshold: 1.25
   output_parquet: tribe_profiles.parquet
   output_csv_template: tribe_profiles_{mode}.csv
 
 exports:
   assignments_template: customer_tribe_assignments_{mode}.parquet
   model_comparison_template: model_comparison_{mode}.csv
+  cluster_summary_template: cluster_summary_{mode}.csv
+  tribe_comparison_template: tribe_side_by_side_{mode}.csv
+  clustering_atlas_template: clustering_atlas_{mode}.html
   decision_log_template: decision_log_{mode}.md
+  profile_report_template: tribe_profile_evidence_{mode}.md
 
 visualization:
   max_scatter_points: 50000
@@ -174,3 +218,7 @@ visualization:
     metric: cosine
     standardize_input: false
     n_jobs: 1
+  interactive:
+    max_points: 5000
+    projection_method: pca
+    include_plotlyjs: true

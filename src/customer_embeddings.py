@@ -40,13 +40,6 @@ def _base_weight_expression(columns: set[str], strategy: str = "quantity") -> pl
     )
 
 
-def _weight_expression(columns: set[str], strategy: str = "quantity") -> pl.Expr:
-    base = _base_weight_expression(columns, strategy)
-    if _uses_idf(strategy):
-        return (base * pl.col("_idf_weight")).alias("_weight")
-    return base
-
-
 def _product_idf_weights(base_lf: pl.LazyFrame) -> pl.LazyFrame:
     total_customers = int(collect_streaming(base_lf.select(pl.col("cliente").n_unique().alias("n_customers")))[0, 0])
     return (
@@ -136,10 +129,35 @@ def build_customer_embeddings(
 
         needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in columns else [])
         base_lf = lf.select(needed)
-        joined = base_lf.join(embedding_lf, on="idarticu", how="inner")
+        log_event(
+            "Stage 4 customer embeddings",
+            "pre-aggregating transaction weights by customer-product",
+            cfg=cfg,
+        )
+        customer_product_weights = (
+            base_lf.with_columns(_base_weight_expression(columns, selected_weight_strategy))
+            .group_by(["cliente", "idarticu"])
+            .agg(pl.col("_weight").sum().cast(pl.Float64).alias("_weight"))
+        )
         if _uses_idf(selected_weight_strategy):
-            joined = joined.join(_product_idf_weights(base_lf), on="idarticu", how="left")
-        joined = joined.with_columns(_weight_expression(columns, selected_weight_strategy))
+            log_event(
+                "Stage 4 customer embeddings",
+                "applying product IDF weights to customer-product rows",
+                cfg=cfg,
+            )
+            customer_product_weights = (
+                customer_product_weights.join(_product_idf_weights(base_lf), on="idarticu", how="left")
+                .with_columns((pl.col("_weight") * pl.col("_idf_weight")).alias("_weight"))
+                .drop("_idf_weight")
+            )
+
+        log_event(
+            "Stage 4 customer embeddings",
+            "joining compressed customer-product weights to product vectors",
+            cfg=cfg,
+            vector_dims=len(emb_cols),
+        )
+        joined = customer_product_weights.join(embedding_lf, on="idarticu", how="inner")
 
         weight_sum = pl.col("_weight").sum()
         agg_exprs = [
@@ -155,6 +173,7 @@ def build_customer_embeddings(
             ]
         )
 
+        log_event("Stage 4 customer embeddings", "collecting weighted customer vectors", cfg=cfg)
         result = collect_streaming(joined.group_by("cliente").agg(agg_exprs).sort("cliente"))
         if normalize_vectors:
             result = _normalize_embedding_columns(result, emb_cols)

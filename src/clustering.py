@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.evaluation import evaluate_labels, quality_gate_result
+from src.evaluation import cluster_size_summary, evaluate_labels, quality_gate_result
 from src.progress import log_event, stage_timer
 from src.utils import (
     deterministic_sample_indices,
@@ -53,13 +53,20 @@ def _assignment_frame(
     probabilities: np.ndarray | None,
     model_name: str,
     model_variant: str,
-    assignment_confidence_type: str | None = None,
-    assignment_source: str = "model_predict",
+    assignment_confidence_type: str | list[str | None] | np.ndarray | None = None,
+    assignment_confidence_score: np.ndarray | list[float | None] | None = None,
+    assignment_source: str | list[str] | np.ndarray = "model_predict",
 ) -> pl.DataFrame:
     if probabilities is None:
         probability_values = [None] * len(clientes)
     else:
         probability_values = np.asarray(probabilities).astype(np.float32)
+    if assignment_confidence_score is None:
+        confidence_score_values = probability_values if probabilities is not None else [None] * len(clientes)
+    else:
+        confidence_score_values = _as_repeated_column(assignment_confidence_score, len(clientes))
+    confidence_values = _as_repeated_column(assignment_confidence_type, len(clientes))
+    source_values = _as_repeated_column(assignment_source, len(clientes))
     return pl.DataFrame(
         {
             "cliente": clientes,
@@ -67,10 +74,19 @@ def _assignment_frame(
             "model_name": [model_name] * len(clientes),
             "model_variant": [model_variant] * len(clientes),
             "assignment_probability": probability_values,
-            "assignment_confidence_type": [assignment_confidence_type] * len(clientes),
-            "assignment_source": [assignment_source] * len(clientes),
+            "assignment_confidence_score": confidence_score_values,
+            "assignment_confidence_type": confidence_values,
+            "assignment_source": source_values,
         }
     ).sort("cliente")
+
+
+def _as_repeated_column(value: Any, n_rows: int) -> list[Any]:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, list):
+        return value
+    return [value] * n_rows
 
 
 def _fit_indices(n_rows: int, cfg: PipelineConfig) -> np.ndarray:
@@ -87,6 +103,86 @@ def _fit_sklearn_hdbscan_full(X: np.ndarray, cfg: PipelineConfig) -> tuple[Any, 
     )
     labels = model.fit_predict(X)
     return model, np.asarray(labels).astype(np.int32)
+
+
+def _soft_assign_noise_labels(
+    X: np.ndarray,
+    labels: np.ndarray,
+    strategy: str = "q95",
+) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray]:
+    confidence_scores = np.full(labels.shape[0], np.nan, dtype=np.float32)
+    valid_labels = sorted(int(label) for label in np.unique(labels) if label >= 0)
+    if not valid_labels or not np.any(labels < 0):
+        return labels.astype(np.int32, copy=True), np.zeros(labels.shape[0], dtype=bool), None, confidence_scores
+
+    centroids = np.vstack([X[labels == label].mean(axis=0) for label in valid_labels]).astype(np.float32)
+    valid_indices = np.where(labels >= 0)[0]
+    valid_label_to_idx = {label: idx for idx, label in enumerate(valid_labels)}
+    own_centroid_idx = np.array([valid_label_to_idx[int(label)] for label in labels[valid_indices]], dtype=np.int32)
+    own_distances = np.linalg.norm(X[valid_indices] - centroids[own_centroid_idx], axis=1)
+
+    threshold = None
+    if strategy.startswith("q"):
+        quantile = float(strategy[1:]) / 100.0
+        threshold = float(np.quantile(own_distances, quantile))
+    elif strategy != "all":
+        raise ValueError(f"Unsupported soft assignment strategy: {strategy}")
+
+    noise_indices = np.where(labels < 0)[0]
+    distances = np.linalg.norm(X[noise_indices, None, :] - centroids[None, :, :], axis=2)
+    nearest_centroid_idx = np.argmin(distances, axis=1)
+    nearest_distances = distances[np.arange(distances.shape[0]), nearest_centroid_idx]
+    assign_mask = np.ones(noise_indices.shape[0], dtype=bool)
+    if threshold is not None:
+        assign_mask = nearest_distances <= threshold
+
+    assigned_noise_indices = noise_indices[assign_mask]
+    soft_labels = labels.astype(np.int32, copy=True)
+    soft_labels[assigned_noise_indices] = np.array(valid_labels, dtype=np.int32)[nearest_centroid_idx[assign_mask]]
+    core_distance_reference = np.sort(own_distances)
+    if core_distance_reference.size:
+        nearest_percentiles = np.searchsorted(core_distance_reference, nearest_distances, side="left") / float(
+            core_distance_reference.size
+        )
+        nearest_confidence = np.clip(1.0 - nearest_percentiles, 0.0, 1.0).astype(np.float32)
+        confidence_scores[assigned_noise_indices] = nearest_confidence[assign_mask]
+
+    assigned_mask_full = np.zeros(labels.shape[0], dtype=bool)
+    assigned_mask_full[assigned_noise_indices] = True
+    return soft_labels.astype(np.int32), assigned_mask_full, threshold, confidence_scores
+
+
+def _soft_assignment_metadata(
+    labels: np.ndarray,
+    core_probabilities: np.ndarray | None,
+    assigned_mask: np.ndarray,
+    soft_confidence_scores: np.ndarray | None,
+    base_assignment_source: str,
+    strategy: str,
+) -> tuple[np.ndarray | None, np.ndarray, list[str | None], list[str]]:
+    probability_values = None
+    confidence_score_values = np.full(len(labels), np.nan, dtype=np.float32)
+    confidence_values: list[str | None] = [None] * len(labels)
+    source_values = [base_assignment_source if int(label) >= 0 else f"hdbscan_noise_unassigned_{strategy}" for label in labels]
+
+    if core_probabilities is not None:
+        probability_values = np.asarray(core_probabilities, dtype=np.float32).copy()
+        probability_values[labels < 0] = np.nan
+        confidence_score_values = probability_values.copy()
+        for idx, label in enumerate(labels):
+            if int(label) >= 0:
+                confidence_values[idx] = "hdbscan_membership_strength"
+
+    if soft_confidence_scores is not None:
+        soft_scores = np.asarray(soft_confidence_scores, dtype=np.float32)
+        confidence_score_values[assigned_mask] = soft_scores[assigned_mask]
+    for idx in np.where(assigned_mask)[0]:
+        source_values[int(idx)] = f"nearest_centroid_soft_noise_{strategy}"
+        confidence_values[int(idx)] = f"nearest_centroid_distance_percentile_{strategy}"
+        if probability_values is not None:
+            probability_values[int(idx)] = np.nan
+
+    return probability_values, confidence_score_values, confidence_values, source_values
 
 
 def run_gmm_grid(
@@ -122,6 +218,7 @@ def run_gmm_grid(
         "gmm": cfg.get("gmm", {}),
         "modeling": cfg.get("modeling", {}),
         "quality_gates": cfg.get("quality_gates", {}),
+        "assignment_schema_version": 2,
     }
     if (
         should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
@@ -257,12 +354,20 @@ def run_hdbscan(
     output_dir: str | Path | None = None,
     model_dir: str | Path | None = None,
     force: bool | None = None,
+    allow_noise_assignment: bool | None = None,
+    noise_assignment_strategy: str | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """HDBSCAN organic tribe discovery on the supplied feature representation."""
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
+    allow_noise_assignment = (
+        bool(cfg.get("hdbscan.allow_noise_assignment", False))
+        if allow_noise_assignment is None
+        else bool(allow_noise_assignment)
+    )
+    noise_assignment_strategy = str(noise_assignment_strategy or cfg.get("hdbscan.noise_assignment_strategy", "q95"))
     model_selection_dir = Path(output_dir) if output_dir else cfg.model_selection_cache
     fitted_model_dir = Path(model_dir) if model_dir else cfg.models
     assignment_path = model_selection_dir / f"cluster_assignments_{output_prefix}.parquet"
@@ -278,10 +383,13 @@ def run_hdbscan(
         "feature_space": feature_space,
         "trial_name": trial_name,
         "scale_features": scale_features,
+        "allow_noise_assignment": allow_noise_assignment,
+        "noise_assignment_strategy": noise_assignment_strategy,
         "hdbscan": cfg.get("hdbscan", {}),
         "modeling": cfg.get("modeling", {}),
         "quality_gates": cfg.get("quality_gates", {}),
-        "hdbscan_backend_policy": "external_hdbscan_with_sklearn_full_fit_fallback",
+        "hdbscan_backend_policy": "external_hdbscan_with_sklearn_full_fit_fallback_and_optional_soft_assignment",
+        "assignment_schema_version": 2,
     }
     if (
         should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
@@ -354,6 +462,62 @@ def run_hdbscan(
 
     labels = np.asarray(labels).astype(np.int32)
     probabilities = None if probabilities is None else np.asarray(probabilities).astype(np.float32)
+    core_labels = labels.copy()
+    core_probabilities = None if probabilities is None else probabilities.copy()
+    core_summary = cluster_size_summary(core_labels)
+    assignment_confidence_type: str | list[str | None] | None = (
+        "hdbscan_membership_strength" if probabilities is not None else None
+    )
+    assignment_confidence_score: np.ndarray | list[float | None] | None = probabilities
+    assignment_sources: str | list[str] = assignment_source
+    soft_assignment_info: dict[str, Any] = {
+        "soft_assignment_strategy": None,
+        "soft_assignment_distance_threshold": None,
+        "core_noise_pct": core_summary.get("noise_pct"),
+        "core_coverage_pct": 100.0 - float(core_summary.get("noise_pct") or 0.0),
+        "soft_assigned_customers": 0,
+        "soft_assigned_pct": 0.0,
+        "soft_assignment_confidence_mean": None,
+        "soft_assignment_confidence_p10": None,
+        "soft_assignment_confidence_min": None,
+    }
+
+    if allow_noise_assignment and np.any(labels < 0) and np.unique(labels[labels >= 0]).shape[0] >= 2:
+        labels, assigned_mask, threshold, soft_confidence_scores = _soft_assign_noise_labels(
+            X,
+            labels,
+            strategy=noise_assignment_strategy,
+        )
+        probabilities, assignment_confidence_score, assignment_confidence_type, assignment_sources = _soft_assignment_metadata(
+            labels,
+            core_probabilities,
+            assigned_mask,
+            soft_confidence_scores,
+            assignment_source,
+            noise_assignment_strategy,
+        )
+        assigned_confidences = soft_confidence_scores[assigned_mask]
+        assigned_confidences = assigned_confidences[np.isfinite(assigned_confidences)]
+        soft_assignment_info.update(
+            {
+                "soft_assignment_strategy": noise_assignment_strategy,
+                "soft_assignment_distance_threshold": threshold,
+                "soft_assigned_customers": int(np.sum(assigned_mask)),
+                "soft_assigned_pct": 100.0 * float(np.sum(assigned_mask)) / max(labels.shape[0], 1),
+                "soft_assignment_confidence_mean": float(np.mean(assigned_confidences))
+                if assigned_confidences.size
+                else None,
+                "soft_assignment_confidence_p10": float(np.quantile(assigned_confidences, 0.10))
+                if assigned_confidences.size
+                else None,
+                "soft_assignment_confidence_min": float(np.min(assigned_confidences))
+                if assigned_confidences.size
+                else None,
+            }
+        )
+        if "SoftNoiseAssignment" not in algorithm_name:
+            algorithm_name = f"{algorithm_name}_SoftNoiseAssignment"
+
     metrics = evaluate_labels(X, labels, probabilities=probabilities, cfg=cfg)
     passes_gate, gate_reason = quality_gate_result(metrics, cfg=cfg)
     variant = (
@@ -362,6 +526,8 @@ def run_hdbscan(
     )
     if variant_prefix:
         variant = f"{variant_prefix}_{variant}"
+    if allow_noise_assignment and soft_assignment_info["soft_assignment_strategy"] is not None:
+        variant = f"{variant}_soft_{noise_assignment_strategy}"
     result = {
         "model": model_label,
         "model_id": model_name,
@@ -372,7 +538,9 @@ def run_hdbscan(
         "trial_name": trial_name,
         "hdbscan_backend": assignment_source,
         "scale_features": scale_features,
+        **soft_assignment_info,
         **metrics,
+        "final_noise_pct": metrics.get("noise_pct"),
         "passes_quality_gate": passes_gate,
         "quality_gate_reason": gate_reason,
         "assignment_path": str(assignment_path),
@@ -385,15 +553,26 @@ def run_hdbscan(
         probabilities,
         model_name,
         variant,
-        assignment_confidence_type="hdbscan_membership_strength" if probabilities is not None else None,
-        assignment_source=assignment_source,
+        assignment_confidence_type=assignment_confidence_type,
+        assignment_confidence_score=assignment_confidence_score,
+        assignment_source=assignment_sources,
     ).write_parquet(assignment_path)
     pl.DataFrame([result]).write_parquet(results_path)
     write_artifact_metadata(assignment_path, cache_metadata)
     write_artifact_metadata(results_path, cache_metadata)
     _save_model(
         fitted_model_dir / f"{output_prefix}_model.pkl",
-        {"model": model, "scaler": scaler, "feature_columns": feature_cols, "selection": result},
+        {
+            "model": model,
+            "scaler": scaler,
+            "feature_columns": feature_cols,
+            "selection": result,
+            "soft_assignment": {
+                "enabled": allow_noise_assignment,
+                "strategy": soft_assignment_info["soft_assignment_strategy"],
+                "distance_threshold": soft_assignment_info["soft_assignment_distance_threshold"],
+            },
+        },
     )
     log_event(
         "Stage 6 HDBSCAN",
@@ -403,6 +582,7 @@ def run_hdbscan(
         noise_pct=result["noise_pct"],
         passes_gate=passes_gate,
         source=assignment_source,
+        soft_assigned=soft_assignment_info["soft_assigned_customers"],
     )
     return assignment_path, results_path, result
 
@@ -438,6 +618,7 @@ def run_pca_kmeans_grid(
         "kmeans": cfg.get("kmeans", {}),
         "modeling": cfg.get("modeling", {}),
         "quality_gates": cfg.get("quality_gates", {}),
+        "assignment_schema_version": 2,
     }
     if (
         should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)

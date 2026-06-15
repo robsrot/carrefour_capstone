@@ -33,7 +33,9 @@ def build_model_comparison(
                 row.update(quality)
                 row["interpretability_summary"] = (
                     f"{quality['clusters_with_product_lift']}/{quality['profiled_clusters']} tribes have strong product lift; "
-                    f"{quality['clusters_with_sector_lift']}/{quality['profiled_clusters']} have sector lift."
+                    f"{quality['clusters_with_sector_lift']}/{quality['profiled_clusters']} have sector lift; "
+                    f"{quality.get('clusters_with_theme_lift', 0)}/{quality['profiled_clusters']} have theme lift; "
+                    f"avg soft-assigned share {float(quality.get('avg_soft_assigned_share') or 0.0):.2%}."
                 )
                 row["profile_path"] = str(profile_path)
             else:
@@ -179,6 +181,7 @@ def export_final_assignments(
             "model_name",
             "model_variant",
             "assignment_probability",
+            "assignment_confidence_score",
             "assignment_confidence_type",
             "assignment_source",
         ]
@@ -270,6 +273,16 @@ def write_decision_log(
         "The selected number of tribes was chosen based on empirical evaluation and interpretability, "
         "not because it matched the expected range.",
         "",
+        "## Tribe Discovery Progression",
+        "",
+        "The final segmentation should be read as a three-layer discovery process:",
+        "",
+        "1. Organic core tribes: dense product-purchase groups discovered by the clustering model without forcing every customer into a tribe.",
+        "2. Confidence-scored soft assignment: nearby non-core customers are attached for campaign usability while preserving assignment provenance and confidence.",
+        "3. Evidence-backed subtribes: within-tribe product, sector, theme, and product-term lifts explain what makes each tribe distinctive.",
+        "",
+        "Core members carry the strongest organic evidence. Soft-assigned members and subtribes are useful for activation, but should be interpreted through their confidence and lift evidence.",
+        "",
         "## Why This Model Was Selected",
         "",
         (
@@ -284,7 +297,9 @@ def write_decision_log(
         (
             f"Interpretability evidence: {selected.get('interpretability_summary')}. "
             f"Average maximum product lift was "
-            f"{_fmt_metric(profile_quality.get('avg_max_product_lift'))} where available."
+            f"{_fmt_metric(profile_quality.get('avg_max_product_lift'))} where available. "
+            f"Average strong theme lifts per tribe: "
+            f"{_fmt_metric(profile_quality.get('avg_strong_theme_lifts_per_cluster'))}."
         ),
         "",
         "## Why Alternatives Were Not Selected",
@@ -310,7 +325,9 @@ def write_decision_log(
             "- Model comparison metrics: silhouette, Davies-Bouldin, Calinski-Harabasz where available.",
             "- Cluster size balance: minimum and maximum population share, plus size dispersion.",
             "- Interpretability: product lift, sector lift, and profile completeness.",
-            "- Assignment confidence for probabilistic GMM candidates.",
+            "- Product-theme lift: strategic purchase themes derived from product descriptions.",
+            "- Assignment provenance: core HDBSCAN assignments versus q95 soft-assigned customers.",
+            "- Assignment confidence for probabilistic candidates and distance-percentile soft assignments.",
             "- Noise share for HDBSCAN candidates.",
             "- Stability evidence should be added from repeated seeds before production rollout if not already cached.",
             "",

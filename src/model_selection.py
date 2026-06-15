@@ -23,7 +23,7 @@ def run_candidate_model_suite(
     include_autoencoder: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Any]:
-    """Run the official Stage 6 candidate suite without forcing a target cluster count."""
+    """Run the curated official Stage 6 candidate suite."""
 
     candidate_results: list[dict[str, Any]] = []
     assignment_paths: dict[str, Path] = {}
@@ -31,11 +31,13 @@ def run_candidate_model_suite(
 
     with stage_timer("Stage 6 model suite", "running candidate model suite", cfg=cfg, feature_path=feature_path):
         if cfg.get("official_model_suite.include_gmm", True):
+            gmm_overrides = dict(cfg.get("official_model_suite.gmm", {}) or {})
+            gmm_cfg = _config_with_section_overrides(cfg, "gmm", gmm_overrides)
             log_event(
                 "Stage 6 model suite",
-                "starting Model A GMM search",
-                cfg=cfg,
-                components=f"{cfg.get('gmm.components_min')}-{cfg.get('gmm.components_max')}",
+                "starting Model A GMM benchmark",
+                cfg=gmm_cfg,
+                components=f"{gmm_cfg.get('gmm.components_min')}-{gmm_cfg.get('gmm.components_max')}",
             )
             assignment, results, best = run_gmm_grid(
                 feature_path,
@@ -45,7 +47,7 @@ def run_candidate_model_suite(
                 algorithm_name="GaussianMixture",
                 feature_space="raw_customer_embeddings",
                 force=force,
-                cfg=cfg,
+                cfg=gmm_cfg,
             )
             _record_candidate(candidate_results, assignment_paths, result_paths, assignment, results, best)
         else:
@@ -68,23 +70,53 @@ def run_candidate_model_suite(
             log_event("Stage 6 model suite", "raw HDBSCAN diagnostic disabled", cfg=cfg)
 
         if cfg.get("official_model_suite.include_umap_hdbscan", True) and cfg.get("umap.enabled", True):
-            log_event("Stage 6 model suite", "starting Model B UMAP-HDBSCAN representation", cfg=cfg)
-            umap_path = build_umap_representation(feature_path, force=force, cfg=cfg)
-            log_event("Stage 6 model suite", "starting Model B UMAP-HDBSCAN clustering", cfg=cfg)
+            promoted = cfg.get("official_model_suite.umap_hdbscan", {}) or {}
+            hdbscan_overrides = dict(promoted.get("hdbscan", {}) or {})
+            umap_overrides = dict(promoted.get("umap", {}) or {})
+            trial_cfg = _config_with_section_overrides(cfg, "hdbscan", hdbscan_overrides)
+            trial_name = str(promoted.get("trial_name", "official"))
+            model_name = str(promoted.get("model_name", "model_b_umap_hdbscan"))
+            output_prefix = str(promoted.get("output_prefix", model_name))
+            algorithm_name = str(promoted.get("algorithm_name", "UMAP_HDBSCAN"))
+            variant_prefix = promoted.get("variant_prefix", "umap")
+            feature_space = str(promoted.get("feature_space", "umap_customer_embeddings"))
+            allow_noise_assignment = bool(hdbscan_overrides.get("allow_noise_assignment", False))
+            noise_assignment_strategy = str(hdbscan_overrides.get("noise_assignment_strategy", "q95"))
+
+            log_event(
+                "Stage 6 model suite",
+                "starting Model B UMAP-HDBSCAN representation",
+                cfg=trial_cfg,
+                trial=trial_name,
+                components=umap_overrides.get("n_components", trial_cfg.get("umap.n_components")),
+                n_neighbors=umap_overrides.get("n_neighbors", trial_cfg.get("umap.n_neighbors")),
+            )
+            umap_path = build_umap_representation(feature_path, umap_overrides=umap_overrides, force=force, cfg=trial_cfg)
+            log_event(
+                "Stage 6 model suite",
+                "starting Model B UMAP-HDBSCAN clustering",
+                cfg=trial_cfg,
+                trial=trial_name,
+                soft_assignment=allow_noise_assignment,
+                strategy=noise_assignment_strategy if allow_noise_assignment else None,
+            )
             assignment, results, best = run_hdbscan(
                 umap_path,
-                output_prefix="model_b_umap_hdbscan",
+                output_prefix=output_prefix,
                 model_label="Model B",
-                model_name="model_b_umap_hdbscan",
-                algorithm_name="UMAP_HDBSCAN",
-                feature_space="umap_customer_embeddings",
-                trial_name="official",
-                variant_prefix="umap",
+                model_name=model_name,
+                algorithm_name=algorithm_name,
+                feature_space=feature_space,
+                trial_name=trial_name,
+                variant_prefix=str(variant_prefix) if variant_prefix else None,
                 scale_features=False,
                 force=force,
-                cfg=cfg,
+                allow_noise_assignment=allow_noise_assignment,
+                noise_assignment_strategy=noise_assignment_strategy,
+                cfg=trial_cfg,
             )
-            best["trial_name"] = "official"
+            best["trial_name"] = trial_name
+            best["promoted_from_experiment"] = promoted.get("promoted_from_experiment")
             _record_candidate(candidate_results, assignment_paths, result_paths, assignment, results, best)
         elif cfg.get("official_model_suite.include_umap_hdbscan", True):
             log_event("Stage 6 model suite", "Model B UMAP-HDBSCAN disabled because UMAP is disabled", cfg=cfg)
@@ -117,11 +149,22 @@ def run_candidate_model_suite(
             log_event("Stage 6 model suite", "autoencoder candidates disabled", cfg=cfg)
 
         if cfg.get("official_model_suite.include_pca_kmeans", True):
+            pca_kmeans_overrides = cfg.get("official_model_suite.pca_kmeans", {}) or {}
+            pca_kmeans_cfg = _config_with_section_overrides(
+                cfg,
+                "pca",
+                dict(pca_kmeans_overrides.get("pca", {}) or {}),
+            )
+            pca_kmeans_cfg = _config_with_section_overrides(
+                pca_kmeans_cfg,
+                "kmeans",
+                dict(pca_kmeans_overrides.get("kmeans", {}) or {}),
+            )
             log_event(
                 "Stage 6 model suite",
-                "starting Model C PCA-KMeans search",
-                cfg=cfg,
-                clusters=f"{cfg.get('kmeans.k_min')}-{cfg.get('kmeans.k_max')}",
+                "starting Model C PCA-KMeans benchmark",
+                cfg=pca_kmeans_cfg,
+                clusters=f"{pca_kmeans_cfg.get('kmeans.k_min')}-{pca_kmeans_cfg.get('kmeans.k_max')}",
             )
             assignment, results, best = run_pca_kmeans_grid(
                 feature_path,
@@ -130,7 +173,7 @@ def run_candidate_model_suite(
                 model_name="model_c_pca_kmeans",
                 algorithm_name="PCA_MiniBatchKMeans",
                 force=force,
-                cfg=cfg,
+                cfg=pca_kmeans_cfg,
             )
             _record_candidate(candidate_results, assignment_paths, result_paths, assignment, results, best)
         else:

@@ -2,10 +2,10 @@ experiments:
   enabled: true
 
 word2vec:
-  vector_size: 100
+  vector_size: 128
   sample: 0.0005
-  epochs: 3
-  workers: 1
+  epochs: 5
+  workers: 5
 
 customer_embeddings:
   weight_strategy: quantity
