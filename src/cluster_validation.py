@@ -104,6 +104,7 @@ def build_cluster_validity_stability_report(
             "validity_note",
         ],
         cfg=cfg,
+        write_markdown=bool(cfg.get("model_selection.write_summary_markdown", True)),
     )
     log_event("Cluster validity", "wrote validity and stability report", cfg=cfg, path=output)
     return {"parquet": output, **summaries}

@@ -2,14 +2,7 @@ experiments:
   enabled: true
 
 word2vec:
-  vector_size: 128
-  sample: 0.0005
-  epochs: 5
   workers: 5
-
-customer_embeddings:
-  weight_strategy: quantity
-  normalize_vectors: true
 
 modeling:
   evaluation_sample_size: 12000
@@ -24,10 +17,6 @@ hdbscan:
   min_samples: 1
   cluster_selection_method: leaf
 
-umap:
-  n_components: 20
-  n_neighbors: 30
-
 autoencoder:
   epochs: 12
   batch_size: 512
@@ -35,6 +24,3 @@ autoencoder:
 
 pca:
   n_components: 24
-
-kmeans:
-  batch_size: 4096

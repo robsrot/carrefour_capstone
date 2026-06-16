@@ -304,6 +304,100 @@ def plot_basket_summary(
     return path
 
 
+def plot_basket_staple_diagnostics(
+    product_diagnostics_path: str | Path,
+    basket_exposure_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Visualize common-product candidates and basket exposure from Stage 1."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage1_common_product_diagnostics.png"
+    products = pl.read_parquet(product_diagnostics_path)
+    exposure = pl.read_parquet(basket_exposure_path)
+    if products.is_empty():
+        raise ValueError(f"No product diagnostics found in {product_diagnostics_path}")
+    if exposure.is_empty():
+        raise ValueError(f"No basket exposure rows found in {basket_exposure_path}")
+
+    customer_threshold = float(cfg.get("baskets.diagnostics.common_customer_penetration_threshold", 0.01))
+    basket_threshold = float(cfg.get("baskets.diagnostics.common_basket_penetration_threshold", 0.005))
+    common = products.filter(pl.col("common_product_candidate"))
+    top_common = common.sort("commonness_score", descending=True).head(15)
+    if top_common.is_empty():
+        top_common = products.sort("commonness_score", descending=True).head(15)
+
+    customer_penetration = products["customer_penetration"].to_numpy().astype(float) * 100.0
+    basket_penetration = products["basket_penetration"].to_numpy().astype(float) * 100.0
+    exposure_share = exposure["common_product_candidate_share"].to_numpy().astype(float) * 100.0
+    clip_max = max(0.01, float(np.nanpercentile(customer_penetration, 99.5)))
+    clipped_customer_penetration = np.clip(customer_penetration, 0, clip_max)
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9), gridspec_kw={"height_ratios": [1.0, 1.15]})
+    ax_product_hist, ax_top, ax_exposure, ax_summary = axes.ravel()
+
+    ax_product_hist.hist(clipped_customer_penetration, bins=40, color=_color("secondary"), alpha=0.85)
+    ax_product_hist.axvline(customer_threshold * 100.0, color=_color("warning"), linestyle="--", linewidth=1.8)
+    ax_product_hist.set_title("Product Customer Penetration")
+    ax_product_hist.set_xlabel("Customers buying product (%)")
+    ax_product_hist.set_ylabel("Products")
+    ax_product_hist.grid(axis="y", alpha=0.25)
+    ax_product_hist.text(
+        0.98,
+        0.95,
+        f"clipped at p99.5 = {clip_max:.2f}%",
+        ha="right",
+        va="top",
+        transform=ax_product_hist.transAxes,
+        fontsize=9,
+        color=_color("subtle_text"),
+    )
+
+    labels = [
+        shorten(str(row.get("product_description") or row.get("idarticu")), width=38, placeholder="...")
+        for row in top_common.iter_rows(named=True)
+    ]
+    scores = top_common["commonness_score"].to_numpy().astype(float)
+    y_pos = np.arange(len(labels))
+    ax_top.barh(y_pos, scores, color=_color("primary"), alpha=0.88)
+    ax_top.set_yticks(y_pos)
+    ax_top.set_yticklabels(labels, fontsize=8)
+    ax_top.invert_yaxis()
+    ax_top.set_title("Top Common-Product Candidates")
+    ax_top.set_xlabel("Commonness score")
+    ax_top.grid(axis="x", alpha=0.25)
+
+    ax_exposure.hist(exposure_share, bins=30, color=_color("accent"), alpha=0.85)
+    ax_exposure.set_title("Common-Product Share Per Basket")
+    ax_exposure.set_xlabel("Common-product candidates / unique products (%)")
+    ax_exposure.set_ylabel("Baskets")
+    ax_exposure.grid(axis="y", alpha=0.25)
+
+    summary_lines = [
+        f"Products reviewed: {products.height:,}",
+        f"Common-product candidates: {common.height:,}",
+        f"Customer threshold: {customer_threshold * 100:.2f}%",
+        f"Basket threshold: {basket_threshold * 100:.2f}%",
+        f"Avg basket exposure: {float(np.nanmean(exposure_share)):.1f}%",
+        f"Median basket exposure: {float(np.nanmedian(exposure_share)):.1f}%",
+        f"P90 basket exposure: {float(np.nanpercentile(exposure_share, 90)):.1f}%",
+        f"Max product customer penetration: {float(np.nanmax(customer_penetration)):.2f}%",
+        f"Max product basket penetration: {float(np.nanmax(basket_penetration)):.2f}%",
+    ]
+    ax_summary.text(0.02, 0.96, "\n".join(summary_lines), va="top", ha="left", fontsize=12)
+    ax_summary.set_title("Stage 1 Staple-Clouding Check")
+    ax_summary.axis("off")
+
+    fig.suptitle("Stage 1 Common-Product Diagnostics", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    path = _save_figure(fig, output, cfg, "Stage 1 figures", "wrote common-product diagnostics")
+    plt.close(fig)
+    return path
+
+
 def plot_product_embedding_diagnostics(
     embeddings_path: str | Path,
     output_path: str | Path | None = None,
@@ -392,6 +486,193 @@ def plot_embedding_validation_summary(
     path = _save_figure(fig, output, cfg, "Stage 3 figures", "wrote embedding validation summary")
     plt.close(fig)
     return path
+
+
+def _validation_group_mask(pdf, group_name: str):
+    return pdf["sample_group"].fillna("").astype(str).str.split(";").apply(lambda groups: group_name in groups)
+
+
+def _validation_group_metrics(pdf, group_name: str, label: str) -> dict[str, Any]:
+    subset = pdf.loc[_validation_group_mask(pdf, group_name)]
+    if subset.empty:
+        return {
+            "group": label,
+            "sampled_products": 0,
+            "mean_cosine": 0.0,
+            "same_sector_share": 0.0,
+            "generic_neighbor_share": 0.0,
+            "warning_products": 0,
+        }
+    return {
+        "group": label,
+        "sampled_products": int(subset["product_id"].nunique()),
+        "mean_cosine": float(subset["cosine_similarity"].astype(float).mean()),
+        "same_sector_share": float(subset["same_sector"].astype(float).mean() * 100.0),
+        "generic_neighbor_share": float(subset["neighbor_is_generic_staple"].astype(float).mean() * 100.0),
+        "warning_products": int(subset.loc[subset["generic_neighbor_warning"].astype(bool), "product_id"].nunique()),
+    }
+
+
+def plot_embedding_validation_quality_extracts(
+    validation_csv: str | Path,
+    output_dir: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    """Extract stricter Stage 3 validation checks into standalone figures."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    figure_dir = Path(output_dir) if output_dir else cfg.figures
+    report = pl.read_csv(validation_csv)
+    if report.height == 0:
+        raise ValueError(f"No validation rows found in {validation_csv}")
+    pdf = report.to_pandas()
+    required = {
+        "sample_group",
+        "product_id",
+        "cosine_similarity",
+        "same_sector",
+        "neighbor_is_generic_staple",
+        "generic_neighbor_warning",
+        "query_generic_neighbor_share",
+        "product_description",
+        "product_sector",
+        "product_basket_penetration",
+    }
+    missing = required.difference(pdf.columns)
+    if missing:
+        raise ValueError(f"Validation CSV is missing Stage 3 extract columns: {sorted(missing)}")
+
+    paths: dict[str, Path] = {}
+
+    frequency_rows = [
+        _validation_group_metrics(pdf, "common_frequency", "Common"),
+        _validation_group_metrics(pdf, "rare_frequency", "Rare"),
+    ]
+    labels = [row["group"] for row in frequency_rows]
+    x = np.arange(len(labels))
+    width = 0.24
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x - width, [row["mean_cosine"] for row in frequency_rows], width, label="Mean cosine", color=_color("primary"))
+    ax.bar(
+        x,
+        [row["same_sector_share"] / 100.0 for row in frequency_rows],
+        width,
+        label="Same-sector share",
+        color=_color("secondary"),
+    )
+    ax.bar(
+        x + width,
+        [row["generic_neighbor_share"] / 100.0 for row in frequency_rows],
+        width,
+        label="Generic-neighbor share",
+        color=_color("warning"),
+    )
+    ax.set_title("Stage 3 Common vs Rare Neighbor Quality")
+    ax.set_xticks(x, labels)
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel("Share / cosine")
+    for idx, row in enumerate(frequency_rows):
+        ax.text(idx, 1.02, f"n={row['sampled_products']}", ha="center", va="bottom", fontsize=9)
+    ax.legend(loc="upper right")
+    ax.grid(axis="y", alpha=0.25)
+    fig.tight_layout()
+    paths["common_vs_rare"] = _save_figure(
+        fig,
+        figure_dir / "stage3_embedding_validation_common_vs_rare.png",
+        cfg,
+        "Stage 3 figures",
+        "wrote common-vs-rare embedding validation extract",
+    )
+    plt.close(fig)
+
+    category_names = []
+    for value in pdf["sample_group"].fillna("").astype(str):
+        for group in value.split(";"):
+            if group.startswith("category_") and group not in category_names:
+                category_names.append(group)
+    category_rows = [
+        _validation_group_metrics(pdf, group, group.removeprefix("category_").replace("_", " ").title())
+        for group in category_names
+    ]
+    if category_rows:
+        y = np.arange(len(category_rows))
+        fig, ax = plt.subplots(figsize=(10, max(5, 0.45 * len(category_rows) + 2)))
+        ax.barh(
+            y - 0.16,
+            [row["same_sector_share"] for row in category_rows],
+            0.32,
+            label="Same-sector share",
+            color=_color("secondary"),
+        )
+        ax.barh(
+            y + 0.16,
+            [row["generic_neighbor_share"] for row in category_rows],
+            0.32,
+            label="Generic-neighbor share",
+            color=_color("warning"),
+        )
+        ax.set_yticks(y, [row["group"] for row in category_rows])
+        ax.set_xlim(0, 115)
+        ax.set_xlabel("Neighbor share (%)")
+        ax.set_title("Stage 3 Data-Selected Niche Theme Quality")
+        for idx, row in enumerate(category_rows):
+            ax.text(101, idx, f"n={row['sampled_products']} warn={row['warning_products']}", va="center", fontsize=8)
+        ax.legend(loc="lower right")
+        ax.grid(axis="x", alpha=0.25)
+        fig.tight_layout()
+    else:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No configured niche-category samples were present.", ha="center", va="center")
+    paths["niche_categories"] = _save_figure(
+        fig,
+        figure_dir / "stage3_embedding_validation_niche_categories.png",
+        cfg,
+        "Stage 3 figures",
+        "wrote niche-category embedding validation extract",
+    )
+    plt.close(fig)
+
+    warnings = (
+        pdf.loc[pdf["generic_neighbor_warning"].astype(bool)]
+        .sort_values(["query_generic_neighbor_share", "product_basket_penetration"], ascending=[False, True])
+        .drop_duplicates(subset=["product_id"])
+        .head(12)
+    )
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.45 * max(len(warnings), 1) + 2)))
+    if warnings.empty:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No generic-neighbor warnings in this Stage 3 validation run.", ha="center", va="center")
+    else:
+        labels = [
+            shorten(str(row.product_description or row.product_id), width=42, placeholder="...")
+            for row in warnings.itertuples()
+        ]
+        y = np.arange(len(warnings))
+        values = warnings["query_generic_neighbor_share"].astype(float).to_numpy() * 100.0
+        ax.barh(y, values, color=_color("warning"), alpha=0.85)
+        ax.set_yticks(y, labels)
+        ax.invert_yaxis()
+        ax.set_xlim(0, 100)
+        ax.set_xlabel("Generic-neighbor share (%)")
+        ax.set_title("Stage 3 Generic Neighbor Warnings")
+        for idx, row in enumerate(warnings.itertuples()):
+            sector = shorten(str(row.product_sector or "Unknown"), width=22, placeholder="...")
+            ax.text(min(values[idx] + 1, 98), idx, sector, va="center", fontsize=8)
+        ax.grid(axis="x", alpha=0.25)
+    fig.tight_layout()
+    paths["generic_warnings"] = _save_figure(
+        fig,
+        figure_dir / "stage3_embedding_validation_generic_warnings.png",
+        cfg,
+        "Stage 3 figures",
+        "wrote generic-neighbor warning extract",
+    )
+    plt.close(fig)
+
+    return paths
 
 
 def plot_customer_embedding_diagnostics(
@@ -937,7 +1218,7 @@ def plot_tribe_vs_population_evidence_dashboard(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / "presentation" / f"stage8_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"
+        else cfg.figures / f"stage_08_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"
     )
     if profiles.is_empty():
         fig, ax = plt.subplots(figsize=(10, 4))
@@ -1170,7 +1451,7 @@ def plot_tribe_theme_lift_heatmap(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / "presentation" / f"stage8_tribe_theme_lift_heatmap_{cfg.mode}.png"
+        else cfg.figures / f"stage_08_tribe_theme_lift_heatmap_{cfg.mode}.png"
     )
     if profiles.is_empty():
         fig, ax = plt.subplots(figsize=(10, 4))
@@ -1253,7 +1534,7 @@ def plot_mission_microtribe_overview(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / "presentation" / f"stage9_shopping_mission_overview_{cfg.mode}.png"
+        else cfg.figures / f"stage_09_shopping_mission_overview_{cfg.mode}.png"
     )
     summary = pl.read_csv(mission_summary_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1333,7 +1614,7 @@ def plot_core_mission_lift_heatmap(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / "presentation" / f"stage9_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"
+        else cfg.figures / f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1526,7 +1807,7 @@ def plot_top_lifts(
 
     cfg.ensure_directories()
     profiles = pl.read_parquet(profile_path)
-    out_dir = Path(output_dir) if output_dir else cfg.figures / "tribe_lifts"
+    out_dir = Path(output_dir) if output_dir else cfg.figures
     out_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for row in profiles.iter_rows(named=True):
@@ -2037,6 +2318,7 @@ def build_2d_projection_figures(
     feature_path: str | Path,
     assignments_path: str | Path,
     output_dir: str | Path | None = None,
+    output_prefix: str | None = None,
     stage_label: str = "Stage 8 figures",
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
@@ -2063,13 +2345,14 @@ def build_2d_projection_figures(
         labels = sampled["tribe_id"].to_numpy()
 
         stem = Path(assignments_path).stem.replace("cluster_assignments_", "")
+        prefix = output_prefix or f"selected_tribes_{stem}"
         outputs: dict[str, Path] = {}
         pca = PCA(n_components=2, random_state=int(cfg.get("visualization.random_state", cfg.random_seed)))
         coords = pca.fit_transform(X)
         outputs["pca"] = _scatter(
             coords,
             labels,
-            out_dir / f"pca_selected_tribes_{stem}.png",
+            out_dir / f"{prefix}_pca.png",
             f"PCA Selected Tribes - {stem}",
             allocation_summary,
         )
@@ -2079,7 +2362,7 @@ def build_2d_projection_figures(
             outputs["umap"] = _scatter(
                 coords,
                 labels,
-                out_dir / f"umap_selected_tribes_{stem}.png",
+                out_dir / f"{prefix}_umap.png",
                 f"UMAP Selected Tribes - {stem}",
                 allocation_summary,
             )

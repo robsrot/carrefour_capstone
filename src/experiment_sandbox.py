@@ -12,7 +12,7 @@ import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.customer_embeddings import build_customer_embeddings
+from src.customer_embeddings import build_customer_embeddings, evaluate_customer_embedding_weight_profile
 from src.data_loader import load_prepared_transactions
 from src.experiment_reporting import write_summary_artifacts
 from src.item2vec import save_product_embeddings, train_item2vec
@@ -314,6 +314,11 @@ def run_customer_embedding_experiments(
         for trial in selected_trials:
             trial_name = _trial_slug(str(trial.get("name", "trial")))
             weight_strategy = str(trial.get("weight_strategy", "quantity"))
+            quantity_transform = str(trial.get("quantity_transform", cfg.get("customer_embeddings.quantity_transform", "raw")))
+            max_customer_product_weight = trial.get(
+                "max_customer_product_weight",
+                cfg.get("customer_embeddings.max_customer_product_weight", None),
+            )
             normalize_vectors = bool(trial.get("normalize_vectors", False))
             output_path = experiment_dir / f"{trial_name}_customer_embeddings.parquet"
 
@@ -324,6 +329,8 @@ def run_customer_embedding_experiments(
                 experiment=experiment_slug,
                 trial=trial_name,
                 weight_strategy=weight_strategy,
+                quantity_transform=quantity_transform,
+                max_customer_product_weight=max_customer_product_weight,
                 normalize_vectors=normalize_vectors,
             )
             customer_path = build_customer_embeddings(
@@ -331,15 +338,26 @@ def run_customer_embedding_experiments(
                 transactions=transactions,
                 output_path=output_path,
                 weight_strategy=weight_strategy,
+                quantity_transform=quantity_transform,
+                max_customer_product_weight=max_customer_product_weight,
                 normalize_vectors=normalize_vectors,
                 force=force,
                 cfg=cfg,
             )
             customer_embedding_paths[trial_name] = customer_path
+            weight_profile = evaluate_customer_embedding_weight_profile(
+                transactions=transactions,
+                weight_strategy=weight_strategy,
+                quantity_transform=quantity_transform,
+                max_customer_product_weight=max_customer_product_weight,
+                normalize_vectors=normalize_vectors,
+                cfg=cfg,
+            )
             metrics = evaluate_customer_embedding_quality(
                 customer_path,
                 trial_name=trial_name,
                 sample_size=sample_size,
+                weight_profile=weight_profile,
                 cfg=cfg,
             )
             metrics.update(
@@ -347,6 +365,8 @@ def run_customer_embedding_experiments(
                     "experiment_name": experiment_slug,
                     "customer_embeddings_path": str(customer_path),
                     "weight_strategy": weight_strategy,
+                    "quantity_transform": quantity_transform,
+                    "max_customer_product_weight": max_customer_product_weight,
                     "normalize_vectors": normalize_vectors,
                 }
             )
@@ -371,6 +391,7 @@ def evaluate_customer_embedding_quality(
     customer_embeddings_path: str | Path,
     trial_name: str | None = None,
     sample_size: int = DEFAULT_CUSTOMER_EMBEDDING_SAMPLE_SIZE,
+    weight_profile: dict[str, Any] | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Any]:
     """Compute lightweight health diagnostics for one customer embedding table."""
@@ -417,9 +438,16 @@ def evaluate_customer_embedding_quality(
         effective_dim=effective_dim,
         norm_cv=norm_cv,
         mean_nearest_neighbor_cosine=mean_nearest_neighbor_cosine,
+        top_product_weight_share_pct=None if weight_profile is None else weight_profile.get("top_product_weight_share_pct"),
+        mean_customer_top_product_weight_share_pct=None
+        if weight_profile is None
+        else weight_profile.get("mean_customer_top_product_weight_share_pct"),
+        mean_customer_common_product_weight_share_pct=None
+        if weight_profile is None
+        else weight_profile.get("mean_customer_common_product_weight_share_pct"),
     )
 
-    return {
+    result = {
         "trial_name": trial_name,
         "customer_count": int(df.height),
         "sampled_customers": int(X.shape[0]),
@@ -437,11 +465,14 @@ def evaluate_customer_embedding_quality(
         "customer_embedding_quality_score": score,
         "selection_reason": (
             "Ranked by finite-value health, nonzero customer coverage, live embedding dimensions, "
-            "retained effective dimensionality, vector norm stability, and sampled nearest-neighbor "
-            "structure. This is an upstream diagnostic; Stage 5B and Stage 6 still decide whether the "
-            "variant produces useful tribes."
+            "retained effective dimensionality, vector norm stability, sampled nearest-neighbor "
+            "structure, and customer-product weight concentration. This is an upstream diagnostic; "
+            "Stage 5B and Stage 6 still decide whether the variant produces useful tribes."
         ),
     }
+    if weight_profile:
+        result.update(weight_profile)
+    return result
 
 
 def run_feature_set_experiments(
@@ -640,6 +671,9 @@ def _customer_embedding_score(
     effective_dim: float,
     norm_cv: float,
     mean_nearest_neighbor_cosine: float | None,
+    top_product_weight_share_pct: float | None = None,
+    mean_customer_top_product_weight_share_pct: float | None = None,
+    mean_customer_common_product_weight_share_pct: float | None = None,
 ) -> float:
     finite_share = max(0.0, min(1.0, finite_pct / 100.0))
     nonzero_share = 1.0 - max(0.0, min(1.0, zero_vector_pct / 100.0))
@@ -652,7 +686,7 @@ def _customer_embedding_score(
         if mean_nearest_neighbor_cosine is None
         else max(0.0, min(1.0, (mean_nearest_neighbor_cosine + 1.0) / 2.0))
     )
-    return float(
+    vector_health = float(
         100.0
         * (
             0.25 * finite_share
@@ -663,6 +697,19 @@ def _customer_embedding_score(
             + 0.10 * neighbor_structure
         )
     )
+    top_product_balance = _lower_pct_is_better(top_product_weight_share_pct, warning_pct=20.0)
+    customer_top_balance = _lower_pct_is_better(mean_customer_top_product_weight_share_pct, warning_pct=70.0)
+    common_product_balance = _lower_pct_is_better(mean_customer_common_product_weight_share_pct, warning_pct=70.0)
+    concentration_score = 100.0 * (
+        0.40 * top_product_balance + 0.35 * customer_top_balance + 0.25 * common_product_balance
+    )
+    return float(0.85 * vector_health + 0.15 * concentration_score)
+
+
+def _lower_pct_is_better(value: float | None, warning_pct: float) -> float:
+    if value is None:
+        return 1.0
+    return max(0.0, min(1.0, 1.0 - (float(value) / max(warning_pct, 1e-12))))
 
 
 def _feature_set_score(

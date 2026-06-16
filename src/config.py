@@ -100,12 +100,16 @@ class PipelineConfig:
         return self.outputs / "reports"
 
     @property
+    def artifacts(self) -> Path:
+        return self.outputs / "artifacts"
+
+    @property
     def figures(self) -> Path:
         return self.outputs / "figures"
 
     @property
     def model_selection(self) -> Path:
-        return self.reports / "model_selection"
+        return self.artifacts / "model_selection"
 
     @property
     def model_selection_cache(self) -> Path:
@@ -138,17 +142,15 @@ class PipelineConfig:
             self.models,
             self.outputs,
             self.reports,
+            self.artifacts,
             self.figures,
-            self.figures / "model_selection",
-            self.figures / "presentation",
-            self.figures / "tribe_lifts",
             self.outputs / "embeddings",
             self.outputs / "features",
             self.outputs / "profiles",
             self.model_selection,
             self.model_selection_cache,
-            self.reports / str(self.get("exports.presentation_dir", "presentation")),
-            self.reports / str(self.get("exports.evidence_dir", "evidence")),
+            self.artifacts / str(self.get("exports.presentation_dir", "presentation")),
+            self.artifacts / str(self.get("exports.evidence_dir", "evidence")),
         ]
         if self.experiments_enabled:
             paths.append(self.experiments)
@@ -180,6 +182,7 @@ RAW_CSV = CONFIG.raw_csv
 MODELS = CONFIG.models
 OUTPUTS = CONFIG.outputs
 REPORTS = CONFIG.reports
+ARTIFACTS = CONFIG.artifacts
 FIGURES = CONFIG.figures
 MODEL_SELECTION_CACHE = CONFIG.model_selection_cache
 
@@ -203,6 +206,7 @@ def configure_mode(mode: str) -> PipelineConfig:
     global MODELS
     global OUTPUTS
     global REPORTS
+    global ARTIFACTS
     global FIGURES
     global MODEL_SELECTION_CACHE
     global PREPARED_TRANSACTIONS
@@ -225,6 +229,7 @@ def configure_mode(mode: str) -> PipelineConfig:
     MODELS = cfg.models
     OUTPUTS = cfg.outputs
     REPORTS = cfg.reports
+    ARTIFACTS = cfg.artifacts
     FIGURES = cfg.figures
     MODEL_SELECTION_CACHE = cfg.model_selection_cache
 

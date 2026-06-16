@@ -26,8 +26,7 @@ def collect_cached_presentation_figures(
 ) -> dict[str, Path]:
     """Return presentation-ready figure artifacts already present in the output cache."""
 
-    presentation_dir = cfg.figures / str(cfg.get("exports.presentation_dir", "presentation"))
-    model_selection_dir = cfg.figures / "model_selection"
+    figures_dir = cfg.figures
     figures: dict[str, Path] = {}
     seen_paths: set[str] = set()
 
@@ -41,36 +40,28 @@ def collect_cached_presentation_figures(
         seen_paths.add(path_key)
 
     known_presentation_files = [
-        ("Selected Tribe Vs Population Dashboard", f"00_selected_tribe_vs_population_dashboard_{cfg.mode}.png"),
-        ("Selected Tribe Theme Lift Heatmap", f"00_selected_tribe_theme_lift_heatmap_{cfg.mode}.png"),
-        ("Core Tribe Sizes", f"01_core_tribe_sizes_{cfg.mode}.png"),
-        ("Assignment Provenance", f"02_assignment_provenance_{cfg.mode}.png"),
-        ("Shopping Mission Overview", f"03_shopping_mission_overview_{cfg.mode}.png"),
-        ("Core Mission Lift Heatmap", f"04_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
+        ("Selected Tribe Vs Population Dashboard", f"stage_08_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"),
+        ("Selected Tribe Theme Lift Heatmap", f"stage_08_tribe_theme_lift_heatmap_{cfg.mode}.png"),
+        ("Core Tribe Sizes", f"stage_09_core_tribe_sizes_{cfg.mode}.png"),
+        ("Assignment Provenance", f"stage_09_assignment_provenance_{cfg.mode}.png"),
+        ("Shopping Mission Overview", f"stage_09_shopping_mission_overview_{cfg.mode}.png"),
+        ("Core Mission Lift Heatmap", f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
+        ("Stage 7 PCA Projection", f"stage_07_winner_projection_pca.png"),
+        ("Stage 7 UMAP Projection", f"stage_07_winner_projection_umap.png"),
+        ("Stage 9 PCA Projection", f"stage_09_final_projection_pca.png"),
+        ("Stage 9 UMAP Projection", f"stage_09_final_projection_umap.png"),
     ]
     for label, filename in known_presentation_files:
-        add(label, presentation_dir / filename)
+        add(label, figures_dir / filename)
 
-    projection_dirs = [presentation_dir]
-    if include_model_selection:
-        projection_dirs.append(model_selection_dir)
     projection_paths: list[Path] = []
-    for directory in projection_dirs:
-        if directory.exists():
-            projection_paths.extend(sorted(directory.glob("umap_selected_tribes_*.png")))
-    for directory in projection_dirs:
-        if directory.exists():
-            projection_paths.extend(sorted(directory.glob("pca_selected_tribes_*.png")))
+    if figures_dir.exists():
+        projection_paths.extend(sorted(figures_dir.glob("stage_*_projection_*.png")))
     for path in projection_paths:
         add(_cached_stage9_figure_label(path, cfg), path)
 
-    cached_dirs = [presentation_dir]
-    if include_model_selection:
-        cached_dirs.append(model_selection_dir)
-    for directory in cached_dirs:
-        if not directory.exists():
-            continue
-        for path in sorted(directory.iterdir()):
+    if figures_dir.exists():
+        for path in sorted(figures_dir.iterdir()):
             add(_cached_stage9_figure_label(path, cfg), path)
     return figures
 
@@ -446,15 +437,15 @@ def _fmt_metric(value: Any, suffix: str = "") -> str:
 
 
 def presentation_report_dir(cfg: PipelineConfig = CONFIG) -> Path:
-    """Return the compact client-facing report directory."""
+    """Return the compact client-facing artifact directory."""
 
-    return cfg.reports / str(cfg.get("exports.presentation_dir", "presentation"))
+    return cfg.artifacts / str(cfg.get("exports.presentation_dir", "presentation"))
 
 
 def evidence_report_dir(cfg: PipelineConfig = CONFIG) -> Path:
-    """Return the detailed audit/evidence report directory."""
+    """Return the detailed audit/evidence artifact directory."""
 
-    return cfg.reports / str(cfg.get("exports.evidence_dir", "evidence"))
+    return cfg.artifacts / str(cfg.get("exports.evidence_dir", "evidence"))
 
 
 def write_stage9_presentation_pack(

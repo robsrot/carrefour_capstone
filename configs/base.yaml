@@ -40,16 +40,41 @@ experiments:
   enabled: false
 
 baskets:
+  construction_strategy: common_downsampled
   repeat_product_by_quantity: false
   output: basket_sentences.parquet
+  diagnostics:
+    output_dir: stage1
+    product_ubiquity_output: product_ubiquity_diagnostics.parquet
+    basket_exposure_output: basket_common_product_exposure.parquet
+    common_products_csv: common_product_candidates.csv
+    summary_md: basket_common_product_diagnostics.md
+    write_markdown_report: false
+    top_n_common_products: 50
+    common_customer_penetration_threshold: 0.01
+    common_basket_penetration_threshold: 0.005
+    common_line_share_threshold: 0.005
+  downsampling:
+    manual_exclude_product_ids: []
+    auto_exclude:
+      enabled: true
+      customer_penetration_threshold: 0.50
+      basket_penetration_threshold: 0.10
+      line_share_threshold: null
+      max_products: 25
+    target_customer_penetration: 0.01
+    keep_probability_exponent: 0.5
+    min_keep_probability: 0.15
 
 word2vec:
   vector_size: 128
-  window: 5
-  full_basket_context: true
-  min_count: 10
+  window: 2
+  full_basket_context: false
+  min_tokens_per_basket: 2
+  max_tokens_per_basket: 20
+  min_count: 40
   negative: 10
-  sample: 0.0005
+  sample: 0.0001
   epochs: 5
   sg: 1
   workers: 1
@@ -59,15 +84,69 @@ word2vec:
   embeddings_output: product_embeddings.parquet
 
 embedding_validation:
-  sample_size: 25
+  output_dir: stage3
+  sample_size: 100
   neighbors: 8
+  staple_sample_size: 20
+  niche_sample_size: 20
+  common_sample_size: 20
+  rare_sample_size: 20
+  niche_category_sample_size: 6
+  category_report_max_products: 4
+  niche_basket_penetration_max: 0.001
+  common_neighbor_basket_penetration_threshold: 0.005
+  generic_neighbor_warning_share_threshold: 0.50
+  write_extract_figures: false
+  guardrails:
+    max_generic_warning_product_share: 0.10
+    min_rare_same_sector_share: 0.35
+    max_common_rare_same_sector_gap: 0.35
+    max_top_hub_cross_sector_share: 0.80
+    max_hubness_lift: 10.0
+    min_cross_sector_hubness_lift: 3.0
+    min_cross_sector_source_sectors: 3
+  niche_categories: auto
+  auto_niche_categories:
+    min_matched_products: 10
+    max_matched_products: 5000
+    max_median_basket_penetration: 0.005
+    max_categories: 12
+  hubness_neighbors: 10
+  hubness_sample_size: null
+  hubness_chunk_size: 256
   output_csv: embedding_validation.csv
+  hubness_output_csv: embedding_hubness.csv
   output_md: embedding_validation.md
+  write_markdown_report: false
 
 customer_embeddings:
   output: customer_embeddings.parquet
   weight_strategy: quantity
+  quantity_transform: log1p
+  max_customer_product_weight: null
   normalize_vectors: true
+  diagnostics:
+    enabled: true
+    output_dir: stage4
+    output_prefix: customer_embedding
+    write_top_products_csv: false
+    top_n_products: 15
+  gates:
+    enabled: true
+    fail_on_violation: true
+    apply_to_custom_outputs: false
+    min_line_coverage_pct: 90.0
+    min_unit_coverage_pct: 90.0
+    min_product_coverage_pct: 35.0
+    min_customer_coverage_pct: 99.0
+    max_zero_embedded_customer_pct: 1.0
+    max_top_product_weight_share_pct: 5.0
+    max_top_10_product_weight_share_pct: 25.0
+    max_mean_customer_top_product_weight_share_pct: 65.0
+    max_p95_customer_top_product_weight_share_pct: 95.0
+    max_common_product_weight_share_pct: 60.0
+    max_mean_customer_common_product_weight_share_pct: 80.0
+    max_p95_customer_common_product_weight_share_pct: 98.0
 
 behavioral_features:
   output: customer_behavior_features.parquet
@@ -79,6 +158,9 @@ feature_sets:
   outputs:
     embeddings_only: feature_set_embeddings_only.parquet
     embeddings_behavior: feature_set_embeddings_behavior.parquet
+
+model_selection:
+  write_summary_markdown: false
 
 autoencoder:
   enabled: true

@@ -66,6 +66,7 @@ def write_summary_artifacts(
     priority_columns: list[str] | None = None,
     cfg: PipelineConfig = CONFIG,
     max_markdown_rows: int = 20,
+    write_markdown: bool = True,
 ) -> dict[str, Path]:
     """Write compact CSV and Markdown summaries next to a canonical artifact."""
 
@@ -75,19 +76,23 @@ def write_summary_artifacts(
 
     summary = _summary_frame(df, priority_columns or [])
     summary.write_csv(summary_csv)
-    summary_md.write_text(
-        _markdown_summary(title, summary, max_rows=max_markdown_rows),
-        encoding="utf-8",
-    )
+    if write_markdown:
+        summary_md.write_text(
+            _markdown_summary(title, summary, max_rows=max_markdown_rows),
+            encoding="utf-8",
+        )
     log_event(
         "Experiment summary",
         "wrote human-readable summaries",
         cfg=cfg,
         rows=summary.height,
         csv=summary_csv,
-        markdown=summary_md,
+        markdown=summary_md if write_markdown else None,
     )
-    return {"summary_csv": summary_csv, "summary_md": summary_md}
+    result = {"summary_csv": summary_csv}
+    if write_markdown:
+        result["summary_md"] = summary_md
+    return result
 
 
 def _summary_paths(output_base: Path) -> tuple[Path, Path]:

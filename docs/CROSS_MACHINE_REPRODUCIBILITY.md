@@ -52,12 +52,12 @@ If these hashes differ across machines, do not compare downstream model results 
 Official customer vectors are quantity-only aggregations of product embeddings:
 
 - Include product identity from Item2Vec.
-- Include product quantities through `unidades`.
+- Include product quantities through the configured `unidades` transform (`log1p` in the current official settings).
 - Exclude `importe`, total spend, average basket value, and revenue tier.
 
 Spend and KPIs are still used after clustering for profiling and business interpretation.
 
-The latest quantity-only vectorization change invalidates generated Stage 4+ artifacts from older runs. Rebuild from Stage 4 onward before interpreting Stage 6+ comparisons.
+The latest quantity-only vectorization change, including the Stage 4 `log1p(unidades)` transform, invalidates generated Stage 4+ artifacts from older runs. Rebuild from Stage 4 onward before interpreting Stage 6+ comparisons.
 
 ## Known Sources of Variation
 

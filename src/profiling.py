@@ -1213,6 +1213,7 @@ def write_clustering_atlas_artifacts(
     output_csv: str | Path | None = None,
     output_md: str | Path | None = None,
     output_html: str | Path | None = None,
+    write_markdown: bool = True,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
     """Write a one-stop atlas of core tribes, subtribes, evidence, and visual links."""
@@ -1230,18 +1231,19 @@ def write_clustering_atlas_artifacts(
 
     csv_output.parent.mkdir(parents=True, exist_ok=True)
     atlas_index.write_csv(csv_output)
-    md_output.write_text(
-        _clustering_atlas_markdown(
-            profiles,
-            atlas_index,
-            subsegments,
-            profile_path=Path(profile_path),
-            figure_paths=figure_paths or {},
-            output_path=md_output,
-            cfg=cfg,
-        ),
-        encoding="utf-8",
-    )
+    if write_markdown:
+        md_output.write_text(
+            _clustering_atlas_markdown(
+                profiles,
+                atlas_index,
+                subsegments,
+                profile_path=Path(profile_path),
+                figure_paths=figure_paths or {},
+                output_path=md_output,
+                cfg=cfg,
+            ),
+            encoding="utf-8",
+        )
     html_output.write_text(
         _clustering_atlas_html(
             profiles,
@@ -1259,10 +1261,13 @@ def write_clustering_atlas_artifacts(
         "wrote clustering atlas",
         cfg=cfg,
         csv=csv_output,
-        markdown=md_output,
+        markdown=md_output if write_markdown else None,
         html=html_output,
     )
-    return {"csv": csv_output, "markdown": md_output, "html": html_output}
+    result = {"csv": csv_output, "html": html_output}
+    if write_markdown:
+        result["markdown"] = md_output
+    return result
 
 
 def _read_subsegment_summary(subsegment_summary_path: str | Path | None) -> pl.DataFrame:

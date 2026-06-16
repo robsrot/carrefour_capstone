@@ -23,7 +23,7 @@ Note: as of this update, `src/business_lens.py`, `src/cache_audit.py`, and `src/
 | `configs/dev.yaml` | Dev-mode overrides for faster local experimentation. |
 | `configs/prod.yaml` | Production-scale overrides; same modeling recipe as dev, scaled to larger data. |
 
-Official customer embeddings use `customer_embeddings.weight_strategy: quantity`. IDF variants belong in the experiment sandbox until promoted deliberately.
+Official customer embeddings use `customer_embeddings.weight_strategy: quantity` with `customer_embeddings.quantity_transform: log1p`. IDF variants belong in the experiment sandbox until promoted deliberately.
 
 ## Source Modules
 
@@ -39,7 +39,7 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `src/item2vec.py` | Item2Vec training and product embedding export. |
 | `src/embeddings.py` | Basket sentence construction and product embedding validation helpers. |
 | `src/embedding_validation.py` | Nearest-neighbor product embedding validation reports. |
-| `src/customer_embeddings.py` | Quantity-only official customer vector aggregation plus optional IDF strategies for sandbox use. |
+| `src/customer_embeddings.py` | Quantity-only official customer vector aggregation, compact Stage 4 weight concentration diagnostics, plus optional IDF strategies for sandbox use. |
 | `src/customer_vectors.py` | Legacy/customer-vector compatibility helpers retained for older workflows. |
 | `src/feature_engineering.py` | Behavioral/profile feature engineering; spend is used for diagnostics/profiling, not official vector weighting. |
 | `src/dimensionality.py` | UMAP and PCA feature representations. |

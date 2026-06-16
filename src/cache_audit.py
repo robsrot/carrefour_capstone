@@ -11,8 +11,9 @@ from typing import Any
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.customer_embeddings import _uses_idf
-from src.item2vec import _effective_window
+from src.customer_embeddings import _uses_idf, _uses_quantity
+from src.embedding_validation import _category_pattern_metadata
+from src.item2vec import _corpus_limits, _effective_window
 from src.utils import cache_status, file_fingerprint, write_artifact_metadata
 
 
@@ -152,6 +153,7 @@ def mode_path_audit(cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
     for check, path in [
         ("models_root", cfg.models),
         ("reports_root", cfg.reports),
+        ("artifacts_root", cfg.artifacts),
         ("figures_root", cfg.figures),
         ("model_selection_cache_root", cfg.model_selection_cache),
     ]:
@@ -167,8 +169,8 @@ def mode_path_audit(cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
 
     for check, path in {
         "stage_8_profiles_root": cfg.outputs / "profiles",
-        "stage_9_presentation_reports": cfg.reports / str(cfg.get("exports.presentation_dir", "presentation")),
-        "stage_9_evidence_reports": cfg.reports / str(cfg.get("exports.evidence_dir", "evidence")),
+        "stage_9_presentation_artifacts": cfg.artifacts / str(cfg.get("exports.presentation_dir", "presentation")),
+        "stage_9_evidence_artifacts": cfg.artifacts / str(cfg.get("exports.evidence_dir", "evidence")),
     }.items():
         add_path_check(check, path, expected_root=current_output_root, forbidden_roots=[forbidden_output_root])
 
@@ -234,8 +236,8 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
         },
         {
             "stage": "3",
-            "artifact": "embedding_validation_md",
-            "path": paths["embedding_validation_md"],
+            "artifact": "embedding_hubness_csv",
+            "path": paths["embedding_hubness_csv"],
             "metadata": _embedding_validation_metadata(paths["product_embeddings"], cfg),
         },
         {
@@ -325,12 +327,15 @@ def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
     selection_feature_set = str(cfg.get("modeling.feature_set_for_selection", "embeddings_only"))
     promoted = cfg.get("official_model_suite.umap_hdbscan", {}) or {}
     model_b_name = str(promoted.get("output_prefix", promoted.get("model_name", "model_b_umap_hdbscan")))
-    return {
+    embedding_validation_dir = cfg.artifacts / str(cfg.get("embedding_validation.output_dir", "stage3"))
+    paths = {
         "basket_sentences": cfg.artifact_path("baskets", "output", directory=cfg.outputs / "embeddings"),
         "item2vec_model": cfg.models / str(cfg.get("word2vec.model_name")),
         "product_embeddings": cfg.artifact_path("word2vec", "embeddings_output", directory=cfg.outputs / "embeddings"),
-        "embedding_validation_csv": cfg.reports / str(cfg.get("embedding_validation.output_csv")),
-        "embedding_validation_md": cfg.reports / str(cfg.get("embedding_validation.output_md")),
+        "embedding_validation_csv": embedding_validation_dir / str(cfg.get("embedding_validation.output_csv")),
+        "embedding_hubness_csv": embedding_validation_dir / str(
+            cfg.get("embedding_validation.hubness_output_csv", "embedding_hubness.csv")
+        ),
         "customer_embeddings": cfg.artifact_path("customer_embeddings", "output", directory=cfg.outputs / "features"),
         "behavioral_features": cfg.artifact_path("behavioral_features", "output", directory=cfg.outputs / "features"),
         "feature_sets": {
@@ -356,6 +361,9 @@ def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
             "model_c_pca_kmeans_results": cfg.model_selection_cache / "model_c_pca_kmeans_grid_results.parquet",
         },
     }
+    if bool(cfg.get("embedding_validation.write_markdown_report", True)):
+        paths["embedding_validation_md"] = embedding_validation_dir / str(cfg.get("embedding_validation.output_md"))
+    return paths
 
 
 def _status_row(
@@ -394,17 +402,64 @@ def _status_row(
 
 
 def _basket_metadata(output: Path, cfg: PipelineConfig) -> dict[str, Any]:
+    strategy = str(cfg.get("baskets.construction_strategy", "baseline"))
     return {
         "stage": "basket_sentences",
         "mode": cfg.mode,
         "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "construction_strategy": strategy,
         "repeat_product_by_quantity": bool(cfg.get("baskets.repeat_product_by_quantity", False)),
+        "downsampling": _downsampling_metadata(cfg) if strategy == "common_downsampled" else None,
+        "common_product_diagnostics": _diagnostic_threshold_metadata(cfg)
+        if strategy == "common_downsampled"
+        else None,
         "ordering": "deterministic_ticket_hash",
     }
 
 
+def _downsampling_metadata(cfg: PipelineConfig) -> dict[str, Any]:
+    legacy_manual_ids = cfg.get("baskets.downsampling.exclude_product_ids", [])
+    manual_ids = cfg.get("baskets.downsampling.manual_exclude_product_ids", legacy_manual_ids) or []
+    auto_exclude = cfg.get("baskets.downsampling.auto_exclude", {}) or {}
+    return {
+        "manual_exclude_product_ids": [str(value) for value in manual_ids],
+        "auto_exclude": {
+            "enabled": bool(auto_exclude.get("enabled", True)),
+            "customer_penetration_threshold": _optional_float(
+                auto_exclude.get("customer_penetration_threshold", 0.50)
+            ),
+            "basket_penetration_threshold": _optional_float(auto_exclude.get("basket_penetration_threshold", 0.10)),
+            "line_share_threshold": _optional_float(auto_exclude.get("line_share_threshold")),
+            "max_products": int(auto_exclude.get("max_products", 25)),
+        },
+        "target_customer_penetration": float(cfg.get("baskets.downsampling.target_customer_penetration", 0.01)),
+        "keep_probability_exponent": float(cfg.get("baskets.downsampling.keep_probability_exponent", 0.5)),
+        "min_keep_probability": float(cfg.get("baskets.downsampling.min_keep_probability", 0.15)),
+        "sample_modulus": 1_000_000,
+    }
+
+
+def _diagnostic_threshold_metadata(cfg: PipelineConfig) -> dict[str, float]:
+    return {
+        "common_customer_penetration_threshold": float(
+            cfg.get("baskets.diagnostics.common_customer_penetration_threshold", 0.01)
+        ),
+        "common_basket_penetration_threshold": float(
+            cfg.get("baskets.diagnostics.common_basket_penetration_threshold", 0.005)
+        ),
+        "common_line_share_threshold": float(cfg.get("baskets.diagnostics.common_line_share_threshold", 0.005)),
+    }
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
 def _item2vec_metadata(basket_path: Path, cfg: PipelineConfig) -> dict[str, Any]:
     effective_window = _effective_window(basket_path, cfg) if basket_path.exists() else int(cfg.get("word2vec.window"))
+    corpus_limits = _corpus_limits(cfg)
     return {
         "stage": "item2vec_model",
         "mode": cfg.mode,
@@ -414,6 +469,9 @@ def _item2vec_metadata(basket_path: Path, cfg: PipelineConfig) -> dict[str, Any]
             "window": effective_window,
             "configured_window": int(cfg.get("word2vec.window")),
             "full_basket_context": bool(cfg.get("word2vec.full_basket_context", False)),
+            "min_tokens_per_basket": int(corpus_limits["min_tokens_per_basket"] or 1),
+            "max_tokens_per_basket": corpus_limits["max_tokens_per_basket"],
+            "basket_context_policy": "deterministic_local_context",
             "min_count": int(cfg.get("word2vec.min_count")),
             "negative": int(cfg.get("word2vec.negative")),
             "sample": float(cfg.get("word2vec.sample")),
@@ -452,6 +510,33 @@ def _embedding_validation_metadata(embeddings_path: Path, cfg: PipelineConfig) -
         "sample_product_ids": None,
         "sample_size": int(cfg.get("embedding_validation.sample_size", 25)),
         "neighbors": int(cfg.get("embedding_validation.neighbors", 8)),
+        "staple_sample_size": int(cfg.get("embedding_validation.staple_sample_size", 8)),
+        "niche_sample_size": int(cfg.get("embedding_validation.niche_sample_size", 8)),
+        "common_sample_size": int(
+            cfg.get("embedding_validation.common_sample_size", cfg.get("embedding_validation.staple_sample_size", 8))
+        ),
+        "rare_sample_size": int(
+            cfg.get("embedding_validation.rare_sample_size", cfg.get("embedding_validation.niche_sample_size", 8))
+        ),
+        "niche_category_sample_size": int(cfg.get("embedding_validation.niche_category_sample_size", 5)),
+        "niche_categories": _category_pattern_metadata(cfg),
+        "generic_neighbor_warning_share_threshold": float(
+            cfg.get("embedding_validation.generic_neighbor_warning_share_threshold", 0.50)
+        ),
+        "guardrails": cfg.get("embedding_validation.guardrails", {}),
+        "write_extract_figures": bool(cfg.get("embedding_validation.write_extract_figures", False)),
+        "niche_basket_penetration_max": float(
+            cfg.get("embedding_validation.niche_basket_penetration_max", 0.001)
+        ),
+        "common_neighbor_basket_penetration_threshold": float(
+            cfg.get(
+                "embedding_validation.common_neighbor_basket_penetration_threshold",
+                cfg.get("baskets.diagnostics.common_basket_penetration_threshold", 0.005),
+            )
+        ),
+        "hubness_neighbors": int(cfg.get("embedding_validation.hubness_neighbors", 10)),
+        "hubness_sample_size": cfg.get("embedding_validation.hubness_sample_size", None),
+        "hubness_chunk_size": int(cfg.get("embedding_validation.hubness_chunk_size", 256)),
         "random_seed": cfg.random_seed,
     }
 
@@ -465,6 +550,10 @@ def _customer_embedding_metadata(embeddings_path: Path, cfg: PipelineConfig) -> 
         "product_embeddings": file_fingerprint(embeddings_path),
         "weight_strategy": selected_weight_strategy,
         "idf_weighting": _uses_idf(selected_weight_strategy),
+        "quantity_transform": str(cfg.get("customer_embeddings.quantity_transform", "raw"))
+        if _uses_quantity(selected_weight_strategy)
+        else None,
+        "max_customer_product_weight": cfg.get("customer_embeddings.max_customer_product_weight", None),
         "normalize_vectors": bool(cfg.get("customer_embeddings.normalize_vectors", False)),
     }
 

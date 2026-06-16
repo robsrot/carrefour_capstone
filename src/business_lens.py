@@ -18,6 +18,7 @@ def write_business_lens_artifacts(
     mission_summary_path: str | Path,
     profile_path: str | Path,
     output_dir: str | Path | None = None,
+    write_markdown: bool = True,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
     """Write the Stage 10 business lens artifacts.
@@ -26,7 +27,7 @@ def write_business_lens_artifacts(
     product-first tribes into CRM, campaign, and opportunity-sizing language.
     """
 
-    out_dir = Path(output_dir) if output_dir else cfg.reports / str(cfg.get("exports.presentation_dir", "presentation"))
+    out_dir = Path(output_dir) if output_dir else cfg.artifacts / str(cfg.get("exports.presentation_dir", "presentation"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     core = _read_table(core_summary_path)
@@ -43,17 +44,18 @@ def write_business_lens_artifacts(
 
     campaign_matrix.write_csv(campaign_path)
     financial_sizing.write_csv(sizing_path)
-    md_path.write_text(
-        _business_lens_markdown(
-            campaign_matrix=campaign_matrix,
-            financial_sizing=financial_sizing,
-            campaign_path=campaign_path,
-            sizing_path=sizing_path,
-            base_dir=out_dir,
-            cfg=cfg,
-        ),
-        encoding="utf-8",
-    )
+    if write_markdown:
+        md_path.write_text(
+            _business_lens_markdown(
+                campaign_matrix=campaign_matrix,
+                financial_sizing=financial_sizing,
+                campaign_path=campaign_path,
+                sizing_path=sizing_path,
+                base_dir=out_dir,
+                cfg=cfg,
+            ),
+            encoding="utf-8",
+        )
     html_path.write_text(
         _business_lens_html(
             campaign_matrix=campaign_matrix,
@@ -69,16 +71,18 @@ def write_business_lens_artifacts(
         "Stage 10 business lens",
         "wrote business opportunity artifacts",
         cfg=cfg,
-        markdown=md_path,
+        markdown=md_path if write_markdown else None,
         campaign_matrix=campaign_path,
         financial_sizing=sizing_path,
     )
-    return {
-        "markdown": md_path,
+    paths = {
         "html": html_path,
         "campaign_matrix": campaign_path,
         "financial_sizing": sizing_path,
     }
+    if write_markdown:
+        paths["markdown"] = md_path
+    return paths
 
 
 def _campaign_opportunity_matrix(core: pl.DataFrame, missions: pl.DataFrame, profiles: pl.DataFrame) -> pl.DataFrame:

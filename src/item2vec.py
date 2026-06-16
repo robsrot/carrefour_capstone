@@ -17,14 +17,27 @@ from src.utils import collect_streaming, file_fingerprint, should_use_cache, wri
 class BasketSentenceCorpus:
     """Iterable over ticket-level product-token lists saved by basket_builder."""
 
-    def __init__(self, basket_path: str | Path):
+    def __init__(
+        self,
+        basket_path: str | Path,
+        min_tokens_per_basket: int = 2,
+        max_tokens_per_basket: int | None = None,
+    ):
         self.basket_path = Path(basket_path)
+        self.min_tokens_per_basket = max(int(min_tokens_per_basket), 1)
+        self.max_tokens_per_basket = (
+            max(int(max_tokens_per_basket), self.min_tokens_per_basket)
+            if max_tokens_per_basket is not None
+            else None
+        )
 
     def __iter__(self) -> Iterator[list[str]]:
         df = pl.read_parquet(self.basket_path, columns=["products"])
         for row in df.iter_rows(named=True):
             products = row["products"] or []
-            if len(products) >= 1:
+            if self.max_tokens_per_basket is not None and len(products) > self.max_tokens_per_basket:
+                products = products[: self.max_tokens_per_basket]
+            if len(products) >= self.min_tokens_per_basket:
                 yield [str(product) for product in products]
 
 
@@ -63,10 +76,33 @@ class _Item2VecProgress:
         self.callback = _Callback(total_epochs)
 
 
-def _basket_training_summary(basket_path: Path) -> dict[str, float | int | None]:
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
+def _corpus_limits(cfg: PipelineConfig) -> dict[str, int | None]:
+    min_tokens = max(int(cfg.get("word2vec.min_tokens_per_basket", 2)), 1)
+    max_tokens = _optional_int(cfg.get("word2vec.max_tokens_per_basket", None))
+    if max_tokens is not None:
+        max_tokens = max(max_tokens, min_tokens)
+    return {"min_tokens_per_basket": min_tokens, "max_tokens_per_basket": max_tokens}
+
+
+def _basket_training_summary(
+    basket_path: Path,
+    cfg: PipelineConfig | None = None,
+) -> dict[str, float | int | None]:
     lf = pl.scan_parquet(basket_path)
     names = set(lf.collect_schema().names())
     if "n_product_tokens" in names:
+        limits = _corpus_limits(cfg) if cfg is not None else {"min_tokens_per_basket": 1, "max_tokens_per_basket": None}
+        min_tokens = int(limits["min_tokens_per_basket"] or 1)
+        max_tokens = limits["max_tokens_per_basket"]
+        effective_tokens = pl.when(pl.col("n_product_tokens") >= min_tokens).then(pl.col("n_product_tokens")).otherwise(0)
+        if max_tokens is not None:
+            effective_tokens = pl.when(effective_tokens > max_tokens).then(max_tokens).otherwise(effective_tokens)
         row = collect_streaming(
             lf.select(
                 [
@@ -75,6 +111,12 @@ def _basket_training_summary(basket_path: Path) -> dict[str, float | int | None]
                     pl.col("n_product_tokens").mean().alias("avg_tokens_per_basket"),
                     pl.col("n_product_tokens").median().alias("median_tokens_per_basket"),
                     pl.col("n_product_tokens").max().alias("max_tokens_per_basket"),
+                    (pl.col("n_product_tokens") >= min_tokens).sum().alias("training_baskets"),
+                    (pl.col("n_product_tokens") < min_tokens).sum().alias("skipped_short_baskets"),
+                    (pl.col("n_product_tokens") > max_tokens).sum().alias("capped_baskets")
+                    if max_tokens is not None
+                    else pl.lit(0).alias("capped_baskets"),
+                    effective_tokens.sum().alias("training_product_tokens"),
                 ]
             )
         ).row(0, named=True)
@@ -86,6 +128,10 @@ def _basket_training_summary(basket_path: Path) -> dict[str, float | int | None]
                 "avg_tokens_per_basket": None,
                 "median_tokens_per_basket": None,
                 "max_tokens_per_basket": None,
+                "training_baskets": None,
+                "skipped_short_baskets": None,
+                "capped_baskets": None,
+                "training_product_tokens": None,
             }
         )
     return row
@@ -95,8 +141,11 @@ def _effective_window(basket_path: Path, cfg: PipelineConfig) -> int:
     configured_window = int(cfg.get("word2vec.window"))
     if not bool(cfg.get("word2vec.full_basket_context", False)):
         return configured_window
-    summary = _basket_training_summary(basket_path)
+    summary = _basket_training_summary(basket_path, cfg=cfg)
     max_tokens = summary.get("max_tokens_per_basket") or configured_window
+    capped_tokens = _corpus_limits(cfg)["max_tokens_per_basket"]
+    if capped_tokens is not None:
+        max_tokens = min(int(max_tokens), int(capped_tokens))
     return max(configured_window, int(max_tokens))
 
 
@@ -107,7 +156,7 @@ def _print_training_config(
     cached: bool,
     effective_window: int,
 ) -> None:
-    summary = _basket_training_summary(basket_path)
+    summary = _basket_training_summary(basket_path, cfg=cfg)
     mode = "loading cached model" if cached else "training model"
     print(f"Item2Vec: {mode}", flush=True)
     print(f"  baskets: {summary.get('baskets'):,}", flush=True)
@@ -118,13 +167,23 @@ def _print_training_config(
             f"median/basket: {summary.get('median_tokens_per_basket'):.2f}",
             flush=True,
         )
+        print(
+            f"  training baskets: {summary.get('training_baskets'):,}; "
+            f"training tokens: {summary.get('training_product_tokens'):,}; "
+            f"skipped short baskets: {summary.get('skipped_short_baskets'):,}; "
+            f"capped baskets: {summary.get('capped_baskets'):,}",
+            flush=True,
+        )
     print(f"  model path: {output}", flush=True)
+    limits = _corpus_limits(cfg)
     print(
         "  config: "
         f"vector_size={cfg.get('word2vec.vector_size')}, "
         f"window={effective_window} "
         f"(configured={cfg.get('word2vec.window')}, "
         f"full_basket_context={cfg.get('word2vec.full_basket_context')}), "
+        f"min_tokens_per_basket={limits['min_tokens_per_basket']}, "
+        f"max_tokens_per_basket={limits['max_tokens_per_basket']}, "
         f"min_count={cfg.get('word2vec.min_count')}, "
         f"negative={cfg.get('word2vec.negative')}, "
         f"sample={cfg.get('word2vec.sample')}, "
@@ -153,6 +212,7 @@ def train_item2vec(
     basket_file = Path(basket_path)
     output = Path(model_path) if model_path else cfg.models / cfg.get("word2vec.model_name")
     effective_window = _effective_window(basket_file, cfg)
+    corpus_limits = _corpus_limits(cfg)
     cache_metadata = {
         "stage": "item2vec_model",
         "mode": cfg.mode,
@@ -162,6 +222,9 @@ def train_item2vec(
             "window": effective_window,
             "configured_window": int(cfg.get("word2vec.window")),
             "full_basket_context": bool(cfg.get("word2vec.full_basket_context", False)),
+            "min_tokens_per_basket": int(corpus_limits["min_tokens_per_basket"] or 1),
+            "max_tokens_per_basket": corpus_limits["max_tokens_per_basket"],
+            "basket_context_policy": "deterministic_local_context",
             "min_count": int(cfg.get("word2vec.min_count")),
             "negative": int(cfg.get("word2vec.negative")),
             "sample": float(cfg.get("word2vec.sample")),
@@ -190,7 +253,11 @@ def train_item2vec(
 
     epochs = int(cfg.get("word2vec.epochs"))
     progress = _Item2VecProgress(epochs).callback if verbose else None
-    corpus = BasketSentenceCorpus(basket_file)
+    corpus = BasketSentenceCorpus(
+        basket_file,
+        min_tokens_per_basket=int(corpus_limits["min_tokens_per_basket"] or 1),
+        max_tokens_per_basket=corpus_limits["max_tokens_per_basket"],
+    )
     model = Word2Vec(
         sentences=corpus,
         vector_size=int(cfg.get("word2vec.vector_size")),

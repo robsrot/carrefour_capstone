@@ -60,6 +60,7 @@ Stages:
 1. Basket sentence generation.
 2. Item2Vec product embedding training/export.
 3. Product embedding validation.
+   Stage 3 must review more than a small random product sample: it includes common and rare products, staple and niche products, and data-selected niche-theme checks from the product text/theme taxonomy. The report must compare common-vs-rare nearest-neighbor quality and flag niche-focus products whose neighbors are mostly generic staples. Guardrail status is computed dynamically in the notebook; when it finds a problem, remediate through Stage 1/2 settings and rebuild downstream stages rather than using a manual acceptance toggle.
 4. Customer embedding aggregation.
 5. Feature-set construction and dimensionality representations.
 6. Official candidate model comparison.
@@ -73,6 +74,8 @@ The decision-log section follows the stage flow and writes the final model-selec
 Official customer embeddings are quantity weighted:
 
 - Uses `cliente`, `idarticu`, `unidades`, and product embedding columns.
+- Applies the configured quantity transform (`customer_embeddings.quantity_transform`, currently `log1p`) before aggregating product vectors.
+- Writes only compact Stage 4 weight diagnostics by default; detailed top-product exports are opt-in, and review should happen mainly through notebook tables and figures.
 - Does not use `importe`.
 - IDF-downweighted variants are sandbox-only unless promoted to YAML after evidence review.
 

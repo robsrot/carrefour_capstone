@@ -402,9 +402,10 @@ def build_candidate_model_diagnostics(
             "cluster_size_cv",
         ],
         cfg=cfg,
+        write_markdown=bool(cfg.get("model_selection.write_summary_markdown", True)),
     )
     result.update(summaries)
-    log_kwargs.update(summary_csv=summaries["summary_csv"], summary_md=summaries["summary_md"])
+    log_kwargs.update(summary_csv=summaries["summary_csv"], summary_md=summaries.get("summary_md"))
 
     if write_csv:
         csv_output = Path(csv_path) if csv_path else cfg.model_selection / "stage6_candidate_model_diagnostics.csv"
