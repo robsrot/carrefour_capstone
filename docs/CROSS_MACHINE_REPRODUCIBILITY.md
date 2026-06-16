@@ -49,15 +49,16 @@ If these hashes differ across machines, do not compare downstream model results 
 
 ## Current Modeling Reproducibility Contract
 
-Official customer vectors are quantity-only aggregations of product embeddings:
+Official customer vectors are quantity-weighted aggregations of product embeddings:
 
 - Include product identity from Item2Vec.
 - Include product quantities through the configured `unidades` transform (`log1p` in the current official settings).
+- Apply configured product-purchase recency decay and product-specific basket-count frequency scaling as multiplicative weights.
 - Exclude `importe`, total spend, average basket value, and revenue tier.
 
 Spend and KPIs are still used after clustering for profiling and business interpretation.
 
-The latest quantity-only vectorization change, including the Stage 4 `log1p(unidades)` transform, invalidates generated Stage 4+ artifacts from older runs. Rebuild from Stage 4 onward before interpreting Stage 6+ comparisons.
+The current Stage 4 vectorization recipe, including `log1p(unidades)` plus recency and product-frequency weighting, invalidates generated Stage 4+ artifacts when changed. Rebuild from Stage 4 onward before interpreting Stage 6+ comparisons.
 
 ## Known Sources of Variation
 
@@ -105,7 +106,9 @@ outputs/<mode>/
   reports/
 ```
 
-Stage 8 profile artifacts are especially sensitive to the exact selected assignment file, prepared transaction table, product-theme rules, product-term rules, and profiling thresholds. If any of those change, rebuild profiles and downstream Stage 9/10 reports.
+Stage 7 profile artifacts are especially sensitive to the exact selected assignment file, prepared transaction table, product-theme rules, product-term rules, and profiling thresholds. If any of those change, rebuild the Stage 7 evidence storyline, profiles, noise-population audit, dossiers, subsegment overlays, clustering atlas, and LLM interpretation prompt pack.
+
+Production Stage 6 uses deterministic sampling for expensive manifold and density fitting, then transforms/assigns the full customer population in batches. Reproducibility therefore depends on the same `modeling.fit_sample_size`, UMAP `transform_batch_size`, random seed, and promoted HDBSCAN parameters.
 
 ## If Results Differ
 
@@ -114,3 +117,4 @@ Stage 8 profile artifacts are especially sensitive to the exact selected assignm
 3. Compare `data/dev/subset_metadata.json` hashes.
 4. Delete or force-rebuild generated Stage 4+ artifacts after vectorization or feature changes.
 5. Compare product-lift profiles and stability diagnostics before concluding that a model is materially different.
+

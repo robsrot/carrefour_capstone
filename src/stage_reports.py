@@ -44,7 +44,7 @@ def write_stage_report(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [
-        f"# Stage {stage}: {title}",
+        f"# Stage {_stage_display(stage)}: {title}",
         "",
         f"- Mode: `{cfg.mode}`",
     ]
@@ -56,8 +56,13 @@ def write_stage_report(
 
     metric_rows = _metric_rows(metrics, max_rows=max_metric_rows, max_value_width=max_value_width)
     if metric_rows:
-        lines.extend(["", "## Key Metrics", "", "| Metric | Value |", "|---|---|"])
-        lines.extend(f"| {metric} | {value} |" for metric, value in metric_rows)
+        has_ideal = any(ideal for _, _, ideal in metric_rows)
+        if has_ideal:
+            lines.extend(["", "## Key Metrics", "", "| Metric | Value | Ideal Value / Range |", "|---|---|---|"])
+            lines.extend(f"| {metric} | {value} | {ideal or ''} |" for metric, value, ideal in metric_rows)
+        else:
+            lines.extend(["", "## Key Metrics", "", "| Metric | Value |", "|---|---|"])
+            lines.extend(f"| {metric} | {value} |" for metric, value, _ in metric_rows)
 
     figure_rows = _item_rows(figures, max_value_width=max_value_width)
     if figure_rows:
@@ -100,6 +105,14 @@ def _stage_token(stage: str | int) -> str:
     return token or "unknown"
 
 
+def _stage_display(stage: str | int) -> str:
+    text = str(stage).strip()
+    match = re.fullmatch(r"0*(\d+)[_.](\d+)", text)
+    if match:
+        return f"{int(match.group(1))}.{match.group(2)}"
+    return text
+
+
 def _as_lines(value: str | Iterable[str] | None) -> list[str]:
     if value is None:
         return []
@@ -108,41 +121,51 @@ def _as_lines(value: str | Iterable[str] | None) -> list[str]:
     return [str(line).strip() for line in value if str(line).strip()]
 
 
-def _metric_rows(metrics: Any | None, *, max_rows: int, max_value_width: int) -> list[tuple[str, str]]:
+def _metric_rows(metrics: Any | None, *, max_rows: int, max_value_width: int) -> list[tuple[str, str, str | None]]:
     if metrics is None:
         return []
 
     if isinstance(metrics, Mapping):
         return [
-            (_escape_cell(str(key)), _escape_cell(_format_value(value, max_value_width=max_value_width)))
+            (_escape_cell(str(key)), _escape_cell(_format_value(value, max_value_width=max_value_width)), None)
             for key, value in metrics.items()
         ][:max_rows]
 
     rows = _records_from_frame_like(metrics)
     if not rows:
-        return [("value", _escape_cell(_format_value(metrics, max_value_width=max_value_width)))]
+        return [("value", _escape_cell(_format_value(metrics, max_value_width=max_value_width)), None)]
 
     if all(set(row.keys()) >= {"metric", "value"} for row in rows):
         return [
             (
                 _escape_cell(_format_value(row["metric"], max_value_width=max_value_width)),
                 _escape_cell(_format_value(row["value"], max_value_width=max_value_width)),
+                _escape_cell(
+                    _format_value(
+                        row.get("ideal_value_range", row.get("ideal_range", row.get("ideal"))),
+                        max_value_width=max_value_width,
+                    )
+                )
+                if row.get("ideal_value_range", row.get("ideal_range", row.get("ideal"))) is not None
+                else None,
             )
             for row in rows[:max_rows]
         ]
 
-    rendered: list[tuple[str, str]] = []
+    rendered: list[tuple[str, str, str | None]] = []
     for index, row in enumerate(rows[:max_rows], start=1):
         metric = str(row.get("metric", row.get("name", f"row_{index}")))
         values = {
             key: value
             for key, value in row.items()
-            if key not in {"metric", "name"} and value is not None
+            if key not in {"metric", "name", "ideal_value_range", "ideal_range", "ideal"} and value is not None
         }
+        ideal = row.get("ideal_value_range", row.get("ideal_range", row.get("ideal")))
         rendered.append(
             (
                 _escape_cell(metric),
                 _escape_cell(_format_value(values, max_value_width=max_value_width)),
+                _escape_cell(_format_value(ideal, max_value_width=max_value_width)) if ideal is not None else None,
             )
         )
     return rendered
@@ -162,6 +185,8 @@ def _records_from_frame_like(value: Any) -> list[dict[str, Any]]:
                 records.append(dict(item))
             elif isinstance(item, tuple) and len(item) == 2:
                 records.append({"metric": item[0], "value": item[1]})
+            elif isinstance(item, tuple) and len(item) == 3:
+                records.append({"metric": item[0], "value": item[1], "ideal_value_range": item[2]})
         return records
     return []
 

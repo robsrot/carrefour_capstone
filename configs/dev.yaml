@@ -4,6 +4,10 @@ experiments:
 word2vec:
   workers: 5
 
+customer_embeddings:
+  variant_diagnostics:
+    enabled: true
+
 modeling:
   evaluation_sample_size: 12000
   fit_sample_size: null
@@ -11,11 +15,6 @@ modeling:
 gmm:
   max_iter: 200
   n_init: 1
-
-hdbscan:
-  min_cluster_size: 150
-  min_samples: 1
-  cluster_selection_method: leaf
 
 autoencoder:
   epochs: 12

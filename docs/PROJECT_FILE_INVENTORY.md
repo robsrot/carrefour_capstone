@@ -4,7 +4,7 @@ Last updated: 2026-06-15
 
 This inventory lists the current source and handoff-relevant files that matter for operating and maintaining the Carrefour segmentation pipeline. Generated artifacts live outside the committed repo state.
 
-Note: as of this update, `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` exist in the local working tree but are not yet tracked by git. Include them in the source handoff before another teammate relies on Stage 9/10 outputs.
+Note: as of this update, `src/cache_audit.py` supports the official Stage 0 cache audit and should be included in the source handoff. `src/business_lens.py` and `src/mission_microtribes.py` are legacy optional helpers from an older extended-handoff flow; the official notebook now ends at deep Stage 7 profiling and interpretation.
 
 ## Root
 
@@ -23,7 +23,7 @@ Note: as of this update, `src/business_lens.py`, `src/cache_audit.py`, and `src/
 | `configs/dev.yaml` | Dev-mode overrides for faster local experimentation. |
 | `configs/prod.yaml` | Production-scale overrides; same modeling recipe as dev, scaled to larger data. |
 
-Official customer embeddings use `customer_embeddings.weight_strategy: quantity` with `customer_embeddings.quantity_transform: log1p`. IDF variants belong in the experiment sandbox until promoted deliberately.
+Official customer embeddings use `customer_embeddings.weight_strategy: quantity` with `customer_embeddings.quantity_transform: log1p`, plus configured recency and product-frequency weighting. Alternative customer-vector recipes, including IDF variants, belong in the experiment sandbox until promoted deliberately.
 
 ## Source Modules
 
@@ -34,28 +34,28 @@ Official customer embeddings use `customer_embeddings.weight_strategy: quantity`
 | `src/data_quality.py` | Production quality report. |
 | `src/generate_dev_subset.py` | Builds the stratified dev subset from production processed data. |
 | `src/basket_builder.py` | Lower-level basket construction helpers used by embedding stages. |
-| `src/business_lens.py` | Stage 10 business opportunity lens for campaign plays and financial sizing. Currently local/untracked. |
+| `src/business_lens.py` | Legacy optional business opportunity lens; not part of the official notebook path. |
 | `src/cache_audit.py` | Cache and artifact-state audit helpers for notebook Stage 0. Currently local/untracked. |
 | `src/item2vec.py` | Item2Vec training and product embedding export. |
 | `src/embeddings.py` | Basket sentence construction and product embedding validation helpers. |
 | `src/embedding_validation.py` | Nearest-neighbor product embedding validation reports. |
-| `src/customer_embeddings.py` | Quantity-only official customer vector aggregation, compact Stage 4 weight concentration diagnostics, plus optional IDF strategies for sandbox use. |
+| `src/customer_embeddings.py` | Quantity-weighted official customer vector aggregation, recency/frequency weighting, compact Stage 4 weight concentration diagnostics, plus alternate weighting strategies for sandbox use. |
 | `src/customer_vectors.py` | Legacy/customer-vector compatibility helpers retained for older workflows. |
 | `src/feature_engineering.py` | Behavioral/profile feature engineering; spend is used for diagnostics/profiling, not official vector weighting. |
 | `src/dimensionality.py` | UMAP and PCA feature representations. |
 | `src/clustering.py` | GMM, HDBSCAN, PCA-KMeans, evaluation, and profile support. |
 | `src/evaluation.py` | Shared cluster metric helpers. |
 | `src/model_selection.py` | Official Stage 6 candidate suite and focused UMAP-HDBSCAN experiments. |
-| `src/cluster_validation.py` | Stage 7 cluster validity and perturbation-stability report. |
-| `src/mission_microtribes.py` | Stage 9 shopping-mission microtribe tagging and summaries. Currently local/untracked. |
+| `src/cluster_validation.py` | Stage 6.4 cluster stability, perturbation, and profile-readiness report. |
+| `src/mission_microtribes.py` | Legacy optional shopping-mission helper; not part of the official notebook path. |
 | `src/experiment_reporting.py` | Compact experiment summaries for sandbox outputs. |
 | `src/experiment_sandbox.py` | Dev-only experiment helpers for embeddings, vectors, feature sets, and focused clustering. |
-| `src/profiling.py` | Product, sector, KPI, and lift-based tribe profiles. |
+| `src/profiling.py` | Final Stage 7 evidence storyline plus product, sector, KPI, lift, noise-population audit, subsegment, dossier, clustering-atlas, and LLM-prompt profiling artifacts. |
 | `src/product_filtering.py` | Product filtering utilities used before embedding/modeling where needed. |
 | `src/product_themes.py` | Product theme and interpretation helpers. |
 | `src/tribe_namer.py` | Optional LLM-based tribe naming from lift profiles. |
 | `src/autoencoder.py` | Experimental autoencoder utilities; not part of the official default pipeline. |
-| `src/exports.py` | Final assignment/profile/report exports. |
+| `src/exports.py` | Legacy final export helpers retained for reference; the official notebook no longer calls this module. |
 | `src/visualization.py` | Shared Carrefour-style visualization theme plus figure generation for diagnostics and final explanation. |
 | `src/progress.py` | Lightweight progress logging. |
 | `src/utils.py` | Shared IO, metadata, sampling, and numeric helper utilities. |

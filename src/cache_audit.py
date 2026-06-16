@@ -11,7 +11,7 @@ from typing import Any
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.customer_embeddings import _uses_idf, _uses_quantity
+from src.customer_embeddings import _frequency_weighting_config, _recency_weighting_config, _uses_idf, _uses_quantity
 from src.embedding_validation import _category_pattern_metadata
 from src.item2vec import _corpus_limits, _effective_window
 from src.utils import cache_status, file_fingerprint, write_artifact_metadata
@@ -168,9 +168,9 @@ def mode_path_audit(cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
         )
 
     for check, path in {
-        "stage_8_profiles_root": cfg.outputs / "profiles",
-        "stage_9_presentation_artifacts": cfg.artifacts / str(cfg.get("exports.presentation_dir", "presentation")),
-        "stage_9_evidence_artifacts": cfg.artifacts / str(cfg.get("exports.evidence_dir", "evidence")),
+        "stage_7_profiles_root": cfg.outputs / "profiles",
+        "stage_7_deep_profile_artifacts": cfg.artifacts / "stage7",
+        "stage_7_lift_figures": cfg.figures / "tribe_lifts",
     }.items():
         add_path_check(check, path, expected_root=current_output_root, forbidden_roots=[forbidden_output_root])
 
@@ -325,6 +325,9 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
 def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
     feature_outputs = cfg.get("feature_sets.outputs", {}) or {}
     selection_feature_set = str(cfg.get("modeling.feature_set_for_selection", "embeddings_only"))
+    selection_feature_filename = str(
+        feature_outputs.get(selection_feature_set, f"feature_set_{selection_feature_set}.parquet")
+    )
     promoted = cfg.get("official_model_suite.umap_hdbscan", {}) or {}
     model_b_name = str(promoted.get("output_prefix", promoted.get("model_name", "model_b_umap_hdbscan")))
     embedding_validation_dir = cfg.artifacts / str(cfg.get("embedding_validation.output_dir", "stage3"))
@@ -339,11 +342,11 @@ def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
         "customer_embeddings": cfg.artifact_path("customer_embeddings", "output", directory=cfg.outputs / "features"),
         "behavioral_features": cfg.artifact_path("behavioral_features", "output", directory=cfg.outputs / "features"),
         "feature_sets": {
-            variant: cfg.outputs / "features" / str(filename) for variant, filename in feature_outputs.items()
+            selection_feature_set: cfg.outputs / "features" / selection_feature_filename
         },
         "selection_feature_set": cfg.outputs
         / "features"
-        / str(feature_outputs.get(selection_feature_set, f"feature_set_{selection_feature_set}.parquet")),
+        / selection_feature_filename,
         "gmm": {
             "model_a_gmm_assignments": cfg.model_selection_cache / "cluster_assignments_model_a_gmm.parquet",
             "model_a_gmm_results": cfg.model_selection_cache / "model_a_gmm_grid_results.parquet",
@@ -554,6 +557,8 @@ def _customer_embedding_metadata(embeddings_path: Path, cfg: PipelineConfig) -> 
         if _uses_quantity(selected_weight_strategy)
         else None,
         "max_customer_product_weight": cfg.get("customer_embeddings.max_customer_product_weight", None),
+        "recency_weighting": _recency_weighting_config(cfg),
+        "frequency_weighting": _frequency_weighting_config(cfg),
         "normalize_vectors": bool(cfg.get("customer_embeddings.normalize_vectors", False)),
     }
 

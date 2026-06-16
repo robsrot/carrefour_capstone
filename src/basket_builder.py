@@ -72,6 +72,7 @@ def build_basket_sentences(
     ):
         if strategy == "baseline":
             basket_lf = _baseline_basket_lazyframe(lf, repeat=repeat)
+            keep_plan = None
         elif strategy == "common_downsampled":
             if repeat:
                 raise ValueError("Common-downsampled basket construction currently expects repeat_product_by_quantity=false.")
@@ -101,6 +102,14 @@ def build_basket_sentences(
         )
         baskets.write_parquet(output)
         write_artifact_metadata(output, cache_metadata)
+        if strategy == "common_downsampled" and keep_plan is not None:
+            _write_common_downsampling_artifacts(
+                transactions=lf,
+                keep_plan=keep_plan,
+                basket_output=baskets,
+                metadata=cache_metadata,
+                cfg=cfg,
+            )
         log_event("Stage 1 baskets", "wrote artifact", cfg=cfg, baskets=baskets.height, strategy=strategy, path=output)
     return output
 
@@ -205,6 +214,167 @@ def basket_summary(basket_path: str | Path) -> pl.DataFrame:
             ]
         )
         .collect()
+    )
+
+
+def _downsampling_diagnostics_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
+    diagnostics_dir = cfg.artifacts / str(cfg.get("baskets.diagnostics.output_dir", "stage1"))
+    return {
+        "downsampling_plan": diagnostics_dir
+        / str(cfg.get("baskets.diagnostics.downsampling_plan_output", "common_product_downsampling_plan.parquet")),
+        "downsampling_summary": diagnostics_dir
+        / str(cfg.get("baskets.diagnostics.downsampling_summary_output", "basket_downsampling_summary.csv")),
+    }
+
+
+def _write_common_downsampling_artifacts(
+    transactions: pl.LazyFrame,
+    keep_plan: pl.DataFrame,
+    basket_output: pl.DataFrame,
+    metadata: dict[str, Any],
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    """Persist the exact common-product keep/exclusion plan and basket-token loss."""
+
+    paths = _downsampling_diagnostics_paths(cfg)
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    plan = keep_plan.with_columns(
+        [
+            pl.when(pl.col("_manual_exclude_from_embedding"))
+            .then(pl.lit("manual_exclude"))
+            .when(pl.col("_auto_exclude_from_embedding"))
+            .then(pl.lit("auto_exclude"))
+            .when(pl.col("common_product_candidate"))
+            .then(pl.lit("downsample_common_candidate"))
+            .otherwise(pl.lit("keep_full"))
+            .alias("downsampling_action"),
+            (pl.col("_keep_probability") * 100.0).round(4).alias("keep_probability_pct"),
+        ]
+    ).sort(["_exclude_from_embedding", "_keep_probability", "commonness_score"], descending=[True, False, True])
+    plan.write_parquet(paths["downsampling_plan"])
+    write_artifact_metadata(paths["downsampling_plan"], {**metadata, "artifact": "common_product_downsampling_plan"})
+
+    summary = _common_downsampling_summary(transactions, keep_plan, basket_output, cfg=cfg)
+    summary.write_csv(paths["downsampling_summary"])
+    write_artifact_metadata(paths["downsampling_summary"], {**metadata, "artifact": "basket_downsampling_summary"})
+    log_event(
+        "Stage 1 baskets",
+        "wrote downsampling diagnostics",
+        cfg=cfg,
+        plan=paths["downsampling_plan"],
+        summary=paths["downsampling_summary"],
+    )
+    return paths
+
+
+def _common_downsampling_summary(
+    transactions: pl.LazyFrame,
+    keep_plan: pl.DataFrame,
+    basket_output: pl.DataFrame,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    sample_modulus = int(_downsampling_metadata(cfg)["sample_modulus"])
+    base_pairs = (
+        transactions.select(["ticket", "idarticu"])
+        .with_columns([pl.col("ticket").cast(pl.Utf8), pl.col("idarticu").cast(pl.Utf8)])
+        .unique()
+    )
+    raw_pairs = base_pairs.join(keep_plan.lazy(), on="idarticu", how="left").with_columns(
+        [
+            pl.col("common_product_candidate").fill_null(False),
+            pl.col("_exclude_from_embedding").fill_null(False),
+            pl.col("_manual_exclude_from_embedding").fill_null(False),
+            pl.col("_auto_exclude_from_embedding").fill_null(False),
+            pl.col("_keep_probability").fill_null(1.0),
+        ]
+    )
+    candidates = (
+        raw_pairs.filter(~pl.col("_exclude_from_embedding"))
+        .with_columns(
+            (
+                (
+                    pl.concat_str(["ticket", "idarticu"], separator="|").hash(seed=cfg.random_seed)
+                    % pl.lit(sample_modulus)
+                ).cast(pl.Float64)
+                / pl.lit(float(sample_modulus))
+            ).alias("_sample_value")
+        )
+        .with_columns((pl.col("_sample_value") < pl.col("_keep_probability")).alias("_keep_selected"))
+    )
+    ticket_status = candidates.group_by("ticket").agg(pl.col("_keep_selected").any().alias("_has_selected"))
+
+    totals = collect_streaming(
+        raw_pairs.select(
+            [
+                pl.col("ticket").n_unique().alias("raw_baskets"),
+                pl.len().alias("raw_unique_ticket_product_pairs"),
+                pl.col("common_product_candidate").sum().alias("raw_common_candidate_pairs"),
+                pl.col("_exclude_from_embedding").sum().alias("excluded_pairs"),
+                pl.col("_manual_exclude_from_embedding").sum().alias("manual_excluded_pairs"),
+                pl.col("_auto_exclude_from_embedding").sum().alias("auto_excluded_pairs"),
+            ]
+        )
+    ).row(0, named=True)
+    candidate_totals = collect_streaming(
+        candidates.select(
+            [
+                pl.col("ticket").n_unique().alias("candidate_baskets_after_exclusions"),
+                pl.len().alias("candidate_pairs_after_exclusions"),
+                pl.col("_keep_selected").sum().alias("sample_selected_pairs"),
+                (~pl.col("_keep_selected") & pl.col("common_product_candidate")).sum().alias(
+                    "sample_dropped_common_candidate_pairs"
+                ),
+            ]
+        )
+    ).row(0, named=True)
+    fallback_totals = collect_streaming(
+        candidates.join(ticket_status, on="ticket", how="left")
+        .filter(~pl.col("_has_selected"))
+        .select(pl.col("ticket").n_unique().alias("fallback_baskets"))
+    ).row(0, named=True)
+    product_totals = keep_plan.select(
+        [
+            pl.len().alias("plan_products"),
+            pl.col("common_product_candidate").sum().alias("common_candidate_products"),
+            pl.col("_exclude_from_embedding").sum().alias("excluded_products"),
+            pl.col("_manual_exclude_from_embedding").sum().alias("manual_excluded_products"),
+            pl.col("_auto_exclude_from_embedding").sum().alias("auto_excluded_products"),
+            ((pl.col("common_product_candidate")) & (~pl.col("_exclude_from_embedding"))).sum().alias(
+                "downsampled_common_candidate_products"
+            ),
+            pl.col("_keep_probability").mean().alias("mean_keep_probability"),
+            pl.col("_keep_probability").filter(pl.col("common_product_candidate")).mean().alias(
+                "mean_common_candidate_keep_probability"
+            ),
+        ]
+    ).row(0, named=True)
+    output_baskets = int(basket_output.height)
+    output_pairs = int(basket_output["n_product_tokens"].sum()) if "n_product_tokens" in basket_output.columns else None
+    raw_baskets = int(totals["raw_baskets"] or 0)
+    raw_pairs_count = int(totals["raw_unique_ticket_product_pairs"] or 0)
+    fallback_baskets = int(fallback_totals["fallback_baskets"] or 0)
+    dropped_baskets = raw_baskets - output_baskets
+    dropped_pairs = raw_pairs_count - int(output_pairs or 0)
+
+    return pl.DataFrame(
+        [
+            {
+                **totals,
+                **candidate_totals,
+                **fallback_totals,
+                **product_totals,
+                "output_baskets": output_baskets,
+                "output_unique_ticket_product_pairs": output_pairs,
+                "baskets_dropped_by_downsampling": dropped_baskets,
+                "basket_retention_pct": _pct(output_baskets, raw_baskets),
+                "unique_pair_retention_pct": _pct(output_pairs, raw_pairs_count),
+                "unique_pairs_dropped_by_downsampling": dropped_pairs,
+                "fallback_basket_pct": _pct(fallback_baskets, raw_baskets),
+                "sample_modulus": sample_modulus,
+            }
+        ]
     )
 
 
@@ -496,16 +666,29 @@ def _common_product_keep_plan(
         base_probability = base_ratio ** exponent
     else:
         base_probability = base_ratio
-    return product_diagnostics.select(
-        [
+    keep_plan_cols = [
+        col
+        for col in [
+            "commonness_rank",
             "idarticu",
-            "common_product_candidate",
+            "product_description",
+            "sector_description",
+            "sector_id",
+            "basket_count",
+            "customer_count",
+            "line_count",
+            "units_sum",
             "customer_penetration",
             "basket_penetration",
             "line_share",
+            "unit_share",
+            "avg_units_per_line",
+            "common_product_candidate",
             "commonness_score",
         ]
-    ).with_columns(
+        if col in product_diagnostics.columns
+    ]
+    return product_diagnostics.select(keep_plan_cols).with_columns(
         [
             pl.col("idarticu").is_in(manual_exclude_ids).alias("_manual_exclude_from_embedding"),
             pl.col("idarticu").is_in(auto_exclude_ids).alias("_auto_exclude_from_embedding"),
@@ -625,7 +808,7 @@ def _basket_staple_summary_markdown(
             "",
             "- If common candidates dominate many baskets, test IDF/capped weighting or common-product masking in dev before changing the official pipeline.",
             "- Do not remove products solely because they are common; first confirm they reduce Stage 2 neighbor quality or Stage 4/6 tribe distinctiveness.",
-            "- Use this report with Stage 3 embedding validation and Stage 8 product-lift profiles.",
+            "- Use this report with Stage 3 embedding validation and Stage 7 product-lift profiles.",
             "",
         ]
     )
@@ -635,6 +818,13 @@ def _basket_staple_summary_markdown(
 def _safe_percentile(values: Any, percentile: float) -> float:
     array = [float(value) for value in values if value is not None]
     return float(pl.Series(array).quantile(percentile / 100.0)) if array else 0.0
+
+
+def _pct(numerator: int | float | None, denominator: int | float | None) -> float | None:
+    denominator_value = float(denominator or 0.0)
+    if denominator_value <= 0:
+        return None
+    return float(numerator or 0.0) / denominator_value * 100.0
 
 
 def _markdown_table(df: pl.DataFrame) -> str:
@@ -656,3 +846,4 @@ def _markdown_table(df: pl.DataFrame) -> str:
             cells.append(text.replace("|", "\\|").replace("\n", " "))
         rows.append("| " + " | ".join(cells) + " |")
     return "\n".join([header, divider, *rows])
+

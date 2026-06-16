@@ -5,7 +5,14 @@ from src.basket_builder import (
     build_basket_sentences,
     build_basket_staple_diagnostics,
 )
-from src.item2vec import BasketSentenceCorpus, load_product_embeddings, save_product_embeddings, train_item2vec
+from src.item2vec import (
+    BasketSentenceCorpus,
+    item2vec_training_summary,
+    load_product_embeddings,
+    save_product_embeddings,
+    train_item2vec,
+    write_item2vec_training_diagnostics,
+)
 
 
 def train_word2vec(*args, **kwargs):
@@ -19,8 +26,10 @@ __all__ = [
     "basket_summary",
     "build_basket_sentences",
     "build_basket_staple_diagnostics",
+    "item2vec_training_summary",
     "load_product_embeddings",
     "save_product_embeddings",
     "train_item2vec",
     "train_word2vec",
+    "write_item2vec_training_diagnostics",
 ]

@@ -109,6 +109,26 @@ def test_build_basket_sentences_uses_single_downsampled_output(tmp_path):
     assert baskets["products"].to_list() == [["niche_a"], ["niche_b"]]
     assert not (basket_path.parent / "basket_sentences_common_downsampled.parquet").exists()
 
+    plan_path = cfg.artifacts / "stage1" / "common_product_downsampling_plan.parquet"
+    summary_path = cfg.artifacts / "stage1" / "basket_downsampling_summary.csv"
+    assert plan_path.exists()
+    assert summary_path.exists()
+
+    plan = pl.read_parquet(plan_path)
+    summary = pl.read_csv(summary_path).row(0, named=True)
+    milk_plan = plan.filter(pl.col("idarticu") == "milk").row(0, named=True)
+
+    assert {"downsampling_action", "_keep_probability", "keep_probability_pct"}.issubset(set(plan.columns))
+    assert milk_plan["downsampling_action"] == "auto_exclude"
+    assert milk_plan["_keep_probability"] == 0.0
+    assert summary["raw_baskets"] == 2
+    assert summary["output_baskets"] == 2
+    assert summary["raw_unique_ticket_product_pairs"] == 4
+    assert summary["output_unique_ticket_product_pairs"] == 2
+    assert summary["auto_excluded_products"] == 1
+    assert summary["unique_pair_retention_pct"] == 50.0
+    assert summary["basket_retention_pct"] == 100.0
+
 
 def test_legacy_second_artifact_builder_is_not_public():
     import src.basket_builder as basket_builder

@@ -137,6 +137,78 @@ def _basket_training_summary(
     return row
 
 
+def item2vec_training_summary(
+    basket_path: str | Path,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, float | int | bool | None]:
+    """Summarize the basket corpus after Stage 2 training limits are applied."""
+
+    basket_file = Path(basket_path)
+    limits = _corpus_limits(cfg)
+    summary = _basket_training_summary(basket_file, cfg=cfg)
+    baskets = int(summary.get("baskets") or 0)
+    product_tokens = summary.get("product_tokens")
+    training_baskets = summary.get("training_baskets")
+    training_tokens = summary.get("training_product_tokens")
+    capped_baskets = summary.get("capped_baskets")
+    skipped_short_baskets = summary.get("skipped_short_baskets")
+    effective_window = _effective_window(basket_file, cfg)
+    return {
+        **summary,
+        "training_basket_pct": _safe_pct(training_baskets, baskets),
+        "skipped_short_basket_pct": _safe_pct(skipped_short_baskets, baskets),
+        "capped_basket_pct": _safe_pct(capped_baskets, baskets),
+        "training_token_retention_pct": _safe_pct(training_tokens, product_tokens),
+        "configured_window": int(cfg.get("word2vec.window")),
+        "effective_window": effective_window,
+        "full_basket_context": bool(cfg.get("word2vec.full_basket_context", False)),
+        "min_tokens_per_basket": int(limits["min_tokens_per_basket"] or 1),
+        "max_tokens_per_basket": limits["max_tokens_per_basket"],
+        "min_count": int(cfg.get("word2vec.min_count")),
+        "sample": float(cfg.get("word2vec.sample")),
+        "negative": int(cfg.get("word2vec.negative")),
+        "epochs": int(cfg.get("word2vec.epochs")),
+        "sg": int(cfg.get("word2vec.sg")),
+    }
+
+
+def write_item2vec_training_diagnostics(
+    basket_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Write compact diagnostics for the exact Stage 2 basket corpus."""
+
+    output = Path(output_path) if output_path else cfg.artifacts / str(
+        cfg.get("word2vec.diagnostics.output_dir", "stage2")
+    ) / str(cfg.get("word2vec.diagnostics.training_summary_csv", "item2vec_training_corpus_diagnostics.csv"))
+    metadata = {
+        "stage": "item2vec_training_corpus_diagnostics",
+        "mode": cfg.mode,
+        "basket_sentences": file_fingerprint(basket_path),
+        "word2vec": {
+            "window": int(cfg.get("word2vec.window")),
+            "full_basket_context": bool(cfg.get("word2vec.full_basket_context", False)),
+            "min_tokens_per_basket": int(_corpus_limits(cfg)["min_tokens_per_basket"] or 1),
+            "max_tokens_per_basket": _corpus_limits(cfg)["max_tokens_per_basket"],
+            "min_count": int(cfg.get("word2vec.min_count")),
+            "sample": float(cfg.get("word2vec.sample")),
+        },
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([item2vec_training_summary(basket_path, cfg=cfg)], infer_schema_length=None).write_csv(output)
+    write_artifact_metadata(output, metadata)
+    log_event("Stage 2 product embeddings", "wrote training corpus diagnostics", cfg=cfg, path=output)
+    return output
+
+
+def _safe_pct(numerator: float | int | None, denominator: float | int | None) -> float | None:
+    denominator_value = float(denominator or 0.0)
+    if denominator_value <= 0:
+        return None
+    return float(numerator or 0.0) / denominator_value * 100.0
+
+
 def _effective_window(basket_path: Path, cfg: PipelineConfig) -> int:
     configured_window = int(cfg.get("word2vec.window"))
     if not bool(cfg.get("word2vec.full_basket_context", False)):

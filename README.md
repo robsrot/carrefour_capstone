@@ -7,14 +7,14 @@ Product-first behavioral customer segmentation for Carrefour checkout data. The 
 As of 2026-06-15:
 
 - Production preprocessing and EDA are complete: raw CSVs have been converted, cleaned, joined, quality-checked, and summarized into `data/processed/`.
-- The ML pipeline is product-first: official customer vectors aggregate product embeddings using product quantities only, not spend. Spend remains available for profiling and business interpretation after clustering.
+- The ML pipeline is product-first: official customer vectors aggregate product embeddings using product quantities plus configured recency and product-frequency weighting, not spend. Spend remains available for profiling and business interpretation after clustering.
 - UMAP is used as a dimensionality-reduction aid and candidate clustering representation. It is not treated as an automatic winner.
 - Official Stage 6 compares committed model families without forcing a curated 10-15 cluster target. The client expectation is treated as a hypothesis checked after the model is evaluated.
-- Stage 7 validity/stability diagnostics and Stage 8 product-lift profiling are part of the official notebook flow before final presentation outputs.
-- Stage 9 exports the selected assignments/profiles plus shopping-mission microtribes; Stage 10 adds the business opportunity lens for campaign and financial sizing.
+- Stage 6.4 validity/stability diagnostics and Stage 7 deep profiling are the official final evidence flow before handoff.
+- Stage 7 now writes a primary evidence storyline, with product-lift profiles, a dedicated noise-population audit, tribe dossiers, subsegment overlays, clustering atlas, and aggregate-only LLM interpretation prompt pack as supporting proof.
 - Visualization outputs now belong under `outputs/<mode>/figures/`, including `figures/model_selection/`, `figures/presentation/`, and `figures/tribe_lifts/`.
-- Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; IDF downweighting and broader UMAP-HDBSCAN sweeps belong there before any setting is promoted into YAML.
-- Local prod artifacts exist for embeddings/features/model-selection caches. If `outputs/prod/profiles/` is empty, prod Stage 8 is still a cold profile build and can take a long time on the 9.8 GB prepared transaction table.
+- Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader UMAP-HDBSCAN sweeps belong there before any setting is promoted into YAML.
+- Local prod artifacts exist for embeddings/features/model-selection caches. If `outputs/prod/profiles/` is empty, prod Stage 7 is still a cold profile build and can take a long time on the 9.8 GB prepared transaction table.
 
 For the detailed status, gaps, and product-first improvement plan, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
@@ -106,7 +106,7 @@ pytest
 git status --short
 ```
 
-The source handoff must include configs, notebooks, docs, and all `src/*.py` modules. In the current local tree, `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` are present but not yet tracked; include them before another teammate runs Stage 0 or Stage 9/10. Generated data/model/output artifacts stay local and should not be committed.
+The source handoff must include configs, notebooks, docs, and all `src/*.py` modules used by the official flow. In the current local tree, `src/cache_audit.py` is required by Stage 0. Generated data/model/output artifacts stay local and should not be committed.
 
 For experimentation:
 
@@ -180,11 +180,13 @@ outputs/prod/
 - Experiments are disabled in prod. Production should only run the official pipeline with the scale-aware settings in `configs/prod.yaml`.
 - Sandbox diagnostics keep Parquet as the canonical artifact and also write compact `*_summary.csv` / `*_summary.md` files so experiments can be inspected quickly.
 - Keep `reports/` for concise human-facing outputs. Official Stage 6 compares only the committed candidates from `official_model_suite`; broader sweeps belong in the sandbox notebook.
-- Official customer vectorization must not use `importe` or other spend fields. Use quantity-only weighting in the pipeline and test IDF variants only in the sandbox.
-- Stage 7 writes cluster validity and perturbation-stability diagnostics after Stage 6, so selection is based on more than silhouette/noise alone.
+- Official customer vectorization must not use `importe` or other spend fields. Use the shared quantity plus recency/frequency weighting recipe in the pipeline; test alternate vector recipes, including IDF, only in the sandbox.
+- Stage 6.4 writes cluster validity and perturbation-stability diagnostics after Stage 6, so selection is based on more than silhouette/noise alone.
 - Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`.
 - Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`; avoid per-file `.meta.json` sidecars.
-- Stage 8 profiling can be the slowest interpretation step in prod because it scans prepared transactions to compute product, sector, theme, and term lift evidence.
+- Prod Stage 6 is intentionally sample-fit/full-assign: UMAP fits on the configured customer sample, transforms the full population in batches, and HDBSCAN fits on the same deterministic sample before assigning all customers.
+- Stage 7 profiling can be the slowest interpretation step in prod because it scans prepared transactions to compute product, sector, theme, term, noise-audit, subsegment, and customer-context evidence, then packages the result into a compact evidence storyline.
+- Stage 7 keeps HDBSCAN noise outside the official core-tribe story, but writes a noise-population audit with behavior contrasts, product/theme/term over-indexing, and a recommended action before any soft-assignment or second-pass-clustering decision.
 - Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
 
 ## Documentation
@@ -194,3 +196,4 @@ outputs/prod/
 - [docs/PROJECT_FILE_INVENTORY.md](docs/PROJECT_FILE_INVENTORY.md) is the current source-file and artifact inventory.
 - [docs/notebook_contract.md](docs/notebook_contract.md) is the stage-by-stage notebook operating contract.
 - [docs/Carrefour_Data_Challenge_Project_Context.md](docs/Carrefour_Data_Challenge_Project_Context.md) preserves the original project brief and methodological constraints.
+

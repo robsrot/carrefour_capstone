@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.progress import log_event, stage_timer
-from src.utils import file_fingerprint, frame_to_numpy, numeric_feature_columns, should_use_cache, write_artifact_metadata
+from src.utils import (
+    collect_streaming,
+    deterministic_sample_indices,
+    file_fingerprint,
+    frame_to_numpy,
+    numeric_feature_columns,
+    should_use_cache,
+    write_artifact_metadata,
+)
 
 
 def build_pca_representation(
@@ -72,11 +83,17 @@ def build_umap_representation(
     min_dist = float(umap_cfg.get("min_dist", 0.0))
     metric = str(umap_cfg.get("metric", "cosine"))
     standardize_input = bool(umap_cfg.get("standardize_input", False))
+    row_count = _parquet_row_count(feature_path)
+    fit_sample_size = _umap_fit_sample_size(umap_cfg, row_count, cfg)
+    transform_batch_size = int(umap_cfg.get("transform_batch_size", 100000))
     cache_metadata = {
         "stage": "umap_representation",
         "mode": cfg.mode,
         "feature_path": file_fingerprint(feature_path),
         "umap": umap_cfg,
+        "resolved_fit_sample_size": fit_sample_size,
+        "source_rows": row_count,
+        "transform_batch_size": transform_batch_size,
         "random_seed": cfg.random_seed,
         "purpose": "clustering_candidate",
     }
@@ -91,33 +108,161 @@ def build_umap_representation(
         components=n_components,
         n_neighbors=n_neighbors,
         metric=metric,
+        source_rows=row_count,
+        fit_sample_size=fit_sample_size,
     ):
-        df = pl.read_parquet(feature_path).sort("cliente")
-        feature_cols = numeric_feature_columns(df)
-        X = frame_to_numpy(df, feature_cols)
-        if standardize_input:
-            X = StandardScaler().fit_transform(X).astype("float32")
-        else:
-            X = X.astype("float32", copy=False)
+        schema_df = pl.read_parquet(feature_path, n_rows=1)
+        feature_cols = numeric_feature_columns(schema_df)
+        fit_indices = deterministic_sample_indices(row_count, fit_sample_size, cfg.random_seed)
+        if fit_indices.shape[0] >= row_count:
+            df = pl.read_parquet(feature_path).sort("cliente")
+            X = frame_to_numpy(df, feature_cols)
+            if standardize_input:
+                X = StandardScaler().fit_transform(X).astype("float32")
+            else:
+                X = X.astype("float32", copy=False)
 
-        reducer = umap.UMAP(
-            n_components=min(n_components, X.shape[1], X.shape[0] - 1),
-            n_neighbors=min(n_neighbors, X.shape[0] - 1),
-            min_dist=min_dist,
-            metric=metric,
-            random_state=cfg.random_seed,
-            low_memory=bool(umap_cfg.get("low_memory", True)),
-            n_jobs=int(umap_cfg.get("n_jobs", 1)),
-        )
-        coords = reducer.fit_transform(X).astype("float32")
-        out = {"cliente": df["cliente"].to_list()}
-        for idx in range(coords.shape[1]):
-            out[f"umap_{idx:03d}"] = coords[:, idx]
-        output.parent.mkdir(parents=True, exist_ok=True)
-        pl.DataFrame(out).write_parquet(output)
+            reducer = umap.UMAP(
+                n_components=min(n_components, X.shape[1], X.shape[0] - 1),
+                n_neighbors=min(n_neighbors, X.shape[0] - 1),
+                min_dist=min_dist,
+                metric=metric,
+                random_state=cfg.random_seed,
+                low_memory=bool(umap_cfg.get("low_memory", True)),
+                n_jobs=int(umap_cfg.get("n_jobs", 1)),
+            )
+            coords = reducer.fit_transform(X).astype("float32")
+            out = {"cliente": df["cliente"].to_list()}
+            for idx in range(coords.shape[1]):
+                out[f"umap_{idx:03d}"] = coords[:, idx]
+            output.parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame(out).write_parquet(output)
+        else:
+            sample = _collect_feature_rows_by_index(feature_path, feature_cols, fit_indices)
+            X_fit = frame_to_numpy(sample, feature_cols)
+            scaler = None
+            if standardize_input:
+                scaler = StandardScaler()
+                X_fit = scaler.fit_transform(X_fit).astype("float32")
+            else:
+                X_fit = X_fit.astype("float32", copy=False)
+
+            reducer = umap.UMAP(
+                n_components=min(n_components, X_fit.shape[1], X_fit.shape[0] - 1),
+                n_neighbors=min(n_neighbors, X_fit.shape[0] - 1),
+                min_dist=min_dist,
+                metric=metric,
+                random_state=cfg.random_seed,
+                low_memory=bool(umap_cfg.get("low_memory", True)),
+                n_jobs=int(umap_cfg.get("n_jobs", 1)),
+            )
+            reducer.fit(X_fit)
+            _write_umap_transformed_batches(
+                feature_path,
+                feature_cols,
+                reducer,
+                output,
+                standardize_input=standardize_input,
+                scaler=scaler,
+                batch_size=transform_batch_size,
+                row_count=row_count,
+                cfg=cfg,
+            )
         write_artifact_metadata(output, cache_metadata)
-        log_event("Stage 6 UMAP", "wrote artifact", cfg=cfg, rows=df.height, dims=coords.shape[1], path=output)
+        log_event(
+            "Stage 6 UMAP",
+            "wrote artifact",
+            cfg=cfg,
+            rows=row_count,
+            fit_sample_rows=int(fit_indices.shape[0]),
+            path=output,
+        )
     return output
+
+
+def _parquet_row_count(path: str | Path) -> int:
+    return int(collect_streaming(pl.scan_parquet(path).select(pl.len().alias("n_rows")))[0, "n_rows"])
+
+
+def _umap_fit_sample_size(umap_cfg: dict[str, Any], row_count: int, cfg: PipelineConfig) -> int:
+    raw_value = umap_cfg.get("fit_sample_size", None)
+    if raw_value is None:
+        raw_value = cfg.get("modeling.fit_sample_size", None)
+    if raw_value is None:
+        return row_count
+    sample_size = int(raw_value)
+    if sample_size <= 0:
+        return row_count
+    return min(sample_size, row_count)
+
+
+def _collect_feature_rows_by_index(
+    feature_path: str | Path,
+    feature_cols: list[str],
+    indices: np.ndarray,
+) -> pl.DataFrame:
+    return (
+        collect_streaming(
+            pl.scan_parquet(feature_path)
+            .with_row_index("_row_idx")
+            .filter(pl.col("_row_idx").is_in([int(value) for value in indices]))
+            .select(["_row_idx", "cliente", *feature_cols])
+            .sort("_row_idx")
+        )
+        .drop("_row_idx")
+    )
+
+
+def _write_umap_transformed_batches(
+    feature_path: str | Path,
+    feature_cols: list[str],
+    reducer: Any,
+    output: Path,
+    *,
+    standardize_input: bool,
+    scaler: Any,
+    batch_size: int,
+    row_count: int,
+    cfg: PipelineConfig,
+) -> None:
+    batch_size = max(int(batch_size), 1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    parts_dir = output.parent / f".{output.stem}_umap_parts"
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        part_index = 0
+        for offset in range(0, row_count, batch_size):
+            batch = collect_streaming(
+                pl.scan_parquet(feature_path)
+                .slice(offset, batch_size)
+                .select(["cliente", *feature_cols])
+            )
+            if batch.is_empty():
+                continue
+            X_batch = frame_to_numpy(batch, feature_cols)
+            if standardize_input and scaler is not None:
+                X_batch = scaler.transform(X_batch).astype("float32")
+            else:
+                X_batch = X_batch.astype("float32", copy=False)
+            coords = reducer.transform(X_batch).astype("float32")
+            out = {"cliente": batch["cliente"].to_list()}
+            for idx in range(coords.shape[1]):
+                out[f"umap_{idx:03d}"] = coords[:, idx]
+            pl.DataFrame(out).write_parquet(parts_dir / f"part_{part_index:05d}.parquet")
+            part_index += 1
+            log_event(
+                "Stage 6 UMAP",
+                "transformed batch",
+                cfg=cfg,
+                rows=batch.height,
+                offset=offset,
+                total_rows=row_count,
+            )
+        pl.scan_parquet(str(parts_dir / "part_*.parquet")).sink_parquet(str(output))
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
 
 
 def build_umap_visualization(

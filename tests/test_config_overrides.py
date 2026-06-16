@@ -51,3 +51,24 @@ def test_stage1_config_has_no_legacy_second_artifact_path():
 
     assert "output" not in downsampling
     assert "summary_md" not in downsampling
+
+
+def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
+    base = _read_yaml(CONFIG_DIR / "base.yaml")
+    official = base["official_model_suite"]
+    promoted = official["umap_hdbscan"]
+    hdbscan = promoted["hdbscan"]
+
+    assert base["modeling"]["feature_set_for_selection"] == "embeddings_only"
+    assert official["include_umap_hdbscan"] is True
+    assert official["include_gmm"] is False
+    assert official["include_pca_kmeans"] is False
+    assert hdbscan["allow_noise_assignment"] is False
+    assert "soft" not in promoted["trial_name"].lower()
+    assert "soft" not in promoted["model_name"].lower()
+    assert "soft" not in promoted["output_prefix"].lower()
+    assert "SoftNoiseAssignment" not in promoted["algorithm_name"]
+
+    prod = _read_yaml(CONFIG_DIR / "prod.yaml")
+    prod_promoted = prod["official_model_suite"]["umap_hdbscan"]
+    assert "soft" not in prod_promoted["trial_name"].lower()

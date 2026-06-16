@@ -109,12 +109,12 @@ Use this rule:
 
 8. Judge the promoted setting with official evidence.
 
-A promoted setting is not accepted until Stage 6, Stage 7, and tribe profiles are reviewed together.
+A promoted setting is not accepted until Stage 6, Stage 6.4 cluster readiness, and tribe profiles are reviewed together.
 
 Look at:
 
 - Stage 6 candidate summary.
-- Stage 7 validity and stability diagnostics.
+- Stage 6.4 stability and profile-readiness diagnostics.
 - Cluster count, noise rate, balance, and tiny-cluster risk.
 - Product and sector lift profiles.
 - Whether tribes can be named commercially without forcing a story.
@@ -144,7 +144,7 @@ These should be run before the team makes a final modeling decision.
 | Customer vectors | Compare `quantity` vs `quantity_idf` vs `equal_idf`, with and without vector normalization | Tests whether universal products are dominating the customer space |
 | Feature sets | Compare `embeddings_only` against any behavior-augmented variant | Confirms whether product vectors are enough and whether behavior features distort topology |
 | UMAP-HDBSCAN | Try a small focused grid over UMAP dimensions/neighbors and HDBSCAN density settings | Verifies whether the current HDBSCAN result is a hyperparameter issue or an upstream representation issue |
-| Stability | Review Stage 7 validity/stability after any promoted candidate | Prevents selecting a pretty but fragile segmentation |
+| Stability | Review Stage 6.4 stability/readiness after any promoted candidate | Prevents selecting a pretty but fragile segmentation |
 | Profiles | Inspect product and sector lift for the selected candidate | The final tribes must be commercially interpretable |
 
 ## Should-Do Experiments
@@ -215,7 +215,7 @@ Before a sandbox winner becomes official:
 - The detailed Parquet does not reveal hidden problems.
 - Product-lift profiles make sense.
 - Noise and cluster-size balance are acceptable.
-- Stage 7 stability does not contradict the result.
+- Stage 6.4 stability/readiness does not contradict the result.
 - The change is explainable to a business audience.
 - YAML is updated only after the evidence review.
 - Official pipeline has been rerun from the affected stage.
@@ -223,7 +223,7 @@ Before a sandbox winner becomes official:
 ## Definition of Ready for Final Production Run
 
 - Dev run is rebuilt from the latest promoted settings.
-- Stage 6 and Stage 7 agree on a defensible candidate.
+- Stage 6 density evidence and Stage 6.4 readiness agree on a defensible candidate.
 - Tribe profiles show distinctive products and sectors by lift, not only raw frequency.
 - The selected configuration is committed in YAML.
 - `pytest` passes or any test gap is explicitly documented.

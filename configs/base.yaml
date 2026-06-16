@@ -48,6 +48,8 @@ baskets:
     product_ubiquity_output: product_ubiquity_diagnostics.parquet
     basket_exposure_output: basket_common_product_exposure.parquet
     common_products_csv: common_product_candidates.csv
+    downsampling_plan_output: common_product_downsampling_plan.parquet
+    downsampling_summary_output: basket_downsampling_summary.csv
     summary_md: basket_common_product_diagnostics.md
     write_markdown_report: false
     top_n_common_products: 50
@@ -82,6 +84,9 @@ word2vec:
   compute_loss: false
   model_name: word2vec_product.model
   embeddings_output: product_embeddings.parquet
+  diagnostics:
+    output_dir: stage2
+    training_summary_csv: item2vec_training_corpus_diagnostics.csv
 
 embedding_validation:
   output_dir: stage3
@@ -125,19 +130,51 @@ customer_embeddings:
   quantity_transform: log1p
   max_customer_product_weight: null
   normalize_vectors: true
+  recency_weighting:
+    enabled: true
+    date_column: fecha
+    reference_date: null
+    half_life_days: 180
+    min_multiplier: 0.35
+  frequency_weighting:
+    enabled: true
+    ticket_column: ticket
+    transform: log1p
+    exponent: 0.5
+    max_multiplier: 2.0
   diagnostics:
     enabled: true
     output_dir: stage4
     output_prefix: customer_embedding
     write_top_products_csv: false
     top_n_products: 15
+  variant_diagnostics:
+    enabled: false
+    output_dir: stage4
+    output_csv: customer_embedding_variant_diagnostics.csv
+    trials:
+      - name: official_quantity_log1p
+        weight_strategy: quantity
+        quantity_transform: log1p
+        max_customer_product_weight: null
+        normalize_vectors: true
+      - name: capped_quantity_log1p_10
+        weight_strategy: quantity
+        quantity_transform: log1p
+        max_customer_product_weight: 10
+        normalize_vectors: true
+      - name: quantity_idf_log1p
+        weight_strategy: quantity_idf
+        quantity_transform: log1p
+        max_customer_product_weight: null
+        normalize_vectors: true
   gates:
     enabled: true
     fail_on_violation: true
     apply_to_custom_outputs: false
     min_line_coverage_pct: 90.0
     min_unit_coverage_pct: 90.0
-    min_product_coverage_pct: 35.0
+    min_product_coverage_pct: null
     min_customer_coverage_pct: 99.0
     max_zero_embedded_customer_pct: 1.0
     max_top_product_weight_share_pct: 5.0
@@ -145,8 +182,8 @@ customer_embeddings:
     max_mean_customer_top_product_weight_share_pct: 65.0
     max_p95_customer_top_product_weight_share_pct: 95.0
     max_common_product_weight_share_pct: 60.0
-    max_mean_customer_common_product_weight_share_pct: 80.0
-    max_p95_customer_common_product_weight_share_pct: 98.0
+    max_mean_customer_common_product_weight_share_pct: 70.0
+    max_p95_customer_common_product_weight_share_pct: 90.0
 
 behavioral_features:
   output: customer_behavior_features.parquet
@@ -155,6 +192,11 @@ behavioral_features:
 feature_sets:
   default: embeddings_only
   standardize_behavior: true
+  diagnostics:
+    output_dir: stage5
+    output_csv: feature_set_diagnostics.csv
+    neighbor_overlap_k: 10
+    neighbor_overlap_sample_size: 2000
   outputs:
     embeddings_only: feature_set_embeddings_only.parquet
     embeddings_behavior: feature_set_embeddings_behavior.parquet
@@ -180,11 +222,11 @@ modeling:
   client_hypothesis_max: 15
 
 official_model_suite:
-  include_gmm: true
+  include_gmm: false
   include_raw_hdbscan: false
   include_umap_hdbscan: true
   include_autoencoder: false
-  include_pca_kmeans: true
+  include_pca_kmeans: false
   gmm:
     components_min: 10
     components_max: 10
@@ -195,28 +237,26 @@ official_model_suite:
       k_min: 10
       k_max: 10
   umap_hdbscan:
-    promoted_from_experiment: experiment_8_dimensionality_reduction_master_search
-    trial_name: u10_n75_leaf_mcs400_soft_q95
-    model_name: model_b_umap_hdbscan_soft
-    output_prefix: model_b_umap_hdbscan_soft
-    algorithm_name: UMAP_HDBSCAN_SoftNoiseAssignment
-    feature_space: umap_customer_embeddings_u10_n75_leaf_mcs400
-    variant_prefix: u10_n75_leaf_mcs400
+    promoted_from_experiment: experiment_8_umap_hdbscan_noise_reduction_grid
+    trial_name: u8_n75_leaf_mcs350_ms2_core
+    model_name: model_b_umap_hdbscan_core
+    output_prefix: model_b_umap_hdbscan_core
+    algorithm_name: UMAP_HDBSCAN
+    feature_space: umap_customer_embeddings_u8_n75
+    variant_prefix: u8_n75_leaf_mcs350_ms2
     umap:
-      output: feature_set_umap_u10_n75_leaf_mcs400.parquet
-      n_components: 10
+      output: feature_set_umap_u8_n75.parquet
+      n_components: 8
       n_neighbors: 75
       min_dist: 0.0
       metric: cosine
-      standardize_input: false
-      low_memory: true
-      n_jobs: 1
+      fit_sample_size: null
+      transform_batch_size: 100000
     hdbscan:
-      min_cluster_size: 400
-      min_samples: 1
+      min_cluster_size: 350
+      min_samples: 2
       cluster_selection_method: leaf
-      allow_noise_assignment: true
-      noise_assignment_strategy: q95
+      allow_noise_assignment: false
 
 stability:
   sample_size: 10000
@@ -230,6 +270,12 @@ quality_gates:
   max_cluster_size_cv: 1.5
   require_profile_lift: false
   min_strong_product_lifts_per_cluster: 1.0
+
+stage6_quality:
+  sample_size: 5000
+  neighbor_k: 15
+  distance_sample_size: 1500
+  dbcv_sample_size: 3000
 
 gmm:
   components_min: 6
@@ -254,6 +300,8 @@ umap:
   standardize_input: false
   low_memory: true
   n_jobs: 1
+  fit_sample_size: null
+  transform_batch_size: 100000
 
 pca:
   n_components: 32
@@ -279,38 +327,22 @@ profiling:
   strong_sector_lift_threshold: 1.2
   strong_theme_lift_threshold: 1.2
   strong_term_lift_threshold: 1.25
+  significance_q_threshold: 0.05
+  noise_audit_top_n: 12
+  noise_audit_min_customers: 20
+  noise_audit_strong_lift_threshold: 1.25
+  noise_audit_high_noise_pct: 60.0
+  noise_audit_second_pass_signal_count: 5
+  min_ready_evidence_signals: 1
+  campaign_signal_themes: []
   output_parquet: tribe_profiles.parquet
   output_csv_template: tribe_profiles_{mode}.csv
 
-mission_microtribes:
-  min_customers: 20
-  min_presented_customers: 1000
-  min_presented_avg_matching_products: 1.4
-  min_presented_confidence: medium
-  max_presented_missions: 10
-  top_n_core_tribes: 4
-  top_n_products: 5
-  write_companion_files: false
-  exclude_from_presentation:
-    - baby
-    - kids
-    - pet_dog
-    - pet_cat
-    - world_foods_asian
-    - world_foods_mexican
-    - world_foods_middle_eastern
-    - world_foods_latin
-
 exports:
-  presentation_dir: presentation
-  evidence_dir: evidence
   write_table_companions: false
-  assignments_template: customer_tribe_assignments_{mode}.parquet
-  model_comparison_template: model_comparison_{mode}.csv
   cluster_summary_template: cluster_summary_{mode}.csv
   tribe_comparison_template: tribe_side_by_side_{mode}.csv
   clustering_atlas_template: clustering_atlas_{mode}.html
-  decision_log_template: decision_log_{mode}.md
   profile_report_template: tribe_profile_evidence_{mode}.md
 
 visualization:

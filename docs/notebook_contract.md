@@ -1,6 +1,6 @@
 # Notebook Contract
 
-Last updated: 2026-06-15
+Last updated: 2026-06-16
 
 The notebooks should orchestrate the pipeline, show compact diagnostics, and explain decisions. Reusable logic belongs in `src/`.
 
@@ -52,40 +52,46 @@ Required handoff artifacts:
 
 ## Notebook 3: Official ML Pipeline
 
-`notebooks/03_ml_pipeline.ipynb` is the official run. It should use YAML settings and avoid hardcoded experiment grids.
+`notebooks/03_ml_pipeline.ipynb` is the official run. It should use promoted YAML settings and avoid hardcoded experiment grids, side-by-side recipe trials, or sandbox-style model bake-offs.
 
 Stages:
 
 0. Mode setup, path validation, cache audit, and prepared-data overview.
 1. Basket sentence generation.
+   Stage 1 basket sentences use product ids as tokens. Under the current official settings, products are not repeated by `unidades`; quantities enter the official customer representation in Stage 4. When common-product downsampling is enabled, Stage 1 must persist the SKU-level keep/exclusion plan and a compact basket/token retention summary.
 2. Item2Vec product embedding training/export.
+   Stage 2 must write a training-corpus diagnostic CSV showing how many baskets and product tokens are actually used after `min_tokens_per_basket`, `max_tokens_per_basket`, and context-window settings.
 3. Product embedding validation.
    Stage 3 must review more than a small random product sample: it includes common and rare products, staple and niche products, and data-selected niche-theme checks from the product text/theme taxonomy. The report must compare common-vs-rare nearest-neighbor quality and flag niche-focus products whose neighbors are mostly generic staples. Guardrail status is computed dynamically in the notebook; when it finds a problem, remediate through Stage 1/2 settings and rebuild downstream stages rather than using a manual acceptance toggle.
 4. Customer embedding aggregation.
 5. Feature-set construction and dimensionality representations.
-6. Official candidate model comparison.
-7. Cluster validity and perturbation-stability diagnostics.
-8. Tribe profiling and interpretability.
-9. Final model selection, selected assignment/profile exports, and shopping-mission microtribes.
-10. Additional business lens for campaign opportunity and financial-sizing scenarios.
-
-The decision-log section follows the stage flow and writes the final model-selection rationale.
+6. Hard UMAP-HDBSCAN core tribe discovery.
+6.4. Cluster validity and perturbation-stability diagnostics.
+7. Deep tribe profiling and interpretation. This is the official final handoff stage.
 
 Official customer embeddings are quantity weighted:
 
 - Uses `cliente`, `idarticu`, `unidades`, and product embedding columns.
 - Applies the configured quantity transform (`customer_embeddings.quantity_transform`, currently `log1p`) before aggregating product vectors.
+- Applies configured product-purchase recency decay and product-specific basket-count frequency scaling as weights, not as separate behavioral feature columns.
 - Writes only compact Stage 4 weight diagnostics by default; detailed top-product exports are opt-in, and review should happen mainly through notebook tables and figures.
+- Treats unique-product coverage as informational because rare long-tail SKUs are intentionally excluded by Item2Vec `min_count`; line, unit, and customer coverage are the hard Stage 4 coverage gates.
 - Does not use `importe`.
-- IDF-downweighted variants are sandbox-only unless promoted to YAML after evidence review.
+- Capped, equal-weight, or alternate IDF customer embedding variants belong in `notebooks/04_experiment_sandbox.ipynb` unless one is promoted into the official YAML recipe after evidence review.
 
-Official clustering should default to the product/quantity feature set. Feature sets that include behavior or spend-derived profile columns are for ablation, diagnostics, or sandbox evidence unless explicitly promoted after review.
+Official clustering should use the product/quantity `embeddings_only` feature set. Feature sets that include behavior or spend-derived profile columns belong in sandbox evidence, not in the official pipeline notebook.
 
-Official Stage 6 compares configured model families without forcing the client hypothesis of 10-15 tribes. The final selected number of tribes is judged after evaluation through metrics, stability, cluster balance, product/sector lift, and commercial interpretability.
+Stage 5 writes compact diagnostics for the official feature set under `outputs/<mode>/artifacts/stage5/` and displays the key row in-notebook: row/feature counts, finite/null rates, zero-variance columns, customer alignment, and selection-feature status. Behavioral features may still be built as separate profiling inputs for later interpretation, but they are not an alternate modeling feature set in Notebook 03.
+
+Official Stage 6 runs the promoted UMAP-to-HDBSCAN recipe as hard core-tribe discovery. It is split into notebook subsections: Stage 6.1 builds and checks the UMAP representation, Stage 6.2 runs hard HDBSCAN and checks assignment quality/provenance, and Stage 6.3 writes compact model diagnostics only after the prior checks pass. It must not soft-assign HDBSCAN noise customers in the official discovery step; `tribe_id = -1` remains the honest non-core population. The final selected number of tribes is judged after evaluation through metrics, stability, cluster balance, product/sector lift, and commercial interpretability, without forcing the client hypothesis of 10-15 tribes.
 
 UMAP is a dimensionality-reduction aid. It is useful when it improves clustering evidence; it is not automatically selected because it exists.
 
-Stage 8 can be slow in prod on a cache miss because it scans prepared transactions and computes product, sector, strategic-theme, product-term, and KPI evidence for the selected assignment. In the current local workspace, `outputs/prod/profiles/` may be empty until that cold build completes.
+For production scale, Stage 6 is sample-fit/full-assign. UMAP fits on the configured deterministic sample and transforms the full customer population in batches. HDBSCAN then fits on the configured deterministic sample and assigns the full UMAP population through the supported HDBSCAN prediction path. Stage 6.3 and Stage 6.4 diagnostics use sampled feature matrices while retaining full assignment counts for coverage, noise, and readiness summaries.
+
+Stage 7 can be slow in prod on a cache miss because it scans prepared transactions and computes product, sector, strategic-theme, product-term, KPI, noise-population audit, subsegment, clustering-atlas, evidence-storyline, and aggregate-only LLM prompt evidence for the selected assignment. In the current local workspace, `outputs/prod/profiles/` may be empty until that cold build completes.
+
+The official assignment must keep HDBSCAN noise as `tribe_id = -1`; Stage 7 must still audit that population before handoff. The noise audit is aggregate-only and answers whether noise looks like weak signal, sparse/lapsed customers, broad generalists, rare-product behavior, or a candidate pool for separate second-pass investigation. It does not rename the official core tribes or silently soft-assign customers.
 
 Official visual outputs belong under `outputs/<mode>/figures/`; presentation-ready figures go under `outputs/<mode>/figures/presentation/`, model-selection views under `outputs/<mode>/figures/model_selection/`, and per-tribe lift plots under `outputs/<mode>/figures/tribe_lifts/`.
 
@@ -125,8 +131,9 @@ df_combined
 -> feature_sets / UMAP / PCA
 -> cluster assignments
 -> validity/stability diagnostics
--> tribe profiles
--> final exports, figures, shopping missions, and business lens
+-> evidence storyline
+-> deep tribe profiles, noise-population audit, dossiers, subsegment overlays, clustering atlas, and LLM interpretation prompt pack
 ```
 
-The latest quantity-only vectorization change requires rerunning from Stage 4 onward before interpreting new clustering results.
+The current quantity plus recency/frequency vectorization recipe requires rerunning from Stage 4 onward before interpreting new clustering results when changed.
+

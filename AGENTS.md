@@ -4,12 +4,12 @@ This repository builds product-first customer tribes from Carrefour checkout dat
 
 ## Current Modeling Contract
 
-- Official customer embeddings use product identity plus `unidades`.
+- Official customer embeddings use product identity plus `unidades` with the configured `log1p` quantity transform, product-purchase recency decay, and product-specific basket-count frequency scaling.
 - Official customer embeddings do not use `importe`, total spend, average basket value, or revenue tier.
 - Spend and KPIs are allowed for profiling and business interpretation after clustering.
 - UMAP is a dimensionality-reduction aid, not an automatic winner.
 - The 10-15 tribe range is a client hypothesis, not a clustering constraint.
-- IDF downweighting is currently a sandbox experiment, not an official pipeline setting.
+- Alternative customer-vector recipes remain sandbox experiments until deliberately promoted into YAML.
 
 ## Modes
 
@@ -52,7 +52,7 @@ Expected sklearn version: `1.7.2`. `hdbscan==0.8.40` can fail with sklearn `1.8.
 4. Optional dev experiments in `notebooks/04_experiment_sandbox.ipynb`
 5. Official run in `notebooks/03_ml_pipeline.ipynb`
 
-After changing vectorization, feature construction, UMAP, or clustering logic, rebuild downstream stages. The latest quantity-only vectorization change requires rerunning from Stage 4 onward.
+After changing vectorization, feature construction, UMAP, or clustering logic, rebuild downstream stages. The current quantity plus recency/frequency vectorization recipe requires rerunning from Stage 4 onward when changed.
 
 ## Artifact Rules
 

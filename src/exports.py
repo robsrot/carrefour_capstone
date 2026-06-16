@@ -40,14 +40,14 @@ def collect_cached_presentation_figures(
         seen_paths.add(path_key)
 
     known_presentation_files = [
-        ("Selected Tribe Vs Population Dashboard", f"stage_08_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"),
-        ("Selected Tribe Theme Lift Heatmap", f"stage_08_tribe_theme_lift_heatmap_{cfg.mode}.png"),
+        ("Selected Tribe Vs Population Dashboard", f"stage_07_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"),
+        ("Selected Tribe Theme Lift Heatmap", f"stage_07_tribe_theme_lift_heatmap_{cfg.mode}.png"),
         ("Core Tribe Sizes", f"stage_09_core_tribe_sizes_{cfg.mode}.png"),
         ("Assignment Provenance", f"stage_09_assignment_provenance_{cfg.mode}.png"),
         ("Shopping Mission Overview", f"stage_09_shopping_mission_overview_{cfg.mode}.png"),
         ("Core Mission Lift Heatmap", f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
-        ("Stage 7 PCA Projection", f"stage_07_winner_projection_pca.png"),
-        ("Stage 7 UMAP Projection", f"stage_07_winner_projection_umap.png"),
+        ("Stage 6.4 PCA Projection", f"stage_06_4_winner_projection_pca.png"),
+        ("Stage 6.4 UMAP Projection", f"stage_06_4_winner_projection_umap.png"),
         ("Stage 9 PCA Projection", f"stage_09_final_projection_pca.png"),
         ("Stage 9 UMAP Projection", f"stage_09_final_projection_umap.png"),
     ]
@@ -91,7 +91,7 @@ def build_model_comparison(
     """Write a client-readable model comparison table."""
 
     cfg.ensure_directories()
-    with stage_timer("Stage 8 exports", "building model comparison", cfg=cfg, candidates=len(candidate_results)):
+    with stage_timer("Stage 9 exports", "building model comparison", cfg=cfg, candidates=len(candidate_results)):
         rows = []
         for result in candidate_results:
             row = dict(result)
@@ -121,13 +121,14 @@ def build_model_comparison(
         output = (
             Path(output_path)
             if output_path
-            else cfg.reports / cfg.get("exports.model_comparison_template").format(mode=cfg.mode)
+            else cfg.reports
+            / str(cfg.get("exports.model_comparison_template", "model_comparison_{mode}.csv")).format(mode=cfg.mode)
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         pl.DataFrame(ranked).write_csv(output)
         selected = next((row for row in ranked if row.get("recommendation") == "Selected"), None)
         log_event(
-            "Stage 8 exports",
+            "Stage 9 exports",
             "wrote model comparison",
             cfg=cfg,
             selected=selected.get("model_variant") if selected else "none",
@@ -239,7 +240,8 @@ def export_final_assignments(
     output = (
         Path(output_path)
         if output_path
-        else cfg.reports / cfg.get("exports.assignments_template").format(mode=cfg.mode)
+        else cfg.reports
+        / str(cfg.get("exports.assignments_template", "customer_tribe_assignments_{mode}.parquet")).format(mode=cfg.mode)
     )
     assignments = pl.read_parquet(selected_assignment_path)
     columns = [
@@ -259,7 +261,7 @@ def export_final_assignments(
     assignments = assignments.select(columns)
     output.parent.mkdir(parents=True, exist_ok=True)
     assignments.write_parquet(output)
-    log_event("Stage 8 exports", "wrote final assignments", cfg=cfg, rows=assignments.height, path=output)
+    log_event("Stage 9 exports", "wrote final assignments", cfg=cfg, rows=assignments.height, path=output)
     return output
 
 
@@ -274,7 +276,7 @@ def export_final_profiles(
         else cfg.reports / cfg.get("profiling.output_csv_template").format(mode=cfg.mode)
     )
     exported = flatten_profiles_for_csv(selected_profile_path, output)
-    log_event("Stage 8 exports", "wrote final profiles", cfg=cfg, path=exported)
+    log_event("Stage 9 exports", "wrote final profiles", cfg=cfg, path=exported)
     return exported
 
 
@@ -292,7 +294,8 @@ def write_decision_log(
         output = (
             Path(output_path)
             if output_path
-            else cfg.reports / cfg.get("exports.decision_log_template").format(mode=cfg.mode)
+            else cfg.reports
+            / str(cfg.get("exports.decision_log_template", "decision_log_{mode}.md")).format(mode=cfg.mode)
         )
         lines = [
             "# Decision Log: Final Tribe Model Selection",
@@ -314,7 +317,7 @@ def write_decision_log(
             )
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(lines), encoding="utf-8")
-        log_event("Stage 8 exports", "wrote no-selection decision log", cfg=cfg, path=output)
+        log_event("Stage 9 exports", "wrote no-selection decision log", cfg=cfg, path=output)
         return output
 
     selected = selected_rows.sort("final_rank").row(0, named=True)
@@ -419,11 +422,11 @@ def write_decision_log(
     output = (
         Path(output_path)
         if output_path
-        else cfg.reports / cfg.get("exports.decision_log_template").format(mode=cfg.mode)
+        else cfg.reports / str(cfg.get("exports.decision_log_template", "decision_log_{mode}.md")).format(mode=cfg.mode)
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(lines), encoding="utf-8")
-    log_event("Stage 8 exports", "wrote decision log", cfg=cfg, path=output)
+    log_event("Stage 9 exports", "wrote decision log", cfg=cfg, path=output)
     return output
 
 
@@ -1005,3 +1008,5 @@ def _stage9_artifact_href(path: str | Path, base_dir: Path) -> str:
         return Path(os.path.relpath(Path(path), base_dir)).as_posix()
     except ValueError:
         return Path(path).as_posix()
+
+

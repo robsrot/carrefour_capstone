@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from src.config import CONFIG, PipelineConfig
 from src.evaluation import cluster_size_summary
 from src.experiment_reporting import write_summary_artifacts
 from src.progress import log_event, stage_timer
-from src.utils import deterministic_sample_indices, frame_to_numpy, numeric_feature_columns
+from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns
 
 
 def build_cluster_validity_stability_report(
@@ -41,39 +42,57 @@ def build_cluster_validity_stability_report(
         feature_path=feature_path,
         repeats=repeats,
     ):
-        features = pl.read_parquet(feature_path).sort("cliente")
-        feature_cols = numeric_feature_columns(features)
-        X = frame_to_numpy(features, feature_cols)
-        X = _standardize(X)
-        base = features.select("cliente").with_columns(pl.Series("_row_idx", np.arange(features.height)))
+        feature_cols = numeric_feature_columns(pl.read_parquet(feature_path, n_rows=1))
 
         rows = []
+        cluster_rows = []
         for candidate_key, assignment_path in sorted((model_suite.get("assignment_paths") or {}).items()):
-            assignments = (
-                pl.read_parquet(assignment_path)
-                .select(["cliente", "tribe_id", "model_name", "model_variant"])
-                .unique(subset=["cliente"], keep="first")
-            )
-            joined = base.join(assignments, on="cliente", how="inner").sort("_row_idx")
-            labels = joined["tribe_id"].to_numpy().astype(int)
-            row_indices = joined["_row_idx"].to_numpy().astype(int)
+            assignment_df = pl.read_parquet(assignment_path)
+            if "assignment_confidence_score" not in assignment_df.columns:
+                assignment_df = assignment_df.with_columns(
+                    pl.lit(None).cast(pl.Float64).alias("assignment_confidence_score")
+                )
+            if "assignment_source" not in assignment_df.columns:
+                assignment_df = assignment_df.with_columns(pl.lit("unknown").alias("assignment_source"))
+            assignments = assignment_df.select(
+                [
+                    "cliente",
+                    "tribe_id",
+                    "model_name",
+                    "model_variant",
+                    "assignment_confidence_score",
+                    "assignment_source",
+                ]
+            ).unique(subset=["cliente"], keep="first")
+            labels = assignments["tribe_id"].to_numpy().astype(int)
             metrics = cluster_size_summary(labels)
+            stability_features = _sample_candidate_features(assignments, feature_path, feature_cols, sample_size, cfg)
             stability = _jitter_stability(
-                X[row_indices],
-                labels,
+                stability_features["X"],
+                stability_features["labels"],
                 sample_size=sample_size,
                 repeats=repeats,
                 jitter_scale=jitter_scale,
                 seed=cfg.random_seed,
             )
+            cluster_recovery = stability.pop("_cluster_recovery_accuracy_mean_by_label", {})
+            cluster_rows.extend(
+                _cluster_readiness_rows(
+                    assignments,
+                    candidate_key=candidate_key,
+                    total_rows=int(assignments.height),
+                    cluster_recovery=cluster_recovery,
+                    min_cluster_size=_candidate_min_cluster_size(candidate_key, model_suite, cfg),
+                )
+            )
             rows.append(
                 {
                     "candidate_id": candidate_key,
-                    "model_name": joined["model_name"][0] if joined.height else None,
-                    "model_variant": joined["model_variant"][0] if joined.height else None,
-                    "rows_evaluated": int(joined.height),
+                    "model_name": assignments["model_name"][0] if assignments.height else None,
+                    "model_variant": assignments["model_variant"][0] if assignments.height else None,
+                    "rows_evaluated": int(assignments.height),
                     "feature_count": int(len(feature_cols)),
-                    "stability_sample_size": int(min(sample_size, max(int(np.sum(labels >= 0)), 0))),
+                    "stability_sample_size": int(stability_features["X"].shape[0]),
                     "stability_repeats": repeats,
                     "jitter_scale": jitter_scale,
                     **metrics,
@@ -88,6 +107,11 @@ def build_cluster_validity_stability_report(
     report = pl.DataFrame(rows).sort("candidate_id") if rows else pl.DataFrame()
     output.parent.mkdir(parents=True, exist_ok=True)
     report.write_parquet(output)
+    cluster_output = output.with_name(f"{output.stem}_clusters.parquet")
+    cluster_report = (
+        pl.DataFrame(cluster_rows).sort(["candidate_id", "tribe_id"]) if cluster_rows else pl.DataFrame()
+    )
+    cluster_report.write_parquet(cluster_output)
     summaries = write_summary_artifacts(
         report,
         output_base=output,
@@ -106,8 +130,64 @@ def build_cluster_validity_stability_report(
         cfg=cfg,
         write_markdown=bool(cfg.get("model_selection.write_summary_markdown", True)),
     )
+    cluster_summaries = write_summary_artifacts(
+        cluster_report,
+        output_base=cluster_output,
+        title="Cluster Profile Readiness Diagnostics",
+        priority_columns=[
+            "candidate_id",
+            "tribe_id",
+            "customers",
+            "customer_share_pct",
+            "core_customer_share_pct",
+            "mean_assignment_confidence",
+            "p10_assignment_confidence",
+            "jitter_label_recovery_accuracy_mean",
+            "profile_readiness",
+            "readiness_issues",
+        ],
+        cfg=cfg,
+        write_markdown=bool(cfg.get("model_selection.write_summary_markdown", True)),
+    )
     log_event("Cluster validity", "wrote validity and stability report", cfg=cfg, path=output)
-    return {"parquet": output, **summaries}
+    return {
+        "parquet": output,
+        **summaries,
+        "cluster_parquet": cluster_output,
+        "cluster_summary_csv": cluster_summaries["summary_csv"],
+        "cluster_summary_md": cluster_summaries.get("summary_md"),
+    }
+
+
+def _sample_candidate_features(
+    assignments: pl.DataFrame,
+    feature_path: str | Path,
+    feature_cols: list[str],
+    sample_size: int,
+    cfg: PipelineConfig,
+) -> dict[str, Any]:
+    core = assignments.filter(pl.col("tribe_id") >= 0)
+    if core.is_empty():
+        return {"X": np.empty((0, len(feature_cols)), dtype=np.float32), "labels": np.array([], dtype=np.int32)}
+
+    sample_idx = deterministic_sample_indices(core.height, min(sample_size, core.height), cfg.random_seed)
+    sampled_assignments = (
+        core[sample_idx]
+        .select(["cliente", "tribe_id"])
+        .with_row_index("_sample_order")
+    )
+    sampled_customers = sampled_assignments["cliente"].to_list()
+    sampled_features = collect_streaming(
+        pl.scan_parquet(feature_path)
+        .select(["cliente", *feature_cols])
+        .filter(pl.col("cliente").is_in(sampled_customers))
+    )
+    joined = sampled_assignments.join(sampled_features, on="cliente", how="inner").sort("_sample_order")
+    if joined.is_empty():
+        return {"X": np.empty((0, len(feature_cols)), dtype=np.float32), "labels": np.array([], dtype=np.int32)}
+    X = _standardize(frame_to_numpy(joined, feature_cols))
+    labels = joined["tribe_id"].to_numpy().astype(np.int32)
+    return {"X": X, "labels": labels}
 
 
 def _standardize(X: np.ndarray) -> np.ndarray:
@@ -115,6 +195,49 @@ def _standardize(X: np.ndarray) -> np.ndarray:
     mean = X.mean(axis=0, keepdims=True)
     std = X.std(axis=0, keepdims=True)
     return ((X - mean) / np.maximum(std, 1e-12)).astype(np.float32)
+
+
+def _candidate_min_cluster_size(candidate_key: str, model_suite: dict[str, Any], cfg: PipelineConfig) -> int:
+    """Resolve the min-cluster-size reference for candidate-level readiness checks."""
+
+    candidate = _candidate_result(candidate_key, model_suite)
+    parsed = _parse_min_cluster_size(candidate.get("model_variant") if candidate else None)
+    if parsed is not None:
+        return parsed
+
+    if _is_official_umap_hdbscan_candidate(candidate_key, candidate, model_suite, cfg):
+        promoted = cfg.get("official_model_suite.umap_hdbscan.hdbscan.min_cluster_size")
+        if promoted is not None:
+            return int(promoted)
+
+    return int(cfg.get("hdbscan.min_cluster_size", 0) or 0)
+
+
+def _candidate_result(candidate_key: str, model_suite: dict[str, Any]) -> dict[str, Any] | None:
+    for candidate in model_suite.get("candidate_results", []) or []:
+        key = f"{candidate.get('model_name')}::{candidate.get('model_variant')}"
+        if key == candidate_key:
+            return candidate
+    return None
+
+
+def _parse_min_cluster_size(model_variant: Any) -> int | None:
+    if model_variant is None:
+        return None
+    match = re.search(r"(?:^|_)mcs(\d+)(?:_|$)", str(model_variant))
+    return int(match.group(1)) if match else None
+
+
+def _is_official_umap_hdbscan_candidate(
+    candidate_key: str,
+    candidate: dict[str, Any] | None,
+    model_suite: dict[str, Any],
+    cfg: PipelineConfig,
+) -> bool:
+    if candidate_key == model_suite.get("official_candidate_key"):
+        return True
+    official_model_name = cfg.get("official_model_suite.umap_hdbscan.model_name")
+    return bool(candidate and official_model_name and candidate.get("model_name") == official_model_name)
 
 
 def _jitter_stability(
@@ -134,6 +257,7 @@ def _jitter_stability(
             "jitter_ari_std": None,
             "jitter_label_recovery_accuracy_mean": None,
             "jitter_label_recovery_accuracy_std": None,
+            "_cluster_recovery_accuracy_mean_by_label": {},
         }
 
     aris: list[float] = []
@@ -144,6 +268,7 @@ def _jitter_stability(
     X_sample = X[chosen_base]
     y_sample = labels[chosen_base]
     unique_labels = np.sort(np.unique(y_sample))
+    cluster_accuracies: dict[int, list[float]] = {int(label): [] for label in unique_labels}
 
     centroids = np.vstack([X_sample[y_sample == label].mean(axis=0) for label in unique_labels])
     for repeat in range(max(repeats, 1)):
@@ -153,10 +278,116 @@ def _jitter_stability(
         predicted = unique_labels[np.argmin(distances, axis=1)]
         aris.append(float(adjusted_rand_score(y_sample, predicted)))
         accuracies.append(float(np.mean(predicted == y_sample)))
+        for label in unique_labels:
+            mask = y_sample == label
+            if np.any(mask):
+                cluster_accuracies[int(label)].append(float(np.mean(predicted[mask] == label)))
 
     return {
         "jitter_ari_mean": float(np.mean(aris)),
         "jitter_ari_std": float(np.std(aris)),
         "jitter_label_recovery_accuracy_mean": float(np.mean(accuracies)),
         "jitter_label_recovery_accuracy_std": float(np.std(accuracies)),
+        "_cluster_recovery_accuracy_mean_by_label": {
+            str(label): float(np.mean(values))
+            for label, values in cluster_accuracies.items()
+            if values
+        },
     }
+
+
+def _cluster_readiness_rows(
+    joined: pl.DataFrame,
+    *,
+    candidate_key: str,
+    total_rows: int,
+    cluster_recovery: dict[str, float],
+    min_cluster_size: int,
+) -> list[dict[str, Any]]:
+    core = joined.filter(pl.col("tribe_id") >= 0)
+    if core.is_empty():
+        return []
+    core_rows = max(core.height, 1)
+    summary = (
+        core.group_by("tribe_id")
+        .agg(
+            pl.len().alias("customers"),
+            pl.col("assignment_confidence_score").mean().alias("mean_assignment_confidence"),
+            pl.col("assignment_confidence_score").quantile(0.10).alias("p10_assignment_confidence"),
+            pl.col("assignment_confidence_score").min().alias("min_assignment_confidence"),
+            pl.col("assignment_source").n_unique().alias("assignment_source_count"),
+        )
+        .sort("tribe_id")
+    )
+    rows: list[dict[str, Any]] = []
+    for row in summary.iter_rows(named=True):
+        tribe_id = int(row["tribe_id"])
+        customers = int(row["customers"])
+        recovery = cluster_recovery.get(str(tribe_id))
+        confidence = row.get("mean_assignment_confidence")
+        p10_confidence = row.get("p10_assignment_confidence")
+        readiness, issues = _profile_readiness(
+            customers=customers,
+            min_cluster_size=min_cluster_size,
+            recovery=recovery,
+            confidence=confidence,
+            p10_confidence=p10_confidence,
+        )
+        rows.append(
+            {
+                "candidate_id": candidate_key,
+                "tribe_id": tribe_id,
+                "customers": customers,
+                "customer_share_pct": customers / max(total_rows, 1) * 100.0,
+                "core_customer_share_pct": customers / core_rows * 100.0,
+                "min_cluster_size_reference": min_cluster_size,
+                "mean_assignment_confidence": confidence,
+                "p10_assignment_confidence": p10_confidence,
+                "min_assignment_confidence": row.get("min_assignment_confidence"),
+                "assignment_source_count": int(row.get("assignment_source_count") or 0),
+                "jitter_label_recovery_accuracy_mean": recovery,
+                "profile_readiness": readiness,
+                "readiness_issues": "; ".join(issues) if issues else "pass",
+            }
+        )
+    return rows
+
+
+def _profile_readiness(
+    *,
+    customers: int,
+    min_cluster_size: int,
+    recovery: float | None,
+    confidence: float | None,
+    p10_confidence: float | None,
+) -> tuple[str, list[str]]:
+    confidence = _finite_or_none(confidence)
+    p10_confidence = _finite_or_none(p10_confidence)
+    recovery = _finite_or_none(recovery)
+    issues: list[str] = []
+    if min_cluster_size and customers < min_cluster_size:
+        issues.append(f"customers<{min_cluster_size}")
+    if recovery is None:
+        issues.append("missing_jitter_recovery")
+    elif recovery < 0.70:
+        issues.append("jitter_recovery<0.70")
+    if confidence is not None and confidence < 0.20:
+        issues.append("mean_assignment_confidence<0.20")
+    if p10_confidence is not None and p10_confidence < 0.05:
+        issues.append("p10_assignment_confidence<0.05")
+
+    if not issues and recovery is not None and recovery >= 0.85 and (confidence is None or confidence >= 0.30):
+        return "strong", issues
+    if not issues:
+        return "usable", issues
+    return "review", issues
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value_float if np.isfinite(value_float) else None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import shutil
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +118,65 @@ def _configured_max_customer_product_weight(cfg: PipelineConfig) -> float | None
     return _optional_positive_float(cfg.get("customer_embeddings.max_customer_product_weight", None))
 
 
+def _recency_weighting_config(cfg: PipelineConfig) -> dict[str, Any]:
+    settings = cfg.get("customer_embeddings.recency_weighting", {}) or {}
+    return {
+        "enabled": bool(settings.get("enabled", False)),
+        "date_column": str(settings.get("date_column", "fecha")),
+        "reference_date": settings.get("reference_date"),
+        "half_life_days": _optional_positive_float(settings.get("half_life_days", 180.0)) or 180.0,
+        "min_multiplier": max(0.0, min(1.0, float(settings.get("min_multiplier", 0.25)))),
+    }
+
+
+def _frequency_weighting_config(cfg: PipelineConfig) -> dict[str, Any]:
+    settings = cfg.get("customer_embeddings.frequency_weighting", {}) or {}
+    return {
+        "enabled": bool(settings.get("enabled", False)),
+        "ticket_column": str(settings.get("ticket_column", "ticket")),
+        "transform": str(settings.get("transform", "log1p")).strip().lower(),
+        "exponent": _optional_positive_float(settings.get("exponent", 1.0)) or 1.0,
+        "max_multiplier": _optional_positive_float(settings.get("max_multiplier", 3.0)),
+    }
+
+
+def _customer_embedding_required_columns(
+    columns: set[str],
+    *,
+    weight_strategy: str,
+    cfg: PipelineConfig,
+) -> list[str]:
+    needed = ["cliente", "idarticu"]
+    if _uses_quantity(weight_strategy):
+        if "unidades" not in columns:
+            raise ValueError("Quantity-weighted customer embeddings require the 'unidades' column.")
+        needed.append("unidades")
+    elif "unidades" in columns:
+        needed.append("unidades")
+
+    recency_cfg = _recency_weighting_config(cfg)
+    if recency_cfg["enabled"]:
+        date_column = str(recency_cfg["date_column"])
+        if date_column not in columns:
+            raise ValueError(
+                "customer_embeddings.recency_weighting.enabled=true requires "
+                f"date column {date_column!r} in prepared transactions."
+            )
+        needed.append(date_column)
+
+    frequency_cfg = _frequency_weighting_config(cfg)
+    if frequency_cfg["enabled"]:
+        ticket_column = str(frequency_cfg["ticket_column"])
+        if ticket_column not in columns:
+            raise ValueError(
+                "customer_embeddings.frequency_weighting.enabled=true requires "
+                f"ticket column {ticket_column!r} in prepared transactions."
+            )
+        needed.append(ticket_column)
+
+    return list(dict.fromkeys(needed))
+
+
 def _optional_positive_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
@@ -143,6 +203,87 @@ def _units_expression(columns: set[str]) -> pl.Expr:
     )
 
 
+def _coerce_date(value: Any, *, setting_name: str) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(f"{setting_name} must be an ISO date string, got {value!r}.") from exc
+
+
+def _resolve_recency_reference_date(
+    base_lf: pl.LazyFrame,
+    date_column: str,
+    recency_cfg: dict[str, Any],
+) -> date:
+    configured = recency_cfg.get("reference_date")
+    if configured:
+        return _coerce_date(configured, setting_name="customer_embeddings.recency_weighting.reference_date")
+    reference = collect_streaming(
+        base_lf.select(pl.col(date_column).cast(pl.Date, strict=False).max().alias("_reference_date"))
+    )[0, "_reference_date"]
+    if reference is None:
+        raise ValueError(
+            "customer_embeddings.recency_weighting.enabled=true but no non-null "
+            f"values were found in date column {date_column!r}."
+        )
+    return _coerce_date(reference, setting_name=f"max({date_column})")
+
+
+def _recency_multiplier_expression(
+    date_column: str,
+    reference_date: date,
+    *,
+    half_life_days: float,
+    min_multiplier: float,
+) -> pl.Expr:
+    transaction_date = pl.col(date_column).cast(pl.Date, strict=False)
+    days_ago = (pl.lit(reference_date) - transaction_date).dt.total_days().cast(pl.Float64)
+    decay = (-math.log(2.0) * days_ago / float(half_life_days)).exp()
+    return (
+        pl.when(days_ago.is_null())
+        .then(pl.lit(float(min_multiplier)))
+        .when(days_ago < 0)
+        .then(pl.lit(1.0))
+        .otherwise(pl.max_horizontal([decay, pl.lit(float(min_multiplier))]))
+        .cast(pl.Float64)
+        .alias("_recency_multiplier")
+    )
+
+
+def _frequency_multiplier_expression(
+    basket_count_col: str,
+    *,
+    transform: str,
+    exponent: float,
+    max_multiplier: float | None,
+) -> pl.Expr:
+    basket_count = pl.col(basket_count_col).cast(pl.Float64)
+    normalized_transform = transform.strip().lower()
+    if normalized_transform in {"none", "off", "identity", "binary"}:
+        multiplier = pl.lit(1.0)
+    elif normalized_transform in {"log", "log1p"}:
+        multiplier = (basket_count + 1.0).log() / math.log(2.0)
+    elif normalized_transform in {"sqrt", "square_root"}:
+        multiplier = basket_count.sqrt()
+    elif normalized_transform in {"raw", "count", "basket_count"}:
+        multiplier = basket_count
+    else:
+        raise ValueError(
+            "Unknown customer_embeddings.frequency_weighting.transform "
+            f"{transform!r}. Use one of: log1p, sqrt, raw, identity."
+        )
+
+    if exponent != 1.0:
+        multiplier = multiplier ** float(exponent)
+    if max_multiplier is not None:
+        multiplier = pl.min_horizontal([multiplier, pl.lit(float(max_multiplier))])
+    return multiplier.cast(pl.Float64).alias("_frequency_multiplier")
+
+
 def _apply_customer_product_weight_cap(
     customer_product_weights: pl.LazyFrame,
     max_customer_product_weight: float | None,
@@ -167,17 +308,85 @@ def _build_customer_product_weights(
     max_customer_product_weight: float | None,
     cfg: PipelineConfig,
 ) -> pl.LazyFrame:
+    recency_cfg = _recency_weighting_config(cfg)
+    frequency_cfg = _frequency_weighting_config(cfg)
     log_event(
         "Stage 4 customer embeddings",
         "pre-aggregating transaction weights by customer-product",
         cfg=cfg,
         quantity_transform=quantity_transform if _uses_quantity(weight_strategy) else "not_applicable",
         max_customer_product_weight=max_customer_product_weight,
+        recency_weighting=recency_cfg["enabled"],
+        frequency_weighting=frequency_cfg["enabled"],
     )
-    customer_product_weights = (
-        base_lf.with_columns(_base_weight_expression(columns, weight_strategy, quantity_transform))
-        .group_by(["cliente", "idarticu"])
-        .agg(pl.col("_weight").sum().cast(pl.Float64).alias("_weight"))
+
+    weighted_lines = base_lf.with_columns(_base_weight_expression(columns, weight_strategy, quantity_transform))
+    recency_reference_date: date | None = None
+    if recency_cfg["enabled"]:
+        date_column = str(recency_cfg["date_column"])
+        recency_reference_date = _resolve_recency_reference_date(base_lf, date_column, recency_cfg)
+        weighted_lines = weighted_lines.with_columns(
+            _recency_multiplier_expression(
+                date_column,
+                recency_reference_date,
+                half_life_days=float(recency_cfg["half_life_days"]),
+                min_multiplier=float(recency_cfg["min_multiplier"]),
+            )
+        ).with_columns((pl.col("_weight") * pl.col("_recency_multiplier")).alias("_weight"))
+    else:
+        weighted_lines = weighted_lines.with_columns(pl.lit(1.0).cast(pl.Float64).alias("_recency_multiplier"))
+
+    aggregate_exprs = [
+        pl.col("_weight").sum().cast(pl.Float64).alias("_weight"),
+        pl.col("_recency_multiplier").mean().cast(pl.Float64).alias("_mean_recency_multiplier"),
+    ]
+    if frequency_cfg["enabled"]:
+        aggregate_exprs.append(
+            pl.col(str(frequency_cfg["ticket_column"])).n_unique().cast(pl.UInt32).alias("_basket_count")
+        )
+
+    customer_product_weights = weighted_lines.group_by(["cliente", "idarticu"]).agg(aggregate_exprs)
+    if frequency_cfg["enabled"]:
+        customer_product_weights = customer_product_weights.with_columns(
+            _frequency_multiplier_expression(
+                "_basket_count",
+                transform=str(frequency_cfg["transform"]),
+                exponent=float(frequency_cfg["exponent"]),
+                max_multiplier=frequency_cfg["max_multiplier"],
+            )
+        ).with_columns((pl.col("_weight") * pl.col("_frequency_multiplier")).alias("_weight"))
+    else:
+        customer_product_weights = customer_product_weights.with_columns(
+            [
+                pl.lit(None, dtype=pl.UInt32).alias("_basket_count"),
+                pl.lit(1.0).cast(pl.Float64).alias("_frequency_multiplier"),
+            ]
+        )
+
+    customer_product_weights = customer_product_weights.with_columns(
+        [
+            pl.lit(bool(recency_cfg["enabled"])).alias("recency_weighting_enabled"),
+            pl.lit(
+                recency_reference_date.isoformat() if recency_reference_date is not None else None,
+                dtype=pl.Utf8,
+            ).alias("recency_reference_date"),
+            pl.lit(float(recency_cfg["half_life_days"]) if recency_cfg["enabled"] else None, dtype=pl.Float64).alias(
+                "recency_half_life_days"
+            ),
+            pl.lit(float(recency_cfg["min_multiplier"]) if recency_cfg["enabled"] else None, dtype=pl.Float64).alias(
+                "recency_min_multiplier"
+            ),
+            pl.lit(bool(frequency_cfg["enabled"])).alias("frequency_weighting_enabled"),
+            pl.lit(str(frequency_cfg["transform"]) if frequency_cfg["enabled"] else None, dtype=pl.Utf8).alias(
+                "frequency_transform"
+            ),
+            pl.lit(float(frequency_cfg["exponent"]) if frequency_cfg["enabled"] else None, dtype=pl.Float64).alias(
+                "frequency_exponent"
+            ),
+            pl.lit(frequency_cfg["max_multiplier"] if frequency_cfg["enabled"] else None, dtype=pl.Float64).alias(
+                "frequency_max_multiplier"
+            ),
+        ]
     )
     if _uses_idf(weight_strategy):
         log_event(
@@ -498,15 +707,45 @@ def _customer_embedding_weight_metrics(
     normalize_vectors: bool,
     cfg: PipelineConfig,
 ) -> dict[str, Any]:
-    totals = collect_streaming(
-        customer_product_weights.select(
+    weight_columns = set(schema_names(customer_product_weights))
+    total_exprs = [
+        pl.len().alias("customer_product_rows"),
+        pl.col("cliente").n_unique().alias("weighted_customers"),
+        pl.col("idarticu").n_unique().alias("weighted_products"),
+        pl.col("_weight").sum().alias("total_weight"),
+    ]
+    if "recency_weighting_enabled" in weight_columns:
+        total_exprs.extend(
             [
-                pl.len().alias("customer_product_rows"),
-                pl.col("cliente").n_unique().alias("weighted_customers"),
-                pl.col("idarticu").n_unique().alias("weighted_products"),
-                pl.col("_weight").sum().alias("total_weight"),
+                pl.col("recency_weighting_enabled").first().alias("recency_weighting_enabled"),
+                pl.col("recency_reference_date").first().alias("recency_reference_date"),
+                pl.col("recency_half_life_days").first().alias("recency_half_life_days"),
+                pl.col("recency_min_multiplier").first().alias("recency_min_multiplier"),
+                pl.col("_mean_recency_multiplier").mean().alias("mean_recency_multiplier"),
             ]
         )
+    if "frequency_weighting_enabled" in weight_columns:
+        total_exprs.extend(
+            [
+                pl.col("frequency_weighting_enabled").first().alias("frequency_weighting_enabled"),
+                pl.col("frequency_transform").first().alias("frequency_transform"),
+                pl.col("frequency_exponent").first().alias("frequency_exponent"),
+                pl.col("frequency_max_multiplier").first().alias("frequency_max_multiplier"),
+                pl.col("_frequency_multiplier").mean().alias("mean_frequency_multiplier"),
+                pl.col("_frequency_multiplier").max().alias("max_frequency_multiplier_observed"),
+            ]
+        )
+    if "_basket_count" in weight_columns:
+        total_exprs.extend(
+            [
+                pl.col("_basket_count").mean().alias("mean_customer_product_basket_count"),
+                pl.col("_basket_count").quantile(0.95).alias("p95_customer_product_basket_count"),
+                pl.col("_basket_count").max().alias("max_customer_product_basket_count"),
+            ]
+        )
+
+    totals = collect_streaming(
+        customer_product_weights.select(total_exprs)
     ).row(0, named=True)
     total_weight = float(totals["total_weight"] or 0.0)
 
@@ -720,7 +959,7 @@ def _write_customer_embedding_weight_diagnostics(
         path.parent.mkdir(parents=True, exist_ok=True)
 
     transaction_columns = set(schema_names(transactions))
-    needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in transaction_columns else [])
+    needed = _customer_embedding_required_columns(transaction_columns, weight_strategy=weight_strategy, cfg=cfg)
     base_lf = transactions.select(needed)
     metrics = _customer_embedding_weight_metrics(
         customer_product_weights,
@@ -779,10 +1018,10 @@ def evaluate_customer_embedding_weight_profile(
 
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
     columns = set(schema_names(lf))
-    needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in columns else [])
-    base_lf = lf.select(needed)
     selected_weight_strategy = str(weight_strategy or cfg.get("customer_embeddings.weight_strategy", "quantity"))
     selected_quantity_transform = str(quantity_transform or _configured_quantity_transform(cfg))
+    needed = _customer_embedding_required_columns(columns, weight_strategy=selected_weight_strategy, cfg=cfg)
+    base_lf = lf.select(needed)
     selected_max_customer_product_weight = (
         _configured_max_customer_product_weight(cfg)
         if max_customer_product_weight is None
@@ -829,10 +1068,10 @@ def build_customer_embedding_weight_diagnostics(
 
     lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
     columns = set(schema_names(lf))
-    needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in columns else [])
-    base_lf = lf.select(needed)
     selected_weight_strategy = str(weight_strategy or cfg.get("customer_embeddings.weight_strategy", "quantity"))
     selected_quantity_transform = str(quantity_transform or _configured_quantity_transform(cfg))
+    needed = _customer_embedding_required_columns(columns, weight_strategy=selected_weight_strategy, cfg=cfg)
+    base_lf = lf.select(needed)
     selected_max_customer_product_weight = (
         _configured_max_customer_product_weight(cfg)
         if max_customer_product_weight is None
@@ -863,6 +1102,100 @@ def build_customer_embedding_weight_diagnostics(
         output_dir=output_dir,
         output_prefix=output_prefix,
     )
+
+
+def build_customer_embedding_variant_diagnostics(
+    embeddings_path: str | Path | None = None,
+    transactions: pl.LazyFrame | None = None,
+    output_path: str | Path | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path | None:
+    """Compare Stage 4 weighting variants without promoting them to the official pipeline."""
+
+    cfg.ensure_directories()
+    diagnostics_cfg = cfg.get("customer_embeddings.variant_diagnostics", {}) or {}
+    if not bool(diagnostics_cfg.get("enabled", False)):
+        return None
+    trials = [dict(trial) for trial in diagnostics_cfg.get("trials", []) or []]
+    if not trials:
+        raise ValueError("customer_embeddings.variant_diagnostics.enabled=true but no trials are configured.")
+
+    force = cfg.get("cache.force", False) if force is None else force
+    output = Path(output_path) if output_path else cfg.artifacts / str(
+        diagnostics_cfg.get("output_dir", "stage4")
+    ) / str(diagnostics_cfg.get("output_csv", "customer_embedding_variant_diagnostics.csv"))
+    lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
+    cache_metadata = {
+        "stage": "customer_embedding_variant_diagnostics",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "product_embeddings": file_fingerprint(embeddings_path) if embeddings_path else None,
+        "trials": trials,
+        "recency_weighting": _recency_weighting_config(cfg),
+        "frequency_weighting": _frequency_weighting_config(cfg),
+        "gates": cfg.get("customer_embeddings.gates", {}),
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 4 customer embeddings", "variant diagnostics cache hit", cfg=cfg, path=output)
+        return output
+
+    official_strategy = str(cfg.get("customer_embeddings.weight_strategy", "quantity"))
+    official_quantity_transform = _configured_quantity_transform(cfg)
+    official_cap = _configured_max_customer_product_weight(cfg)
+    official_normalize = bool(cfg.get("customer_embeddings.normalize_vectors", False))
+    common_share_gate = _optional_float(
+        (cfg.get("customer_embeddings.gates", {}) or {}).get("max_common_product_weight_share_pct")
+    )
+
+    rows = []
+    for trial in trials:
+        trial_name = str(trial.get("name", "trial"))
+        weight_strategy = str(trial.get("weight_strategy", official_strategy))
+        quantity_transform = str(trial.get("quantity_transform", official_quantity_transform))
+        max_customer_product_weight = (
+            official_cap
+            if "max_customer_product_weight" not in trial
+            else _optional_positive_float(trial.get("max_customer_product_weight"))
+        )
+        normalize_vectors = bool(trial.get("normalize_vectors", official_normalize))
+        metrics = evaluate_customer_embedding_weight_profile(
+            transactions=lf,
+            embeddings_path=embeddings_path,
+            weight_strategy=weight_strategy,
+            quantity_transform=quantity_transform,
+            max_customer_product_weight=max_customer_product_weight,
+            normalize_vectors=normalize_vectors,
+            cfg=cfg,
+        )
+        common_share = metrics.get("common_product_weight_share_pct")
+        rows.append(
+            {
+                "trial_name": trial_name,
+                "is_official_stage4_recipe": bool(
+                    weight_strategy == official_strategy
+                    and quantity_transform == official_quantity_transform
+                    and max_customer_product_weight == official_cap
+                    and normalize_vectors == official_normalize
+                ),
+                "weight_strategy": weight_strategy,
+                "quantity_transform": quantity_transform,
+                "max_customer_product_weight": max_customer_product_weight,
+                "normalize_vectors": normalize_vectors,
+                "common_product_gate_margin_pct": (
+                    common_share_gate - float(common_share)
+                    if common_share_gate is not None and common_share is not None
+                    else None
+                ),
+                **metrics,
+            }
+        )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(rows, infer_schema_length=None).write_csv(output)
+    write_artifact_metadata(output, cache_metadata)
+    log_event("Stage 4 customer embeddings", "wrote variant diagnostics", cfg=cfg, rows=len(rows), path=output)
+    return output
 
 
 def build_customer_embeddings(
@@ -901,6 +1234,8 @@ def build_customer_embeddings(
         "idf_weighting": _uses_idf(selected_weight_strategy),
         "quantity_transform": selected_quantity_transform if _uses_quantity(selected_weight_strategy) else None,
         "max_customer_product_weight": selected_max_customer_product_weight,
+        "recency_weighting": _recency_weighting_config(cfg),
+        "frequency_weighting": _frequency_weighting_config(cfg),
         "normalize_vectors": bool(normalize_vectors),
     }
     if should_use_cache(
@@ -917,7 +1252,7 @@ def build_customer_embeddings(
         ):
             lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
             columns = set(schema_names(lf))
-            needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in columns else [])
+            needed = _customer_embedding_required_columns(columns, weight_strategy=selected_weight_strategy, cfg=cfg)
             base_lf = lf.select(needed)
             diagnostic_result = _write_customer_embedding_weight_diagnostics(
                 _build_customer_product_weights(
@@ -949,6 +1284,8 @@ def build_customer_embeddings(
         weight_strategy=selected_weight_strategy,
         quantity_transform=selected_quantity_transform if _uses_quantity(selected_weight_strategy) else "not_applicable",
         max_customer_product_weight=selected_max_customer_product_weight,
+        recency_weighting=_recency_weighting_config(cfg)["enabled"],
+        frequency_weighting=_frequency_weighting_config(cfg)["enabled"],
         normalize_vectors=bool(normalize_vectors),
     ):
         lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
@@ -958,7 +1295,7 @@ def build_customer_embeddings(
         if not emb_cols:
             raise ValueError(f"No embedding columns found in {embeddings_path}")
 
-        needed = ["cliente", "idarticu"] + (["unidades"] if "unidades" in columns else [])
+        needed = _customer_embedding_required_columns(columns, weight_strategy=selected_weight_strategy, cfg=cfg)
         base_lf = lf.select(needed)
         customer_product_weights = _build_customer_product_weights(
             base_lf,

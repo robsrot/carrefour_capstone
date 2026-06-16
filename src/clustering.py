@@ -517,8 +517,28 @@ def run_hdbscan(
         )
         if "SoftNoiseAssignment" not in algorithm_name:
             algorithm_name = f"{algorithm_name}_SoftNoiseAssignment"
+    elif np.any(labels < 0):
+        assignment_sources = [
+            assignment_source if int(label) >= 0 else "hdbscan_noise_unassigned"
+            for label in labels
+        ]
 
     metrics = evaluate_labels(X, labels, probabilities=probabilities, cfg=cfg)
+    cluster_persistence = getattr(model, "cluster_persistence_", None)
+    persistence_metrics = {
+        "hdbscan_cluster_persistence_mean": None,
+        "hdbscan_cluster_persistence_min": None,
+        "hdbscan_cluster_persistence_max": None,
+    }
+    if cluster_persistence is not None and len(cluster_persistence):
+        persistence_values = np.asarray(cluster_persistence, dtype=np.float64)
+        persistence_values = persistence_values[np.isfinite(persistence_values)]
+        if persistence_values.size:
+            persistence_metrics = {
+                "hdbscan_cluster_persistence_mean": float(np.mean(persistence_values)),
+                "hdbscan_cluster_persistence_min": float(np.min(persistence_values)),
+                "hdbscan_cluster_persistence_max": float(np.max(persistence_values)),
+            }
     passes_gate, gate_reason = quality_gate_result(metrics, cfg=cfg)
     variant = (
         f"hdbscan_mcs{cfg.get('hdbscan.min_cluster_size')}_"
@@ -538,8 +558,15 @@ def run_hdbscan(
         "trial_name": trial_name,
         "hdbscan_backend": assignment_source,
         "scale_features": scale_features,
+        "assignment_policy": "hdbscan_core_plus_soft_noise_assignment"
+        if allow_noise_assignment and soft_assignment_info["soft_assignment_strategy"] is not None
+        else "hard_hdbscan_core_noise_retained",
+        "soft_assignment_enabled": bool(
+            allow_noise_assignment and soft_assignment_info["soft_assignment_strategy"] is not None
+        ),
         **soft_assignment_info,
         **metrics,
+        **persistence_metrics,
         "final_noise_pct": metrics.get("noise_pct"),
         "passes_quality_gate": passes_gate,
         "quality_gate_reason": gate_reason,

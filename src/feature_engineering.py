@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 import polars as pl
@@ -13,7 +14,9 @@ from src.data_loader import load_prepared_transactions
 from src.progress import log_event, stage_timer
 from src.utils import (
     collect_streaming,
+    deterministic_sample_indices,
     file_fingerprint,
+    frame_to_numpy,
     numeric_feature_columns,
     schema_names,
     should_use_cache,
@@ -198,3 +201,160 @@ def build_feature_set(
         write_artifact_metadata(output, cache_metadata)
         log_event("Stage 5 feature set", "wrote artifact", cfg=cfg, variant=variant, rows=result.height, path=output)
     return output
+
+
+def build_feature_set_diagnostics(
+    feature_paths: Mapping[str, str | Path],
+    baseline_name: str | None = None,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Write compact Stage 5 diagnostics for feature health and topology drift."""
+
+    cfg.ensure_directories()
+    diagnostics_cfg = cfg.get("feature_sets.diagnostics", {}) or {}
+    output = Path(output_path) if output_path else cfg.artifacts / str(
+        diagnostics_cfg.get("output_dir", "stage5")
+    ) / str(diagnostics_cfg.get("output_csv", "feature_set_diagnostics.csv"))
+    baseline = str(baseline_name or cfg.get("feature_sets.default", "embeddings_only"))
+    if baseline not in feature_paths:
+        raise ValueError(f"Baseline feature set {baseline!r} is not present in feature_paths.")
+
+    frames = {name: pl.read_parquet(path).sort("cliente") for name, path in feature_paths.items()}
+    baseline_frame = frames[baseline]
+    baseline_customers = baseline_frame["cliente"].to_list()
+    baseline_customer_set = set(baseline_customers)
+    baseline_features = numeric_feature_columns(baseline_frame)
+    neighbor_k = int(diagnostics_cfg.get("neighbor_overlap_k", 10))
+    sample_size = int(diagnostics_cfg.get("neighbor_overlap_sample_size", 2000))
+    sample_customers = _diagnostic_sample_customers(baseline_customers, sample_size, cfg)
+    baseline_neighbors = _nearest_neighbor_indices(
+        _aligned_feature_matrix(baseline_frame, sample_customers, baseline_features),
+        neighbor_k,
+    )
+
+    selection_feature_set = str(cfg.get("modeling.feature_set_for_selection", baseline))
+    selection_warning = (
+        "OK: official selection uses product embeddings only."
+        if selection_feature_set == baseline
+        else (
+            f"WARNING: official selection uses {selection_feature_set!r}; confirm Stage 6/8 evidence "
+            "before allowing behavior or auxiliary features to drive organic tribes."
+        )
+    )
+
+    rows = []
+    for name, path in feature_paths.items():
+        df = frames[name]
+        feature_cols = numeric_feature_columns(df)
+        customer_set = set(df["cliente"].to_list()) if "cliente" in df.columns else set()
+        missing_vs_baseline = len(baseline_customer_set - customer_set)
+        extra_vs_baseline = len(customer_set - baseline_customer_set)
+        duplicate_customer_count = df.height - df["cliente"].n_unique() if "cliente" in df.columns else None
+        health = _feature_health_metrics(df, feature_cols)
+        overlap = None
+        if name == baseline:
+            overlap = 100.0
+        elif missing_vs_baseline == 0 and feature_cols and baseline_neighbors is not None:
+            target_neighbors = _nearest_neighbor_indices(
+                _aligned_feature_matrix(df, sample_customers, feature_cols),
+                neighbor_k,
+            )
+            overlap = _neighbor_overlap_pct(baseline_neighbors, target_neighbors)
+        rows.append(
+            {
+                "feature_set_name": str(name),
+                "feature_path": str(path),
+                "is_selection_feature_set": name == selection_feature_set,
+                "selection_feature_set": selection_feature_set,
+                "selection_warning": selection_warning,
+                "rows": int(df.height),
+                "baseline_rows": int(baseline_frame.height),
+                "missing_vs_baseline_customers": int(missing_vs_baseline),
+                "extra_vs_baseline_customers": int(extra_vs_baseline),
+                "duplicate_customer_count": None if duplicate_customer_count is None else int(duplicate_customer_count),
+                "customer_alignment_status": "pass"
+                if missing_vs_baseline == 0 and extra_vs_baseline == 0 and duplicate_customer_count == 0
+                else "warn",
+                "feature_count": int(len(feature_cols)),
+                "null_pct": health["null_pct"],
+                "finite_pct": health["finite_pct"],
+                "zero_variance_feature_count": health["zero_variance_feature_count"],
+                "zero_variance_features": health["zero_variance_features"],
+                "neighbor_overlap_vs_baseline_pct": overlap,
+                "neighbor_overlap_k": int(neighbor_k),
+                "neighbor_overlap_sample_size": int(len(sample_customers)),
+            }
+        )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    diagnostics = pl.DataFrame(rows, infer_schema_length=None)
+    diagnostics.write_csv(output)
+    log_event("Stage 5 diagnostics", "wrote feature-set diagnostics", cfg=cfg, rows=diagnostics.height, path=output)
+    return output
+
+
+def _feature_health_metrics(df: pl.DataFrame, feature_cols: list[str]) -> dict[str, object]:
+    if not feature_cols or df.height == 0:
+        return {
+            "null_pct": None,
+            "finite_pct": None,
+            "zero_variance_feature_count": 0,
+            "zero_variance_features": "",
+        }
+    total_cells = df.height * len(feature_cols)
+    null_count = sum(int(df.select(pl.col(col).is_null().sum())[0, 0]) for col in feature_cols)
+    X = frame_to_numpy(df, feature_cols)
+    finite_pct = float(np.isfinite(X).mean() * 100.0)
+    zero_variance = []
+    for idx, col in enumerate(feature_cols):
+        values = X[:, idx]
+        finite_values = values[np.isfinite(values)]
+        if len(finite_values) == 0 or float(np.nanstd(finite_values)) <= 1e-12:
+            zero_variance.append(col)
+    preview = ", ".join(zero_variance[:12])
+    if len(zero_variance) > 12:
+        preview = f"{preview}, ..."
+    return {
+        "null_pct": float(null_count / max(total_cells, 1) * 100.0),
+        "finite_pct": finite_pct,
+        "zero_variance_feature_count": int(len(zero_variance)),
+        "zero_variance_features": preview,
+    }
+
+
+def _diagnostic_sample_customers(customers: list[object], sample_size: int, cfg: PipelineConfig) -> list[object]:
+    if not customers:
+        return []
+    indices = deterministic_sample_indices(len(customers), sample_size, cfg.random_seed)
+    return [customers[int(idx)] for idx in indices]
+
+
+def _aligned_feature_matrix(df: pl.DataFrame, customers: list[object], feature_cols: list[str]) -> np.ndarray:
+    if not customers or not feature_cols:
+        return np.empty((0, 0), dtype=np.float32)
+    order = pl.DataFrame({"cliente": customers, "_diagnostic_order": list(range(len(customers)))})
+    aligned = order.join(df.select(["cliente", *feature_cols]), on="cliente", how="inner").sort("_diagnostic_order")
+    return np.nan_to_num(frame_to_numpy(aligned, feature_cols), copy=False)
+
+
+def _nearest_neighbor_indices(X: np.ndarray, k: int) -> np.ndarray | None:
+    if X.shape[0] <= 1 or X.shape[1] == 0:
+        return None
+    n_neighbors = max(1, min(int(k), X.shape[0] - 1))
+    norms = np.linalg.norm(X, axis=1)
+    normalized = X / np.maximum(norms[:, None], 1e-12)
+    similarities = normalized @ normalized.T
+    np.fill_diagonal(similarities, -np.inf)
+    return np.argsort(-similarities, axis=1)[:, :n_neighbors]
+
+
+def _neighbor_overlap_pct(baseline_neighbors: np.ndarray | None, target_neighbors: np.ndarray | None) -> float | None:
+    if baseline_neighbors is None or target_neighbors is None:
+        return None
+    if baseline_neighbors.shape != target_neighbors.shape or baseline_neighbors.shape[0] == 0:
+        return None
+    overlaps = []
+    for base_row, target_row in zip(baseline_neighbors, target_neighbors):
+        overlaps.append(len(set(base_row.tolist()) & set(target_row.tolist())) / max(len(base_row), 1))
+    return float(np.mean(overlaps) * 100.0)

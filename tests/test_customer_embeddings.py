@@ -2,7 +2,11 @@ import polars as pl
 import pytest
 
 from src.config import PipelineConfig
-from src.customer_embeddings import build_customer_embeddings, build_customer_embedding_weight_diagnostics
+from src.customer_embeddings import (
+    build_customer_embeddings,
+    build_customer_embedding_variant_diagnostics,
+    build_customer_embedding_weight_diagnostics,
+)
 
 
 def _test_config(
@@ -12,6 +16,9 @@ def _test_config(
     max_customer_product_weight=None,
     write_top_products_csv=False,
     gates=None,
+    variant_diagnostics=None,
+    recency_weighting=None,
+    frequency_weighting=None,
 ):
     customer_embedding_cfg = {
         "output": "customer_embeddings.parquet",
@@ -30,6 +37,12 @@ def _test_config(
     }
     if gates is not None:
         customer_embedding_cfg["gates"] = gates
+    if variant_diagnostics is not None:
+        customer_embedding_cfg["variant_diagnostics"] = variant_diagnostics
+    if recency_weighting is not None:
+        customer_embedding_cfg["recency_weighting"] = recency_weighting
+    if frequency_weighting is not None:
+        customer_embedding_cfg["frequency_weighting"] = frequency_weighting
     return PipelineConfig(
         values={
             "run": {"random_seed": 42},
@@ -83,6 +96,25 @@ def _transactions():
             "desc_sector": ["Grocery", "Special", "Grocery", "Other"],
         }
     ).lazy()
+
+
+def _temporal_transactions():
+    return pl.DataFrame(
+        {
+            "cliente": ["c1", "c1", "c1", "c2"],
+            "ticket": ["old_bulk", "recent_1", "recent_2", "recent_other"],
+            "idarticu": ["common", "niche", "niche", "other"],
+            "unidades": [10, 1, 1, 1],
+            "fecha": [
+                "2024-01-01",
+                "2024-01-31",
+                "2024-01-31",
+                "2024-01-31",
+            ],
+            "desc_larga_articulo": ["Common Staple", "Niche Item", "Niche Item", "Other Item"],
+            "desc_sector": ["Grocery", "Special", "Special", "Other"],
+        }
+    ).with_columns(pl.col("fecha").str.strptime(pl.Date)).lazy()
 
 
 def _write_common_product_diagnostics(cfg):
@@ -193,3 +225,108 @@ def test_customer_embedding_dominance_gate_fails_when_common_product_dominates(t
     assert summary["passes_stage4_gates"] is False
     assert summary["common_product_weight_share_pct"] > 10.0
     assert "common_product_weight_share_pct" in summary["stage4_gate_issues"]
+
+
+def test_customer_embeddings_apply_recency_decay_and_product_basket_frequency(tmp_path):
+    cfg = _test_config(
+        tmp_path,
+        quantity_transform="raw",
+        recency_weighting={
+            "enabled": True,
+            "date_column": "fecha",
+            "reference_date": "2024-01-31",
+            "half_life_days": 10,
+            "min_multiplier": 0.25,
+        },
+        frequency_weighting={
+            "enabled": True,
+            "ticket_column": "ticket",
+            "transform": "log1p",
+            "exponent": 1.0,
+            "max_multiplier": 3.0,
+        },
+    )
+    cfg.ensure_directories()
+    _write_common_product_diagnostics(cfg)
+    embeddings_path = cfg.outputs / "embeddings" / "product_embeddings.parquet"
+    _write_product_embeddings(embeddings_path)
+
+    output = build_customer_embeddings(embeddings_path, transactions=_temporal_transactions(), force=True, cfg=cfg)
+    rows = pl.read_parquet(output).sort("cliente")
+    c1 = rows.filter(pl.col("cliente") == "c1").row(0, named=True)
+    summary = pl.read_csv(cfg.artifacts / "stage4" / "customer_embedding_weight_diagnostics.csv").row(0, named=True)
+
+    assert c1["emb_001"] > c1["emb_000"]
+    assert summary["recency_weighting_enabled"] is True
+    assert summary["recency_reference_date"] == "2024-01-31"
+    assert summary["frequency_weighting_enabled"] is True
+    assert summary["frequency_transform"] == "log1p"
+    assert summary["max_customer_product_basket_count"] == 2
+    assert summary["max_frequency_multiplier_observed"] > 1.0
+
+
+def test_customer_embedding_variant_diagnostics_compare_capped_and_idf_trials(tmp_path):
+    cfg = _test_config(
+        tmp_path,
+        variant_diagnostics={
+            "enabled": True,
+            "output_dir": "stage4",
+            "output_csv": "customer_embedding_variant_diagnostics.csv",
+            "trials": [
+                {
+                    "name": "official_quantity_log1p",
+                    "weight_strategy": "quantity",
+                    "quantity_transform": "log1p",
+                    "max_customer_product_weight": None,
+                    "normalize_vectors": False,
+                },
+                {
+                    "name": "capped_quantity_log1p_2",
+                    "weight_strategy": "quantity",
+                    "quantity_transform": "log1p",
+                    "max_customer_product_weight": 2.0,
+                    "normalize_vectors": False,
+                },
+                {
+                    "name": "quantity_idf_log1p",
+                    "weight_strategy": "quantity_idf",
+                    "quantity_transform": "log1p",
+                    "max_customer_product_weight": None,
+                    "normalize_vectors": False,
+                },
+            ],
+        },
+        gates={
+            "enabled": True,
+            "fail_on_violation": False,
+            "max_common_product_weight_share_pct": 80.0,
+        },
+    )
+    cfg.ensure_directories()
+    _write_common_product_diagnostics(cfg)
+    embeddings_path = cfg.outputs / "embeddings" / "product_embeddings.parquet"
+    _write_product_embeddings(embeddings_path)
+
+    output = build_customer_embedding_variant_diagnostics(
+        embeddings_path=embeddings_path,
+        transactions=_transactions(),
+        force=True,
+        cfg=cfg,
+    )
+    diagnostics = pl.read_csv(output).sort("trial_name")
+    official = diagnostics.filter(pl.col("trial_name") == "official_quantity_log1p").row(0, named=True)
+    capped = diagnostics.filter(pl.col("trial_name") == "capped_quantity_log1p_2").row(0, named=True)
+    idf = diagnostics.filter(pl.col("trial_name") == "quantity_idf_log1p").row(0, named=True)
+
+    assert output == cfg.artifacts / "stage4" / "customer_embedding_variant_diagnostics.csv"
+    assert diagnostics["trial_name"].to_list() == [
+        "capped_quantity_log1p_2",
+        "official_quantity_log1p",
+        "quantity_idf_log1p",
+    ]
+    assert official["is_official_stage4_recipe"] is True
+    assert capped["is_official_stage4_recipe"] is False
+    assert idf["weight_strategy"] == "quantity_idf"
+    assert capped["common_product_weight_share_pct"] < official["common_product_weight_share_pct"]
+    assert idf["common_product_weight_share_pct"] < official["common_product_weight_share_pct"]
+    assert "common_product_gate_margin_pct" in diagnostics.columns

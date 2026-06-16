@@ -61,6 +61,65 @@ def consolidated_umap_hdbscan_trials() -> list[dict[str, Any]]:
     return _dedupe_trials(trials)
 
 
+def focused_umap_hdbscan_noise_reduction_trials(
+    *,
+    n_components_values: Sequence[int] = (8, 10),
+    n_neighbors_values: Sequence[int] = (75, 100, 125, 150),
+    min_cluster_size_values: Sequence[int] = (300, 350, 400, 500),
+    min_samples_values: Sequence[int] = (2, 3, 5),
+) -> list[dict[str, Any]]:
+    """Targeted hard UMAP-HDBSCAN grid for reducing noise without forcing soft assignment.
+
+    The grid is intentionally centered on LEAF clustering because EOM collapsed
+    the current customer manifold into a few broad macro groups. It varies UMAP
+    smoothing and density strictness while keeping noise unassigned.
+    """
+
+    trials: list[dict[str, Any]] = []
+    for n_components in n_components_values:
+        for n_neighbors in n_neighbors_values:
+            for min_cluster_size in min_cluster_size_values:
+                for min_samples in min_samples_values:
+                    trials.append(
+                        _trial(
+                            (
+                                f"u{int(n_components)}_n{int(n_neighbors)}_leaf_"
+                                f"mcs{int(min_cluster_size)}_ms{int(min_samples)}"
+                            ),
+                            int(n_components),
+                            int(n_neighbors),
+                            0.0,
+                            "cosine",
+                            int(min_cluster_size),
+                            int(min_samples),
+                            "leaf",
+                        )
+                    )
+    return _dedupe_trials(trials)
+
+
+def run_noise_reduction_grid_experiment(
+    feature_path: str | Path,
+    experiment_name: str = "umap_hdbscan_noise_reduction_grid",
+    trials: list[dict[str, Any]] | None = None,
+    limit: int | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Any]:
+    """Run the focused Stage 6 hard UMAP-HDBSCAN noise-reduction grid."""
+
+    selected_trials = trials or focused_umap_hdbscan_noise_reduction_trials()
+    if limit is not None:
+        selected_trials = selected_trials[: int(limit)]
+    return run_umap_hdbscan_experiments(
+        feature_path,
+        trials=selected_trials,
+        experiment_name=experiment_name,
+        force=force,
+        cfg=cfg,
+    )
+
+
 def two_stage_hdbscan_trials() -> list[dict[str, Any]]:
     """Hierarchical EOM -> LEAF trials for splitting the largest broad parent cluster."""
 
@@ -490,6 +549,52 @@ def default_dimensionality_profile_shortlist() -> list[dict[str, Any]]:
     ]
 
 
+def ranked_dimensionality_profile_shortlist(
+    diagnostics_path: str | Path,
+    *,
+    max_candidates: int = 5,
+    target_cluster_min: int | None = None,
+    target_cluster_max: int | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> list[dict[str, Any]]:
+    """Select top-ranked target-range candidates from a diagnostics file for profiling."""
+
+    diagnostics = pl.read_parquet(diagnostics_path)
+    if diagnostics.is_empty():
+        return []
+
+    target_min = target_cluster_min or int(cfg.get("modeling.client_hypothesis_min", 10))
+    target_max = target_cluster_max or int(cfg.get("modeling.client_hypothesis_max", 15))
+    ranked = diagnostics.sort("stage6_rank") if "stage6_rank" in diagnostics.columns else diagnostics
+    target = ranked.filter(
+        (pl.col("cluster_count") >= target_min)
+        & (pl.col("cluster_count") <= target_max)
+        & (pl.col("assignment_path").is_not_null())
+    )
+    if target.is_empty():
+        target = ranked.filter(pl.col("assignment_path").is_not_null())
+
+    shortlist = []
+    for idx, row in enumerate(target.head(max_candidates).iter_rows(named=True), start=1):
+        trial_name = str(row.get("trial_name") or f"candidate_{idx}")
+        clusters = row.get("cluster_count")
+        noise = row.get("noise_pct")
+        label = f"rank{idx}_{_trial_slug(trial_name)}"
+        shortlist.append(
+            {
+                "label": label,
+                "role": (
+                    f"Rank {idx} target-range candidate"
+                    f" ({clusters} tribes, {float(noise):.1f}% noise)"
+                    if noise is not None
+                    else f"Rank {idx} target-range candidate"
+                ),
+                "candidate_id": row.get("candidate_id"),
+            }
+        )
+    return shortlist
+
+
 def profile_dimensionality_shortlist(
     diagnostics_path: str | Path,
     experiment_name: str = "umap_dimensionality_reduction_master_search",
@@ -506,7 +611,7 @@ def profile_dimensionality_shortlist(
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     diagnostics = pl.read_parquet(diagnostics_path).sort("stage6_rank")
-    selected_specs = list(shortlist or default_dimensionality_profile_shortlist())
+    selected_specs = list(default_dimensionality_profile_shortlist() if shortlist is None else shortlist)
     comparison_rows: list[dict[str, Any]] = []
     detail_sections: list[str] = []
 

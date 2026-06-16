@@ -9,7 +9,8 @@ This is a product-first customer segmentation pipeline. Clusters should be drive
 Official customer vectorization uses:
 
 - Product identity through Item2Vec product embeddings.
-- Product quantity through `unidades`.
+- Product quantity through `unidades` using the configured `log1p` transform.
+- Product-purchase recency decay and product-specific basket-count frequency scaling as weights.
 
 Official customer vectorization does not use:
 
@@ -32,10 +33,8 @@ The clean ML workflow is:
 4. Aggregate customer embeddings using quantity-weighted product vectors.
 5. Build model-ready feature sets.
 6. Compare official clustering candidates without forcing a target number of clusters.
-7. Produce cluster validity and perturbation-stability diagnostics.
-8. Profile tribes by product, sector, theme, term, KPI, promo, and business-readability metrics.
-9. Export final assignments, profiles, reports, figures, and shopping-mission microtribes.
-10. Write an additional business lens for campaign opportunities and conservative financial sizing.
+6.4. Produce cluster validity and perturbation-stability diagnostics.
+7. Deeply profile and interpret tribes by product, sector, theme, term, KPI, noise-population audit, subsegment, readiness, and clustering-atlas evidence. This is the official final handoff stage.
 
 UMAP is a dimensionality-reduction aid. It can improve density clustering, but it must earn its place through metrics, stability, interpretability, and clean product-lift profiles.
 
@@ -46,8 +45,9 @@ This repository is ready for colleague experimentation after the source changes 
 Current handoff notes:
 
 - Reconcile the environment before running UMAP-HDBSCAN. The project expects `scikit-learn=1.7.2` with `hdbscan==0.8.40`.
-- Local prod embeddings, feature sets, and model-selection caches exist. Prod Stage 8 profile artifacts may still be absent or in progress; if `outputs/prod/profiles/` is empty, the selected tribe profile has not finished building.
-- Include local source modules `src/business_lens.py`, `src/cache_audit.py`, and `src/mission_microtribes.py` in any handoff; they are currently present locally but not yet tracked by git.
+- Local prod embeddings, feature sets, and model-selection caches exist. Prod Stage 7 profile artifacts may still be absent or in progress; if `outputs/prod/profiles/` is empty, the selected tribe profile has not finished building.
+- Prod Stage 6 is configured for 1.4M-customer scale by fitting UMAP/HDBSCAN on a deterministic 300k customer sample, transforming/assigning the full population, and keeping diagnostics sampled rather than loading full feature matrices.
+- Include local source modules used by the official flow in any handoff. `src/cache_audit.py` supports Stage 0, and `src/profiling.py` now owns the final Stage 7 evidence storyline, noise-population audit, dossier, subsegment, atlas, and LLM-prompt artifacts.
 - Use dev sandboxes for experimentation; do not change production YAML based on one unreviewed run.
 - Commit or otherwise share all source files, configs, notebooks, and docs. Do not share raw data, Parquet caches, trained models, figures, or `.env` files through git.
 
@@ -67,11 +67,11 @@ Current sandbox areas:
 
 - Item2Vec hyperparameters.
 - Product embedding diagnostics.
-- Customer vector aggregation, including IDF-downweighted variants.
+- Customer vector aggregation, including capped and alternate weighting variants.
 - Feature-set composition.
 - Focused UMAP-HDBSCAN trials.
 
-IDF downweighting is intentionally a sandbox experiment for now. It may help reduce the dominance of products bought by many customers, but it should only be promoted to YAML if it improves downstream cluster validity, stability, and product-lift interpretability.
+IDF downweighting remains an available sandbox variant, but the current shared Stage 4 YAML recipe is quantity plus recency/frequency weighting. Treat downstream cluster validity, stability, and product-lift interpretability as the evidence check for keeping it official.
 
 ## Configuration
 
@@ -109,8 +109,9 @@ The repo should not commit generated Parquet files, trained model binaries, plot
 ## Next Steps
 
 1. Reconcile the local environment to `environment.yml`.
-2. Let prod Stage 8 complete if it is currently building profiles; expect a cold profile build to scan the large prepared transaction table.
-3. Inspect Stage 6, Stage 7, and Stage 8 outputs together: metrics, noise, balance, stability, and product/theme/term lift.
-4. Run Stage 9 and Stage 10 after profiles exist to generate the selected exports, shopping missions, presentation pack, decision log, and business lens.
-5. Use the sandbox to test IDF and focused UMAP-HDBSCAN variants only if the official run shows weak product separation or unstable labels.
+2. Let prod Stage 7 complete if it is currently building profiles; expect a cold profile build to scan the large prepared transaction table.
+3. Inspect Stage 6.1-6.4 and Stage 7 outputs together: metrics, noise, balance, stability/readiness, product/theme/term lift, and the noise-audit recommendation.
+4. Review the Stage 7 evidence storyline first, then use the noise-population audit, dossier, all-tribe comparison, subsegment overlays, clustering atlas, and LLM interpretation prompt pack as supporting proof before presenting the selected solution.
+5. Use the sandbox to test alternate customer-vector recipes and focused UMAP-HDBSCAN variants only if the official run shows weak product separation or unstable labels.
 6. Promote only the strongest evidence-backed settings into YAML.
+

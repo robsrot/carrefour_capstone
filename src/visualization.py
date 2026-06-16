@@ -15,15 +15,17 @@ from src.progress import log_event, stage_timer
 from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns, scan_if_path, schema_names
 
 
+KING_BLUE = "#0050A4"
+
 FIGURE_COLORS = {
-    "primary": "#0050A4",
-    "secondary": "#1F7A8C",
-    "tertiary": "#4BA3C7",
-    "accent": "#F2A900",
-    "warning": "#E30613",
-    "purple": "#6D5BD0",
-    "green": "#4C956C",
-    "navy": "#183B56",
+    "primary": KING_BLUE,
+    "secondary": KING_BLUE,
+    "tertiary": KING_BLUE,
+    "accent": KING_BLUE,
+    "warning": KING_BLUE,
+    "purple": KING_BLUE,
+    "green": KING_BLUE,
+    "navy": KING_BLUE,
     "neutral": "#667085",
     "muted": "#A0AEC0",
     "text": "#17202A",
@@ -36,26 +38,31 @@ FIGURE_COLORS = {
 }
 CHART_COLOR_SEQUENCE = [
     FIGURE_COLORS["primary"],
-    FIGURE_COLORS["secondary"],
-    FIGURE_COLORS["warning"],
-    FIGURE_COLORS["accent"],
-    FIGURE_COLORS["purple"],
-    FIGURE_COLORS["green"],
-    FIGURE_COLORS["tertiary"],
-    FIGURE_COLORS["navy"],
-    FIGURE_COLORS["muted"],
+]
+# Keep this separate from the default chart cycle; use it only where colors encode labels.
+CLUSTER_COLOR_SEQUENCE = [
+    KING_BLUE,
+    "#1F7A8C",
+    "#E30613",
+    "#F2A900",
+    "#6D5BD0",
+    "#4C956C",
+    "#4BA3C7",
+    "#183B56",
+    "#C2410C",
+    "#7C3AED",
 ]
 ASSIGNMENT_COLORS = {
-    "HDBSCAN core": FIGURE_COLORS["primary"],
-    "q95 soft-assigned": FIGURE_COLORS["accent"],
+    "HDBSCAN core": KING_BLUE,
+    "q95 soft-assigned": "#4BA3C7",
     "remaining noise": FIGURE_COLORS["neutral"],
-    "other": FIGURE_COLORS["purple"],
+    "other": "#183B56",
 }
 EVIDENCE_COLORS = {
-    "Product": FIGURE_COLORS["purple"],
-    "Theme": FIGURE_COLORS["green"],
-    "Term": FIGURE_COLORS["secondary"],
-    "Sector": FIGURE_COLORS["tertiary"],
+    "Product": KING_BLUE,
+    "Theme": "#1F7A8C",
+    "Term": "#4BA3C7",
+    "Sector": "#183B56",
 }
 SEQUENTIAL_CMAP = "Blues"
 DIVERGING_CMAP = "RdBu_r"
@@ -680,7 +687,7 @@ def plot_customer_embedding_diagnostics(
     output_path: str | Path | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Plot customer-vector norm distribution and a sampled PCA preview."""
+    """Plot customer-vector health plus Stage 4 coverage and dominance gates."""
 
     import matplotlib.pyplot as plt
 
@@ -696,7 +703,47 @@ def plot_customer_embedding_diagnostics(
     norms = np.linalg.norm(X, axis=1)
     coords = _pca_2d(X, cfg)
 
-    fig, (ax_norm, ax_pca) = plt.subplots(1, 2, figsize=(12, 5))
+    diagnostics_cfg = cfg.get("customer_embeddings.diagnostics", {}) or {}
+    diagnostics_path = (
+        cfg.artifacts
+        / str(diagnostics_cfg.get("output_dir", "stage4"))
+        / f"{diagnostics_cfg.get('output_prefix', 'customer_embedding')}_weight_diagnostics.csv"
+    )
+    diagnostics: dict[str, Any] = {}
+    diagnostics_error: str | None = None
+    if diagnostics_path.exists():
+        try:
+            diagnostics_df = pl.read_csv(diagnostics_path)
+            if diagnostics_df.height > 0:
+                diagnostics = diagnostics_df.row(0, named=True)
+        except Exception as exc:  # pragma: no cover - plot should still render if a CSV is mid-write/corrupt.
+            diagnostics_error = str(exc)
+
+    def _metric(name: str) -> float | None:
+        value = diagnostics.get(name)
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _display_value(value: Any) -> str:
+        if value is None or value == "":
+            return "n/a"
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        if isinstance(value, float):
+            return f"{value:.3g}"
+        return str(value)
+
+    fig = plt.figure(figsize=(13.6, 8.4))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.9])
+    ax_norm = fig.add_subplot(gs[0, 0])
+    ax_pca = fig.add_subplot(gs[0, 1])
+    ax_gates = fig.add_subplot(gs[1, 0])
+    ax_summary = fig.add_subplot(gs[1, 1])
+
     finite_norms = norms[np.isfinite(norms)]
     if finite_norms.size == 0:
         raise ValueError(f"No finite customer-vector norms found in {customer_embeddings_path}")
@@ -704,7 +751,7 @@ def plot_customer_embedding_diagnostics(
     norm_max = float(np.max(finite_norms))
     norm_mean = float(np.mean(finite_norms))
     if norm_max - norm_min <= 1e-5:
-        ax_norm.axvline(norm_mean, color=_color("purple"), linewidth=3)
+        ax_norm.axvline(norm_mean, color=_color("primary"), linewidth=3.5)
         ax_norm.set_xlim(norm_mean - 0.01, norm_mean + 0.01)
         ax_norm.set_ylim(0, max(1, sample.height))
         ax_norm.text(
@@ -718,21 +765,94 @@ def plot_customer_embedding_diagnostics(
             bbox={"boxstyle": "round,pad=0.35", "facecolor": _color("white"), "edgecolor": _color("grid")},
         )
     else:
-        ax_norm.hist(finite_norms, bins=40, color=_color("purple"), alpha=0.82)
+        ax_norm.hist(finite_norms, bins=40, color=_color("primary"), alpha=0.82)
     ax_norm.set_title("Customer Vector Norms")
     ax_norm.set_xlabel("L2 norm")
     ax_norm.set_ylabel("Sampled customers")
     ax_norm.grid(axis="y", alpha=0.25)
 
-    color = sample["embedded_unique_products"].to_numpy() if "embedded_unique_products" in sample.columns else norms
-    scatter = ax_pca.scatter(coords[:, 0], coords[:, 1], c=color, s=4, cmap=SCATTER_CMAP, alpha=0.6, linewidths=0)
+    ax_pca.scatter(coords[:, 0], coords[:, 1], s=6, color=_color("primary"), alpha=0.35, linewidths=0)
     ax_pca.set_title("Customer Embedding PCA Preview")
     ax_pca.set_xlabel("PC1")
     ax_pca.set_ylabel("PC2")
     ax_pca.grid(alpha=0.2)
-    fig.colorbar(scatter, ax=ax_pca, fraction=0.046, pad=0.04, label="Embedded unique products" if "embedded_unique_products" in sample.columns else "Vector norm")
 
-    fig.tight_layout()
+    gates = cfg.get("customer_embeddings.gates", {}) or {}
+    gate_specs = [
+        ("Line coverage", "line_coverage_pct", "min_line_coverage_pct", "min"),
+        ("Unit coverage", "unit_coverage_pct", "min_unit_coverage_pct", "min"),
+        ("Customer coverage", "customer_coverage_pct", "min_customer_coverage_pct", "min"),
+        ("Common product weight", "common_product_weight_share_pct", "max_common_product_weight_share_pct", "max"),
+        ("Top product weight", "top_product_weight_share_pct", "max_top_product_weight_share_pct", "max"),
+        ("Top 10 product weight", "top_10_product_weight_share_pct", "max_top_10_product_weight_share_pct", "max"),
+    ]
+    gate_rows = [
+        (label, value, gates.get(threshold_key), direction)
+        for label, value_key, threshold_key, direction in gate_specs
+        if (value := _metric(value_key)) is not None
+    ]
+    if gate_rows:
+        y = np.arange(len(gate_rows))
+        values = [max(0.0, min(100.0, row[1])) for row in gate_rows]
+        ax_gates.barh(y, values, color=_color("primary"), alpha=0.82)
+        ax_gates.set_yticks(y, [row[0] for row in gate_rows])
+        ax_gates.set_xlim(0, 100)
+        ax_gates.set_xlabel("Percent")
+        ax_gates.set_title("Stage 4 Gate Metrics")
+        ax_gates.grid(axis="x", alpha=0.25)
+        ax_gates.invert_yaxis()
+        for idx, (_, value, threshold, direction) in enumerate(gate_rows):
+            ax_gates.text(min(value + 1.0, 98.5), idx, f"{value:.1f}%", va="center", fontsize=8)
+            if threshold is not None and threshold != "":
+                threshold_value = float(threshold)
+                ax_gates.plot(
+                    [threshold_value, threshold_value],
+                    [idx - 0.36, idx + 0.36],
+                    color=_color("line"),
+                    linestyle="--",
+                    linewidth=1.2,
+                )
+                prefix = "min" if direction == "min" else "max"
+                ax_gates.text(
+                    min(threshold_value + 1.0, 98.0),
+                    idx + 0.31,
+                    f"{prefix} {threshold_value:.0f}%",
+                    fontsize=7,
+                    color=_color("subtle_text"),
+                )
+    else:
+        ax_gates.axis("off")
+        missing_message = "Stage 4 weight diagnostics CSV not found yet."
+        if diagnostics_error:
+            missing_message = f"Stage 4 weight diagnostics could not be read:\n{diagnostics_error}"
+        ax_gates.text(0.5, 0.5, missing_message, ha="center", va="center")
+
+    strategy = diagnostics.get("weight_strategy", cfg.get("customer_embeddings.weight_strategy", "quantity"))
+    issues = str(diagnostics.get("stage4_gate_issues", "n/a"))
+    if len(issues) > 120:
+        issues = shorten(issues, width=120, placeholder="...")
+    summary_rows = [
+        ("Weight strategy", strategy),
+        ("Quantity transform", diagnostics.get("quantity_transform", cfg.get("customer_embeddings.quantity_transform"))),
+        ("IDF weighting", "yes" if "idf" in str(strategy).lower() else "no"),
+        ("Normalize vectors", diagnostics.get("normalize_vectors", cfg.get("customer_embeddings.normalize_vectors"))),
+        ("Recency weighting", diagnostics.get("recency_weighting_enabled")),
+        ("Frequency weighting", diagnostics.get("frequency_weighting_enabled")),
+        ("Embedded customers", diagnostics.get("weighted_customers", embeddings.height)),
+        ("Embedded products", diagnostics.get("weighted_products", len(feature_cols))),
+        ("Gate status", diagnostics.get("stage4_gate_status", "n/a")),
+        ("Gate issues", issues),
+    ]
+    ax_summary.axis("off")
+    ax_summary.set_title("Recipe and Gate Status", loc="left")
+    y_pos = 0.96
+    for label, value in summary_rows:
+        ax_summary.text(0.02, y_pos, f"{label}:", fontweight="bold", va="top")
+        ax_summary.text(0.42, y_pos, _display_value(value), va="top", wrap=True)
+        y_pos -= 0.09 if label != "Gate issues" else 0.15
+
+    fig.suptitle("Stage 4 Customer Embedding Diagnostics", fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
     path = _save_figure(fig, output, cfg, "Stage 4 figures", "wrote customer embedding diagnostics")
     plt.close(fig)
     return path
@@ -905,7 +1025,7 @@ def plot_model_comparison(
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160)
     plt.close(fig)
-    log_event("Stage 8 figures", "wrote model comparison plot", cfg=cfg, path=output)
+    log_event("Stage 7 figures", "wrote model comparison plot", cfg=cfg, path=output)
     return output
 
 
@@ -914,7 +1034,7 @@ def plot_stage6_model_diagnostics(
     output_path: str | Path | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Plot all Stage 6 candidate rows before product-lift profiling."""
+    """Plot Stage 6 model diagnostics before stability and product-lift profiling."""
 
     import matplotlib.pyplot as plt
 
@@ -922,7 +1042,7 @@ def plot_stage6_model_diagnostics(
     diagnostics = (
         pl.read_csv(diagnostics_path) if str(diagnostics_path).lower().endswith(".csv") else pl.read_parquet(diagnostics_path)
     )
-    output = Path(output_path) if output_path else cfg.figures / "stage6_candidate_model_diagnostics.png"
+    output = Path(output_path) if output_path else cfg.figures / "stage6_model_diagnostics.png"
     pdf = diagnostics.to_pandas()
     if pdf.empty:
         raise ValueError(f"No Stage 6 diagnostics rows found in {diagnostics_path}")
@@ -985,7 +1105,7 @@ def plot_stage6_model_diagnostics(
 
     ax_scatter.set_xlabel("Cluster count")
     ax_scatter.set_ylabel(metric.replace("_", " ").title())
-    ax_scatter.set_title("Stage 6 Candidate Landscape")
+    ax_scatter.set_title("Stage 6 Core Tribe Diagnostics")
     ax_scatter.grid(alpha=0.25)
     ax_scatter.legend(loc="best", fontsize=7, frameon=False)
 
@@ -995,7 +1115,7 @@ def plot_stage6_model_diagnostics(
     ax_ranked.set_yticks(range(len(top)))
     ax_ranked.set_yticklabels(top["candidate_label"], fontsize=7)
     ax_ranked.set_xlabel(metric.replace("_", " ").title())
-    ax_ranked.set_title("Top Stage 6 Candidates")
+    ax_ranked.set_title("Stage 6 Ranked Runs")
     ax_ranked.grid(axis="x", alpha=0.25)
 
     fig.tight_layout()
@@ -1004,6 +1124,321 @@ def plot_stage6_model_diagnostics(
     plt.close(fig)
     log_event("Stage 6 diagnostics", "wrote candidate diagnostics plot", cfg=cfg, path=output)
     return output
+
+
+def plot_stage6_quality_evidence(
+    quality_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot Stage 6.3 UMAP retention and HDBSCAN validity against target ranges."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    quality = pl.read_csv(quality_path)
+    if quality.is_empty():
+        raise ValueError(f"No Stage 6.3 quality rows found in {quality_path}")
+    row = quality.row(0, named=True)
+    output = Path(output_path) if output_path else cfg.figures / "stage6_3_quality_evidence.png"
+
+    specs = [
+        {
+            "key": "umap_trustworthiness",
+            "label": "UMAP trustworthiness",
+            "ideal": ">= 0.95 strong; >= 0.90 usable",
+            "score": _score_high_good(_as_float_for_plot(row.get("umap_trustworthiness")), low=0.90, high=0.95),
+            "value": row.get("umap_trustworthiness"),
+        },
+        {
+            "key": "umap_mean_knn_overlap_pct",
+            "label": "UMAP kNN overlap",
+            "ideal": ">= 25% useful; >= 15% review",
+            "score": _score_high_good(_as_float_for_plot(row.get("umap_mean_knn_overlap_pct")), low=15.0, high=25.0),
+            "value": row.get("umap_mean_knn_overlap_pct"),
+        },
+        {
+            "key": "umap_distance_spearman",
+            "label": "UMAP distance rank",
+            "ideal": ">= 0.70 strong; >= 0.60 usable",
+            "score": _score_high_good(_as_float_for_plot(row.get("umap_distance_spearman")), low=0.60, high=0.70),
+            "value": row.get("umap_distance_spearman"),
+        },
+        {
+            "key": "hdbscan_dbcv_score",
+            "label": "HDBSCAN DBCV",
+            "ideal": ">= 0.25 strong; >= 0.10 usable",
+            "score": _score_high_good(_as_float_for_plot(row.get("hdbscan_dbcv_score")), low=0.10, high=0.25),
+            "value": row.get("hdbscan_dbcv_score"),
+        },
+        {
+            "key": "noise_pct",
+            "label": "Noise share",
+            "ideal": "<= 60% gate; <= 40% strong",
+            "score": _score_low_good(_as_float_for_plot(row.get("noise_pct")), low=40.0, high=60.0),
+            "value": row.get("noise_pct"),
+        },
+        {
+            "key": "core_coverage_pct",
+            "label": "Core coverage",
+            "ideal": ">= 40% useful; >= 60% strong",
+            "score": _score_high_good(_as_float_for_plot(row.get("core_coverage_pct")), low=40.0, high=60.0),
+            "value": row.get("core_coverage_pct"),
+        },
+        {
+            "key": "silhouette_core_only",
+            "label": "Core silhouette",
+            "ideal": ">= 0.40 strong; >= 0.25 usable",
+            "score": _score_high_good(_as_float_for_plot(row.get("silhouette_core_only")), low=0.25, high=0.40),
+            "value": row.get("silhouette_core_only"),
+        },
+        {
+            "key": "coverage_adjusted_silhouette",
+            "label": "Coverage-adjusted silhouette",
+            "ideal": ">= 0.25 strong; >= 0.15 usable",
+            "score": _score_high_good(_as_float_for_plot(row.get("coverage_adjusted_silhouette")), low=0.15, high=0.25),
+            "value": row.get("coverage_adjusted_silhouette"),
+        },
+        {
+            "key": "avg_assignment_confidence",
+            "label": "Assignment confidence",
+            "ideal": ">= 0.40 stronger; >= 0.30 review",
+            "score": _score_high_good(_as_float_for_plot(row.get("avg_assignment_confidence")), low=0.30, high=0.40),
+            "value": row.get("avg_assignment_confidence"),
+        },
+    ]
+    specs = [spec for spec in specs if spec["value"] is not None and str(spec["value"]) != ""]
+    if not specs:
+        raise ValueError(f"Stage 6.3 quality row did not contain plottable metrics: {quality_path}")
+
+    labels = [str(spec["label"]) for spec in specs][::-1]
+    scores = [float(spec["score"]) * 100.0 for spec in specs][::-1]
+    values = [_format_plot_value(spec["value"]) for spec in specs][::-1]
+    ideals = [str(spec["ideal"]) for spec in specs][::-1]
+    colors = [_evidence_score_color(score / 100.0) for score in scores]
+
+    fig_height = max(6.0, 1.02 * len(specs))
+    fig, ax = plt.subplots(figsize=(12.5, fig_height))
+    y = np.arange(len(specs))
+    ax.barh(y, [100.0] * len(specs), color="#EEF2F6", height=0.64)
+    ax.barh(y, scores, color=colors, height=0.64)
+    ax.axvline(70.0, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.text(70.7, len(specs) - 0.35, "usable evidence", fontsize=9, color="#475467", va="top")
+
+    for idx, (score, value, ideal) in enumerate(zip(scores, values, ideals)):
+        ax.text(min(max(score + 2.0, 4.0), 98.0), idx, f"{score:.0f}", va="center", ha="left", fontsize=9)
+        ax.text(103.0, idx, f"{value} | {ideal}", va="center", ha="left", fontsize=9, color=_color("text"))
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=10)
+    ax.set_xlim(0, 160)
+    ax.set_xlabel("Evidence score, 0-100")
+    ax.set_title("Stage 6.3 Representation and Density Evidence")
+    ax.grid(axis="x", alpha=0.22)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.tick_params(axis="y", length=0)
+    fig.text(
+        0.125,
+        0.025,
+        "Scores are pragmatic diagnostics, not model objectives. Use them with Stage 6.4 stability and Stage 7 product-lift evidence.",
+        fontsize=9,
+        color=_color("subtle_text"),
+    )
+
+    fig.tight_layout(rect=(0, 0.055, 1, 1))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=170)
+    plt.close(fig)
+    log_event("Stage 6.3 diagnostics", "wrote quality evidence scorecard", cfg=cfg, path=output)
+    return output
+
+
+def plot_stage6_cluster_readiness(
+    readiness_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot Stage 6.4 cluster-level readiness before product profiling."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    readiness = (
+        pl.read_csv(readiness_path)
+        if str(readiness_path).lower().endswith(".csv")
+        else pl.read_parquet(readiness_path)
+    )
+    if readiness.is_empty():
+        raise ValueError(f"No Stage 6.4 cluster readiness rows found in {readiness_path}")
+    pdf = readiness.to_pandas()
+    output = Path(output_path) if output_path else cfg.figures / "stage6_4_cluster_readiness.png"
+
+    readiness_colors = {
+        "strong": "#2E7D32",
+        "usable": "#F2A900",
+        "review": "#C2410C",
+    }
+    pdf["profile_readiness"] = pdf["profile_readiness"].fillna("review").astype(str)
+    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].fillna(0.0).astype(float)
+    pdf["customers"] = pdf["customers"].fillna(0).astype(float)
+    pdf["core_customer_share_pct"] = pdf["core_customer_share_pct"].fillna(0.0).astype(float)
+    min_cluster_size = float(pdf["min_cluster_size_reference"].dropna().iloc[0]) if "min_cluster_size_reference" in pdf else 0.0
+
+    fig, ax = plt.subplots(figsize=(10.8, 6.6))
+    for readiness_label, group in pdf.groupby("profile_readiness"):
+        sizes = 70.0 + group["core_customer_share_pct"].clip(lower=0, upper=35) * 24.0
+        ax.scatter(
+            group["customers"],
+            group["mean_assignment_confidence"],
+            s=sizes,
+            color=readiness_colors.get(readiness_label, _color("neutral")),
+            alpha=0.82,
+            edgecolor="white",
+            linewidth=0.8,
+            label=readiness_label,
+        )
+        for _, row in group.iterrows():
+            ax.annotate(
+                str(int(row["tribe_id"])),
+                (row["customers"], row["mean_assignment_confidence"]),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=8,
+                color=_color("text"),
+            )
+
+    if min_cluster_size > 0:
+        ax.axvline(min_cluster_size, color="#475467", linestyle="--", linewidth=1.0, alpha=0.8)
+        ax.text(min_cluster_size, ax.get_ylim()[1] * 0.96, "min cluster size", rotation=90, va="top", ha="right", fontsize=8)
+    ax.axhline(0.30, color="#475467", linestyle=":", linewidth=1.0, alpha=0.8)
+    ax.text(ax.get_xlim()[1] * 0.99, 0.305, "confidence review line", ha="right", va="bottom", fontsize=8)
+    ax.set_xlabel("Customers in core tribe")
+    ax.set_ylabel("Mean assignment confidence")
+    ax.set_title("Stage 6.4 Cluster Readiness Before Profiling")
+    ax.grid(alpha=0.22)
+    ax.legend(title="Profile readiness", frameon=False, loc="best")
+    fig.tight_layout()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=170)
+    plt.close(fig)
+    log_event("Stage 6.4 diagnostics", "wrote cluster readiness plot", cfg=cfg, path=output)
+    return output
+
+
+def _as_float_for_plot(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        value_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value_float if math.isfinite(value_float) else None
+
+
+def _score_high_good(value: float | None, *, low: float, high: float) -> float:
+    if value is None:
+        return 0.0
+    if value >= high:
+        return 1.0
+    if value <= low:
+        return max(0.0, 0.35 * value / low) if low > 0 else 0.0
+    return 0.35 + 0.65 * ((value - low) / (high - low))
+
+
+def _score_low_good(value: float | None, *, low: float, high: float) -> float:
+    if value is None:
+        return 0.0
+    if value <= low:
+        return 1.0
+    if value >= high:
+        return max(0.0, 0.35 * (1.0 - min(value - high, high) / max(high, 1e-12)))
+    return 1.0 - 0.65 * ((value - low) / (high - low))
+
+
+def _evidence_score_color(score: float) -> str:
+    if score >= 0.70:
+        return "#2E7D32"
+    if score >= 0.45:
+        return "#F2A900"
+    return "#C2410C"
+
+
+def _format_plot_value(value: Any) -> str:
+    value_float = _as_float_for_plot(value)
+    if value_float is None:
+        return str(value)
+    if abs(value_float) >= 100:
+        return f"{value_float:.0f}"
+    if abs(value_float) >= 10:
+        return f"{value_float:.1f}"
+    return f"{value_float:.3f}".rstrip("0").rstrip(".")
+
+
+def plot_stage6_umap_representation(
+    umap_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot the first two dimensions of the Stage 6.1 UMAP representation."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage6_1_umap_representation.png"
+    umap_df = pl.read_parquet(umap_path)
+    umap_cols = [col for col in numeric_feature_columns(umap_df) if col.startswith("umap_")]
+    if len(umap_cols) < 2:
+        raise ValueError(f"UMAP representation needs at least two numeric components for plotting: {umap_path}")
+    sample = _sample_frame(umap_df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.8))
+    ax.scatter(
+        sample[umap_cols[0]].to_numpy(),
+        sample[umap_cols[1]].to_numpy(),
+        s=4,
+        color=_color("primary"),
+        alpha=0.32,
+        linewidths=0,
+    )
+    ax.set_title("Stage 6.1 UMAP Customer Manifold")
+    ax.set_xlabel(umap_cols[0])
+    ax.set_ylabel(umap_cols[1])
+    ax.grid(alpha=0.22)
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 6.1 figures", "wrote UMAP representation preview")
+    plt.close(fig)
+    return path
+
+
+def plot_stage6_hdbscan_assignment_map(
+    umap_path: str | Path,
+    assignment_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot hard HDBSCAN tribe assignments on the Stage 6.1 UMAP plane."""
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage6_2_hdbscan_assignment_map.png"
+    umap_df = pl.read_parquet(umap_path)
+    assignments = pl.read_parquet(assignment_path).select(["cliente", "tribe_id"])
+    umap_cols = [col for col in numeric_feature_columns(umap_df) if col.startswith("umap_")]
+    if len(umap_cols) < 2:
+        raise ValueError(f"UMAP representation needs at least two numeric components for plotting: {umap_path}")
+
+    plot_df = umap_df.select(["cliente", umap_cols[0], umap_cols[1]]).join(assignments, on="cliente", how="inner")
+    sample = _sample_frame(plot_df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+    coords = sample.select([umap_cols[0], umap_cols[1]]).to_numpy().astype(np.float32, copy=False)
+    labels = sample["tribe_id"].to_numpy().astype(np.int32, copy=False)
+    path = _scatter(
+        coords,
+        labels,
+        output,
+        "Stage 6.2 Hard HDBSCAN Core Tribes on UMAP",
+        allocation_summary=_tribe_allocation_summary(assignments),
+    )
+    log_event("Stage 6.2 figures", "wrote hard HDBSCAN assignment map", cfg=cfg, path=path)
+    return path
 
 
 def plot_cluster_sizes(
@@ -1030,7 +1465,7 @@ def plot_cluster_sizes(
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160)
     plt.close(fig)
-    log_event("Stage 8 figures", "wrote cluster size plot", cfg=cfg, path=output)
+    log_event("Stage 7 figures", "wrote cluster size plot", cfg=cfg, path=output)
     return output
 
 
@@ -1094,7 +1529,7 @@ def plot_assignment_provenance(
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=170)
     plt.close(fig)
-    log_event("Stage 8 figures", "wrote assignment provenance plot", cfg=cfg, path=output)
+    log_event("Stage 7 figures", "wrote assignment provenance plot", cfg=cfg, path=output)
     return output
 
 
@@ -1200,7 +1635,7 @@ def plot_profile_evidence_dashboard(
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=170)
     plt.close(fig)
-    log_event("Stage 8 figures", "wrote profile evidence dashboard", cfg=cfg, path=output)
+    log_event("Stage 7 figures", "wrote profile evidence dashboard", cfg=cfg, path=output)
     return output
 
 
@@ -1218,14 +1653,14 @@ def plot_tribe_vs_population_evidence_dashboard(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / f"stage_08_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"
+        else cfg.figures / f"stage_07_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"
     )
     if profiles.is_empty():
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.text(0.5, 0.5, "No tribe profiles available.", ha="center", va="center")
         ax.axis("off")
         fig.tight_layout()
-        return _save_figure(fig, output, cfg, "Stage 8 figures", "wrote empty tribe evidence dashboard")
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty tribe evidence dashboard")
 
     rows = [dict(row) for row in profiles.iter_rows(named=True)]
     tribe_ids = [int(row.get("tribe_id")) for row in rows]
@@ -1426,13 +1861,152 @@ def plot_tribe_vs_population_evidence_dashboard(
         ax_behavior.axis("off")
 
     fig.suptitle(
-        "Stage 8 Tribe Evidence Dashboard: Each Tribe Compared With The Rest Of The Assigned Population",
+        "Stage 7 Tribe Evidence Dashboard: Each Tribe Compared With The Rest Of The Assigned Population",
         fontsize=14,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    path = _save_figure(fig, output, cfg, "Stage 8 figures", "wrote tribe-vs-population evidence dashboard")
+    path = _save_figure(fig, output, cfg, "Stage 7 figures", "wrote tribe-vs-population evidence dashboard")
     plt.close(fig)
     return path
+
+
+def plot_tribe_profile_comparison_heatmap(
+    profile_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot a between-tribe comparison heatmap using ratios versus the rest."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    output = (
+        Path(output_path)
+        if output_path
+        else cfg.figures / f"stage_07_tribe_profile_comparison_heatmap_{cfg.mode}.png"
+    )
+    if profiles.is_empty():
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No tribe profiles available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty tribe profile comparison heatmap")
+
+    rows = [dict(row) for row in profiles.iter_rows(named=True)]
+    metric_values: list[tuple[str, list[float | None]]] = [
+        ("Top product lift", [_max_ratio(row.get("top_product_lifts_vs_rest") or row.get("top_product_lifts")) for row in rows]),
+        ("Top sector lift", [_max_ratio(row.get("top_sector_lifts_vs_rest") or row.get("top_sector_lifts")) for row in rows]),
+        ("Top term lift", [_max_ratio(row.get("top_product_term_lifts_vs_rest") or row.get("top_product_term_lifts")) for row in rows]),
+    ]
+    for column, label in _profile_heatmap_behavior_fields(profiles):
+        metric_values.append((label, [_profile_rest_ratio(profiles, row, column) for row in rows]))
+
+    metric_values = [
+        (label, values)
+        for label, values in metric_values
+        if any(value is not None and math.isfinite(float(value)) for value in values)
+    ]
+    if not metric_values:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No comparable profile ratios available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty tribe profile comparison heatmap")
+
+    matrix = np.full((len(rows), len(metric_values)), np.nan, dtype=float)
+    annotation = [["" for _ in metric_values] for _ in rows]
+    for col_idx, (_, values) in enumerate(metric_values):
+        for row_idx, value in enumerate(values):
+            if value is None or not math.isfinite(float(value)) or value <= 0:
+                continue
+            matrix[row_idx, col_idx] = math.log2(float(value))
+            annotation[row_idx][col_idx] = f"{float(value):.1f}x"
+
+    masked = np.ma.masked_invalid(np.clip(matrix, -1.25, 2.0))
+    fig_width = max(12.0, 0.9 * len(metric_values) + 5.0)
+    fig_height = max(7.0, 0.55 * len(rows) + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    cmap = plt.get_cmap(DIVERGING_CMAP).copy()
+    cmap.set_bad(_color("background"))
+    im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=-1.25, vmax=2.0)
+
+    tribe_labels = [
+        f"T{row.get('tribe_id')} {shorten(str(row.get('suggested_tribe_name') or ''), width=26, placeholder='...')}".strip()
+        for row in rows
+    ]
+    ax.set_yticks(np.arange(len(rows)))
+    ax.set_yticklabels(tribe_labels)
+    ax.set_xticks(np.arange(len(metric_values)))
+    ax.set_xticklabels([label for label, _ in metric_values], rotation=35, ha="right")
+    ax.set_title("Stage 7 Between-Tribe Profile Comparison")
+    ax.set_xlabel("Metric ratio versus rest of assigned population")
+    ax.set_ylabel("Tribe")
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            if annotation[row_idx][col_idx]:
+                ax.text(col_idx, row_idx, annotation[row_idx][col_idx], ha="center", va="center", fontsize=7)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("log2 ratio vs rest; 0 means same as rest")
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 7 figures", "wrote tribe profile comparison heatmap")
+    plt.close(fig)
+    return path
+
+
+def _profile_heatmap_behavior_fields(profiles: pl.DataFrame) -> list[tuple[str, str]]:
+    candidates = [
+        ("avg_ticket_count", "Tickets"),
+        ("avg_total_units", "Units"),
+        ("avg_unique_products", "Unique products"),
+        ("avg_unique_sectors", "Unique sectors"),
+        ("avg_frequency_per_30d", "Frequency"),
+        ("avg_promo_share", "Promo share"),
+        ("avg_avg_basket_value", "Basket value"),
+    ]
+    return [(column, label) for column, label in candidates if column in profiles.columns]
+
+
+def _profile_rest_ratio(profiles: pl.DataFrame, row: Mapping[str, Any], column: str) -> float | None:
+    value = _finite_float(row.get(column))
+    tribe_id = int(row.get("tribe_id"))
+    if value is None:
+        return None
+    total_weight = 0.0
+    total_value = 0.0
+    own_weight = 0.0
+    own_value = 0.0
+    for item in profiles.iter_rows(named=True):
+        item_value = _finite_float(item.get(column))
+        weight = _finite_float(item.get("n_customers")) or 0.0
+        if item_value is None or weight <= 0:
+            continue
+        total_weight += weight
+        total_value += item_value * weight
+        if int(item.get("tribe_id")) == tribe_id:
+            own_weight += weight
+            own_value += item_value * weight
+    rest_weight = total_weight - own_weight
+    if rest_weight <= 0:
+        return None
+    rest_mean = (total_value - own_value) / rest_weight
+    return value / rest_mean if rest_mean > 0 else None
+
+
+def _max_ratio(values: Any) -> float | None:
+    cleaned = [_finite_float(value) for value in (values or [])]
+    finite = [value for value in cleaned if value is not None and value > 0]
+    return max(finite) if finite else None
+
+
+def _finite_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 def plot_tribe_theme_lift_heatmap(
@@ -1451,14 +2025,14 @@ def plot_tribe_theme_lift_heatmap(
     output = (
         Path(output_path)
         if output_path
-        else cfg.figures / f"stage_08_tribe_theme_lift_heatmap_{cfg.mode}.png"
+        else cfg.figures / f"stage_07_tribe_theme_lift_heatmap_{cfg.mode}.png"
     )
     if profiles.is_empty():
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.text(0.5, 0.5, "No tribe profiles available.", ha="center", va="center")
         ax.axis("off")
         fig.tight_layout()
-        return _save_figure(fig, output, cfg, "Stage 8 figures", "wrote empty tribe-theme heatmap")
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty tribe-theme heatmap")
 
     theme_scores: dict[str, float] = {}
     rows = []
@@ -1479,7 +2053,7 @@ def plot_tribe_theme_lift_heatmap(
         ax.text(0.5, 0.5, "No product-theme lift evidence available.", ha="center", va="center")
         ax.axis("off")
         fig.tight_layout()
-        return _save_figure(fig, output, cfg, "Stage 8 figures", "wrote empty tribe-theme heatmap")
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty tribe-theme heatmap")
 
     selected_themes = [
         theme for theme, _ in sorted(theme_scores.items(), key=lambda item: item[1], reverse=True)[:max_themes]
@@ -1506,7 +2080,7 @@ def plot_tribe_theme_lift_heatmap(
     )
     ax.set_xlabel("Product-theme evidence")
     ax.set_ylabel("Selected core tribe")
-    ax.set_title("Stage 8 Product-Theme Lift By Selected Tribe")
+    ax.set_title("Stage 7 Product-Theme Lift By Selected Tribe")
     threshold = float(cfg.get("profiling.strong_theme_lift_threshold", 1.2))
     for y in range(matrix.shape[0]):
         for x in range(matrix.shape[1]):
@@ -1516,7 +2090,7 @@ def plot_tribe_theme_lift_heatmap(
     cbar = fig.colorbar(im, ax=ax)
     cbar.set_label("Theme lift vs assigned population")
     fig.tight_layout()
-    return _save_figure(fig, output, cfg, "Stage 8 figures", "wrote tribe-theme heatmap")
+    return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote tribe-theme heatmap")
 
 
 def plot_mission_microtribe_overview(
@@ -1743,7 +2317,7 @@ def plot_candidate_umap_grid(
     if not assignment_paths:
         raise ValueError("No assignment paths were provided for candidate UMAP grid.")
 
-    with stage_timer("Stage 8 figures", "building candidate UMAP assignment grid", cfg=cfg, candidates=len(assignment_paths)):
+    with stage_timer("Stage 7 figures", "building candidate UMAP assignment grid", cfg=cfg, candidates=len(assignment_paths)):
         features = pl.read_parquet(feature_path).sort("cliente")
         feature_cols = numeric_feature_columns(features, exclude=("cliente",))
         sample_idx = deterministic_sample_indices(
@@ -1794,7 +2368,7 @@ def plot_candidate_umap_grid(
         output.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(output, dpi=170)
         plt.close(fig)
-        log_event("Stage 8 figures", "wrote candidate UMAP grid", cfg=cfg, path=output)
+        log_event("Stage 7 figures", "wrote candidate UMAP grid", cfg=cfg, path=output)
     return output
 
 
@@ -1832,7 +2406,7 @@ def plot_top_lifts(
         fig.savefig(path, dpi=160)
         plt.close(fig)
         paths.append(path)
-    log_event("Stage 8 figures", "wrote lift plots", cfg=cfg, plots=len(paths), output_dir=out_dir)
+    log_event("Stage 7 figures", "wrote lift plots", cfg=cfg, plots=len(paths), output_dir=out_dir)
     return paths
 
 
@@ -2167,7 +2741,7 @@ def build_interactive_3d_projection_html(
     sample_size = int(max_points or cfg.get("visualization.interactive.max_points", 15000))
 
     with stage_timer(
-        "Stage 8 figures",
+        "Stage 7 figures",
         f"building interactive 3D {method.upper()} projection",
         cfg=cfg,
         color_by=color_mode,
@@ -2297,7 +2871,7 @@ def build_interactive_3d_projection_html(
         output.parent.mkdir(parents=True, exist_ok=True)
         include_plotlyjs = bool(cfg.get("visualization.interactive.include_plotlyjs", True))
         fig.write_html(output, include_plotlyjs=include_plotlyjs, full_html=True)
-        log_event("Stage 8 figures", "wrote interactive 3D projection", cfg=cfg, path=output)
+        log_event("Stage 7 figures", "wrote interactive 3D projection", cfg=cfg, path=output)
     return output
 
 
@@ -2319,7 +2893,7 @@ def build_2d_projection_figures(
     assignments_path: str | Path,
     output_dir: str | Path | None = None,
     output_prefix: str | None = None,
-    stage_label: str = "Stage 8 figures",
+    stage_label: str = "Stage 7 figures",
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
     """Create PCA and optional UMAP 2D figures for visual review only."""
@@ -2464,7 +3038,7 @@ def _draw_tribe_allocation_panel(ax, allocation_summary: Sequence[Mapping[str, A
 def _tribe_color(tribe_id: int) -> str:
     if tribe_id < 0:
         return _color("muted")
-    return CHART_COLOR_SEQUENCE[int(tribe_id) % len(CHART_COLOR_SEQUENCE)]
+    return CLUSTER_COLOR_SEQUENCE[int(tribe_id) % len(CLUSTER_COLOR_SEQUENCE)]
 
 
 def _scatter_labels(ax, x: np.ndarray, y: np.ndarray, labels: np.ndarray) -> None:
@@ -2484,3 +3058,4 @@ def _scatter_labels(ax, x: np.ndarray, y: np.ndarray, labels: np.ndarray) -> Non
             alpha=0.78,
             linewidths=0,
         )
+

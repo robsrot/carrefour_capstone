@@ -4,24 +4,23 @@ from __future__ import annotations
 
 import os
 import math
+import re
 from typing import Any
 
 import polars as pl
-
-from src.product_themes import detect_product_themes
 
 
 THEME_LABELS = {
     "alcohol": "Beer & Alcohol Buyers",
     "alcohol_free": "Alcohol-Free Beer Buyers",
-    "baby": "Baby Care Buyers",
-    "halal": "Halal Product Buyers",
+    "baby": "Baby Product Signal",
+    "halal": "Halal-Labelled Product Signal",
     "pet": "Pet Care Buyers",
     "pet_dog": "Dog Product Buyers",
     "pet_cat": "Cat Product Buyers",
-    "kids_general": "Kids & Family Buyers",
-    "kids_girls": "Girls Apparel & Toy Buyers",
-    "kids_boys": "Boys Apparel & Toy Buyers",
+    "kids_general": "Kids/Toys Product Signal",
+    "kids_girls": "Doll/Girls-Labelled Product Signal",
+    "kids_boys": "Action/Vehicle Toy Product Signal",
     "world_foods_asian": "Asian-Style World Food Buyers",
     "world_foods_mexican": "Mexican-Style World Food Buyers",
     "world_foods_middle_eastern": "Middle Eastern-Style World Food Buyers",
@@ -55,86 +54,178 @@ THEME_LABELS = {
     "seasonal_celebration": "Seasonal Buyers",
 }
 
-THEME_COMBINATION_LABELS = {
-    frozenset({"plant_based", "organic_bio"}): "Plant-Based & Bio Buyers",
-    frozenset({"dairy_eggs", "organic_bio"}): "Organic Dairy Buyers",
-    frozenset({"plant_based", "protein_fitness"}): "Plant-Based & Protein Buyers",
-    frozenset({"organic_bio", "protein_fitness"}): "Organic Protein Buyers",
-    frozenset({"gluten_free", "lactose_free"}): "Special Diet Buyers",
-    frozenset({"baby", "apparel_textile"}): "Baby & Family Buyers",
-    frozenset({"baby", "kids_general"}): "Young Family Buyers",
-    frozenset({"baby", "books_toys"}): "Young Family Buyers",
-    frozenset({"kids_general", "books_toys"}): "Kids, Books & Toys Buyers",
-    frozenset({"kids_girls", "apparel_textile"}): "Girls Apparel Buyers",
-    frozenset({"kids_boys", "apparel_textile"}): "Boys Apparel Buyers",
-    frozenset({"pet_dog", "pet_cat"}): "Multi-Pet Buyers",
-    frozenset({"pet", "pet_dog"}): "Dog Product Buyers",
-    frozenset({"pet", "pet_cat"}): "Cat Product Buyers",
-    frozenset({"world_foods_mexican", "world_foods_asian"}): "World Food Buyers",
-    frozenset({"world_foods_middle_eastern", "world_foods_latin"}): "World Food Buyers",
-    frozenset({"alcohol", "beverages_soft"}): "Drinks Buyers",
-    frozenset({"meat_charcuterie", "fresh_produce"}): "Fresh Food Buyers",
-    frozenset({"seafood", "premium_indulgence"}): "Premium Seafood Buyers",
-    frozenset({"apparel_textile", "books_toys"}): "Family Non-Food Buyers",
-    frozenset({"home_cleaning", "personal_care_beauty"}): "Household Essentials Buyers",
-}
-
-SECTOR_LABELS = {
-    "TEXTIL": "Textile & Apparel Buyers",
-    "ELECTROFOTO": "Electronics & Appliance Buyers",
-    "BAZAR": "Home & General Merchandise Buyers",
-    "PROD. FRESCOS TRADIC": "Fresh Food Buyers",
-    "P.G.C.": "Packaged Grocery Buyers",
-}
-
-
 def fallback_tribe_name(profile_row: dict[str, Any]) -> str:
-    product_theme_name = _product_theme_name(profile_row)
-    if _is_low_distinction(profile_row):
-        return product_theme_name or "Mixed Basket Generalists"
+    """Return the deterministic core label used in profile tables."""
 
-    theme_candidates = _rank_theme_candidates(profile_row)
-    if theme_candidates:
-        top_theme = theme_candidates[0]
-        if len(theme_candidates) > 1:
-            second_theme = theme_candidates[1]
-            combo = THEME_COMBINATION_LABELS.get(frozenset({top_theme["theme"], second_theme["theme"]}))
-            if combo and second_theme["score"] >= top_theme["score"] * 0.65:
-                return combo
-        return THEME_LABELS.get(top_theme["theme"], f"{str(top_theme['theme']).replace('_', ' ').title()} Buyers")
+    return tribe_name_evidence(profile_row)["working_tribe_name"]
 
-    if product_theme_name:
-        return product_theme_name
+
+def tribe_name_evidence(profile_row: dict[str, Any]) -> dict[str, str]:
+    """Build a strict evidence-led label and describe where it came from.
+
+    Core tribe names should not be created from client/persona assumptions. The
+    order is intentionally conservative: data-driven product terms first,
+    individual lifted product descriptions second, and the raw lifted sector
+    label third. Rule-based strategic themes remain evidence overlays, not
+    primary core names.
+    """
+
+    term_candidates = _rank_term_candidates(profile_row)
+    if term_candidates:
+        selected = _select_name_parts(term_candidates)
+        return _name_payload(
+            f"{' + '.join(item['label'] for item in selected)} Purchase Cluster",
+            "data_driven_product_terms",
+            _evidence_summary(selected),
+        )
+
+    product_candidates = _rank_product_candidates(profile_row)
+    if product_candidates:
+        selected = _select_name_parts(product_candidates, max_parts=1)
+        return _name_payload(
+            f"{selected[0]['label']} Purchase Cluster",
+            "lifted_product_description",
+            _evidence_summary(selected),
+        )
 
     sector_name = _best_sector_name(profile_row)
     if sector_name:
-        return sector_name
+        return _name_payload(
+            f"{sector_name} Purchase Cluster",
+            "lifted_sector",
+            sector_name,
+        )
 
-    products = profile_row.get("top_products") or []
-    if products:
-        product_hint = _product_name_hint(str(products[0]))
-        if product_hint:
-            return f"{product_hint} Buyers"
-    return f"Tribe {profile_row.get('tribe_id')}"
+    return _name_payload(
+        f"Tribe {profile_row.get('tribe_id')} Product Evidence Cluster",
+        "insufficient_distinctive_evidence",
+        "No strong data-derived term, lifted product, or raw sector signal passed naming thresholds.",
+    )
 
 
-def _rank_theme_candidates(profile_row: dict[str, Any]) -> list[dict[str, Any]]:
-    themes = profile_row.get("top_themes") or []
-    lifts = profile_row.get("top_theme_lifts") or []
-    counts = profile_row.get("top_theme_customer_counts") or []
+def _name_payload(name: str, source: str, evidence: str) -> dict[str, str]:
+    return {
+        "working_tribe_name": name,
+        "working_tribe_name_source": source,
+        "working_tribe_name_evidence": evidence,
+    }
+
+
+def _select_name_parts(candidates: list[dict[str, Any]], max_parts: int = 2) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    selected = [candidates[0]]
+    for candidate in candidates[1:max_parts]:
+        if candidate["score"] >= candidates[0]["score"] * 0.65:
+            selected.append(candidate)
+    return selected
+
+
+def _evidence_summary(candidates: list[dict[str, Any]]) -> str:
+    parts = []
+    for item in candidates:
+        q_text = "" if item.get("q_value") is None else f", q={float(item['q_value']):.3g}"
+        parts.append(
+            f"{item['raw_label']} (lift={float(item['lift']):.2f}, coverage={float(item['coverage']):.1%}{q_text})"
+        )
+    return "; ".join(parts)
+
+
+def _rank_term_candidates(profile_row: dict[str, Any]) -> list[dict[str, Any]]:
+    terms = profile_row.get("top_product_terms") or []
+    lifts = profile_row.get("top_product_term_lifts") or []
+    counts = profile_row.get("top_product_term_customer_counts") or []
+    q_values = profile_row.get("top_product_term_q_values") or []
     n_customers = max(int(profile_row.get("n_customers") or 0), 1)
     candidates = []
-    for idx, theme in enumerate(themes):
-        lift = float(lifts[idx]) if idx < len(lifts) and lifts[idx] is not None else 0.0
-        count = int(counts[idx]) if idx < len(counts) and counts[idx] is not None else 0
+    for idx, term in enumerate(terms):
+        lift = (_safe_float(lifts[idx]) if idx < len(lifts) else None) or 0.0
+        count = _safe_int(counts[idx]) if idx < len(counts) else 0
+        q_value = _safe_float(q_values[idx]) if idx < len(q_values) else None
         coverage = count / n_customers
-        if lift < 1.15 and not (lift >= 1.08 and coverage >= 0.60):
+        if lift < 1.25:
             continue
-        if coverage < 0.05 and count < 75:
+        if coverage < 0.01 and count < 50:
             continue
-        score = lift * math.sqrt(max(coverage, 0.0))
-        candidates.append({"theme": str(theme), "lift": lift, "coverage": coverage, "score": score})
-    return sorted(candidates, key=lambda item: (-item["score"], -item["lift"], item["theme"]))
+        raw_label = str(term).strip()
+        label = _term_label(raw_label)
+        if not label:
+            continue
+        candidates.append(
+            {
+                "label": label,
+                "raw_label": raw_label,
+                "lift": lift,
+                "coverage": coverage,
+                "q_value": q_value,
+                "score": _evidence_score(lift, coverage, q_value),
+            }
+        )
+    return sorted(candidates, key=lambda item: (-item["score"], -item["lift"], item["raw_label"]))
+
+
+def _rank_product_candidates(profile_row: dict[str, Any]) -> list[dict[str, Any]]:
+    products = profile_row.get("top_products") or []
+    lifts = profile_row.get("top_product_lifts") or []
+    counts = profile_row.get("top_product_customer_counts") or []
+    q_values = profile_row.get("top_product_q_values") or []
+    n_customers = max(int(profile_row.get("n_customers") or 0), 1)
+    candidates = []
+    for idx, product in enumerate(products):
+        lift = (_safe_float(lifts[idx]) if idx < len(lifts) else None) or 0.0
+        count = _safe_int(counts[idx]) if idx < len(counts) else 0
+        q_value = _safe_float(q_values[idx]) if idx < len(q_values) else None
+        coverage = count / n_customers
+        if lift < 1.50:
+            continue
+        if coverage < 0.005 and count < 25:
+            continue
+        raw_label = str(product).strip()
+        label = _product_name_hint(raw_label)
+        if not label:
+            continue
+        candidates.append(
+            {
+                "label": label,
+                "raw_label": raw_label,
+                "lift": lift,
+                "coverage": coverage,
+                "q_value": q_value,
+                "score": _evidence_score(lift, coverage, q_value),
+            }
+        )
+    return sorted(candidates, key=lambda item: (-item["score"], -item["lift"], item["raw_label"]))
+
+
+def _evidence_score(lift: float, coverage: float, q_value: float | None) -> float:
+    significance_bonus = 1.25 if q_value is not None and q_value <= 0.05 else 1.0
+    return lift * math.sqrt(max(coverage, 0.0)) * significance_bonus
+
+
+def _term_label(term: str) -> str:
+    words = [part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", term) if len(part) >= 3]
+    if not words:
+        return ""
+    return " ".join(words[:3])
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _safe_int(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _best_sector_name(profile_row: dict[str, Any]) -> str | None:
@@ -142,10 +233,31 @@ def _best_sector_name(profile_row: dict[str, Any]) -> str | None:
     lifts = profile_row.get("top_sector_lifts") or []
     for idx, sector in enumerate(sectors):
         lift = float(lifts[idx]) if idx < len(lifts) and lifts[idx] is not None else 0.0
-        sector_text = str(sector).upper()
         if lift >= 1.20:
-            return SECTOR_LABELS.get(sector_text, f"{sector_text.title()} Buyers")
+            return _sector_label(str(sector))
     return None
+
+
+def _sector_label(sector: str) -> str:
+    text = _repair_display_text(sector).strip()
+    if not text:
+        return ""
+    return text.title()
+
+
+def _repair_display_text(text: str) -> str:
+    repaired = text
+    for _ in range(3):
+        if "Ãƒ" not in repaired and "Ã‚" not in repaired:
+            break
+        try:
+            next_text = repaired.encode("latin1").decode("utf-8")
+        except UnicodeError:
+            break
+        if next_text == repaired:
+            break
+        repaired = next_text
+    return repaired
 
 
 def _product_name_hint(product: str) -> str | None:
@@ -153,28 +265,6 @@ def _product_name_hint(product: str) -> str | None:
     if not words:
         return None
     return " ".join(words[:2])
-
-
-def _product_theme_name(profile_row: dict[str, Any]) -> str | None:
-    products = profile_row.get("top_products") or []
-    theme_counts: dict[str, int] = {}
-    for product in products[:8]:
-        for theme in detect_product_themes(str(product)):
-            theme_counts[theme] = theme_counts.get(theme, 0) + 1
-    if not theme_counts:
-        return None
-    theme, count = sorted(theme_counts.items(), key=lambda item: (-item[1], item[0]))[0]
-    if count < 2:
-        return None
-    return THEME_LABELS.get(theme, f"{theme.replace('_', ' ').title()} Buyers")
-
-
-def _is_low_distinction(profile_row: dict[str, Any]) -> bool:
-    theme_lifts = [float(value) for value in (profile_row.get("top_theme_lifts") or []) if value is not None]
-    sector_lifts = [float(value) for value in (profile_row.get("top_sector_lifts") or []) if value is not None]
-    strong_themes = sum(1 for value in theme_lifts if value >= 1.20)
-    strong_sectors = sum(1 for value in sector_lifts if value >= 1.20)
-    return strong_themes == 0 and strong_sectors == 0
 
 
 def build_tribe_prompt(profile_row: dict[str, Any]) -> str:
