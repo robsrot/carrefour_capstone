@@ -209,6 +209,9 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 
 def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
     paths = _official_stage_paths(cfg)
+    product_exposure_enabled = bool(cfg.get("product_exposure_features.enabled", False)) or str(
+        cfg.get("modeling.feature_set_for_selection", "embeddings_only")
+    ) == "embeddings_product_exposure"
     specs: list[dict[str, Any]] = [
         {
             "stage": "1",
@@ -253,7 +256,20 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
             "metadata": _behavior_metadata(cfg),
         },
     ]
+    if product_exposure_enabled:
+        specs.append(
+            {
+                "stage": "5",
+                "artifact": "product_exposure_features",
+                "path": paths["product_exposure_features"],
+                "metadata": _product_exposure_metadata(cfg),
+            }
+        )
     for variant, path in paths["feature_sets"].items():
+        behavior_path = paths["behavioral_features"] if variant == "embeddings_behavior" else None
+        product_exposure_path = (
+            paths["product_exposure_features"] if variant == "embeddings_product_exposure" else None
+        )
         specs.append(
             {
                 "stage": "5",
@@ -262,7 +278,8 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
                 "metadata": _feature_set_metadata(
                     variant,
                     paths["customer_embeddings"],
-                    paths["behavioral_features"] if variant == "embeddings_behavior" else None,
+                    behavior_path,
+                    product_exposure_path,
                     cfg,
                 ),
             }
@@ -341,6 +358,11 @@ def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
         ),
         "customer_embeddings": cfg.artifact_path("customer_embeddings", "output", directory=cfg.outputs / "features"),
         "behavioral_features": cfg.artifact_path("behavioral_features", "output", directory=cfg.outputs / "features"),
+        "product_exposure_features": cfg.artifact_path(
+            "product_exposure_features",
+            "output",
+            directory=cfg.outputs / "features",
+        ),
         "feature_sets": {
             selection_feature_set: cfg.outputs / "features" / selection_feature_filename
         },
@@ -573,10 +595,20 @@ def _behavior_metadata(cfg: PipelineConfig) -> dict[str, Any]:
     }
 
 
+def _product_exposure_metadata(cfg: PipelineConfig) -> dict[str, Any]:
+    return {
+        "stage": "product_exposure_features",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "settings": cfg.get("product_exposure_features", {}) or {},
+    }
+
+
 def _feature_set_metadata(
     variant: str,
     customer_embeddings_path: Path,
     behavior_path: Path | None,
+    product_exposure_path: Path | None,
     cfg: PipelineConfig,
 ) -> dict[str, Any]:
     return {
@@ -585,7 +617,10 @@ def _feature_set_metadata(
         "variant": variant,
         "customer_embeddings": file_fingerprint(customer_embeddings_path),
         "behavior": file_fingerprint(behavior_path) if behavior_path else None,
+        "product_exposure": file_fingerprint(product_exposure_path) if product_exposure_path else None,
         "standardize_behavior": bool(cfg.get("feature_sets.standardize_behavior", True)),
+        "standardize_product_exposure": bool(cfg.get("feature_sets.standardize_product_exposure", True)),
+        "product_exposure_weight": float(cfg.get("feature_sets.product_exposure_weight", 0.35)),
     }
 
 

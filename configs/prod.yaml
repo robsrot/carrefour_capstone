@@ -16,18 +16,23 @@ profiling:
 
 official_model_suite:
   umap_hdbscan:
-    # Dev uses min_cluster_size=350 on the dev subset. Production fits HDBSCAN
+    # Dev uses min_cluster_size=550 on the dev subset. Production fits HDBSCAN
     # on a 300k customer sample, so this keeps a similar minimum density share
-    # while preserving the promoted u8/n75 leaf/ms2 recipe.
-    trial_name: u8_n75_leaf_mcs2400_ms2_core
-    variant_prefix: u8_n75_leaf_mcs2400_ms2
+    # while preserving the promoted PCA64/u20/n75/eom/ms2 recipe.
+    trial_name: u20_n75_eom_mcs3800_ms2_core
+    variant_prefix: u20_n75_eom_mcs3800_ms2
     umap:
       # Fit the expensive manifold step on a deterministic customer sample,
       # then transform the full production population in memory-bounded batches.
       fit_sample_size: 300000
       transform_batch_size: 50000
     hdbscan:
-      min_cluster_size: 2400
+      min_cluster_size: 3800
+  two_stage_hdbscan:
+    trial_name: two_stage_u20_n75_eom_mcs3800_ms2_lift_core
+    variant_prefix: two_stage_u20_n75_eom_mcs3800_ms2
+    second_stage_hdbscan:
+      min_cluster_size: 4800
 
 hdbscan:
   # Prod raw-HDBSCAN diagnostics, if enabled, use a scaled minimum density share.

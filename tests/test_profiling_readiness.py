@@ -7,6 +7,7 @@ from src.profiling import (
     noise_audit_table,
     profile_quality_summary,
     profile_readiness_evidence_table,
+    stage7_final_index_table,
     stage7_storyline_table,
     tribe_comparison_table,
     tribe_product_summary_tables,
@@ -14,6 +15,7 @@ from src.profiling import (
     write_campaign_signal_artifacts,
     write_llm_profile_interpretation_pack,
     write_noise_audit_artifacts,
+    write_stage7_final_handoff_pack,
     write_stage7_storyline_artifacts,
 )
 
@@ -297,6 +299,7 @@ def test_llm_profile_interpretation_pack_is_evidence_grounded(tmp_path):
     assert outputs["markdown"] == md_path
     assert "Do not infer age" in payload
     assert "Greek Yogurt" in payload
+    assert "supporting_curated_themes" in payload
     assert "cliente" not in payload
     assert "```text" in markdown
 
@@ -504,6 +507,209 @@ def test_tribe_product_summaries_and_comparison_are_product_first(tmp_path):
     assert "Greek Yogurt (Dairy" in comparison_row["top_product_and_category_evidence"]
     assert "Tickets" in comparison_row["customer_behavior_over_under_index"]
     assert outputs["combined_csv"].exists()
+
+
+def test_stage7_final_handoff_pack_creates_curated_profile_first_outputs(tmp_path):
+    cfg = _test_config(tmp_path)
+    profile_path = tmp_path / "profiles.parquet"
+    readiness_path = tmp_path / "readiness.csv"
+
+    strong_profile = {
+        "tribe_id": 0,
+        "n_customers": 100,
+        "population_share": 0.25,
+        "profile_population_customers": 500,
+        "profile_noise_customers": 100,
+        "core_customers": 100,
+        "soft_assigned_customers": 0,
+        "soft_assigned_share": 0.0,
+        "suggested_tribe_name": "Greek Yogurt Evidence Cluster",
+        "suggested_tribe_name_source": "lifted_product_terms",
+        "suggested_tribe_name_evidence": "greek yogurt",
+        "suggested_tribe_name_status": "unique_working_name",
+        "top_product_ids": ["sku_yogurt", "sku_honey"],
+        "top_products": ["Greek Yogurt", "Honey"],
+        "top_product_sectors": ["Dairy", "Grocery"],
+        "top_product_sector_ids": ["1", "2"],
+        "top_product_lifts": [2.0, 1.7],
+        "top_product_lifts_vs_rest": [2.4, 1.9],
+        "top_product_q_values": [0.001, 0.02],
+        "top_product_customer_counts": [40, 25],
+        "top_sectors": ["Dairy"],
+        "top_sector_lifts": [1.4],
+        "top_sector_lifts_vs_rest": [1.5],
+        "top_sector_q_values": [0.01],
+        "top_themes": ["dairy_eggs"],
+        "top_theme_lifts": [1.5],
+        "top_theme_lifts_vs_rest": [1.6],
+        "top_theme_q_values": [0.02],
+        "top_theme_customer_counts": [45],
+        "top_theme_product_evidence": ["Greek Yogurt (2.4x vs rest; 40.0% reach; q=0.001; n=40); Honey (1.9x vs rest; 25.0% reach; q=0.020; n=25)"],
+        "top_theme_tagged_product_counts": [2],
+        "top_product_terms": ["greek yogurt"],
+        "top_product_term_lifts": [1.8],
+        "top_product_term_lifts_vs_rest": [2.0],
+        "top_product_term_q_values": [0.01],
+        "top_product_term_customer_counts": [35],
+        "avg_ticket_count": 5.0,
+        "avg_frequency_per_30d": 2.0,
+        "avg_avg_basket_value": 18.5,
+        "avg_total_spend": 120.0,
+        "avg_promo_share": 0.20,
+    }
+    review_profile = {
+        **strong_profile,
+        "tribe_id": 1,
+        "n_customers": 80,
+        "suggested_tribe_name": "Honey Review Evidence Cluster",
+        "suggested_tribe_name_evidence": "honey",
+        "top_product_ids": ["sku_honey"],
+        "top_products": ["Honey"],
+        "top_product_sectors": ["Grocery"],
+        "top_product_sector_ids": ["2"],
+        "top_product_lifts": [2.2],
+        "top_product_lifts_vs_rest": [2.5],
+        "top_product_q_values": [0.001],
+        "top_product_customer_counts": [30],
+    }
+    pl.DataFrame([strong_profile, review_profile]).write_parquet(profile_path)
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "stage6_profile_readiness": "strong",
+                "profiling_readiness": "ready_strong",
+                "profiling_readiness_issues": "pass",
+                "profile_significant_interpretability_signals": 3,
+            },
+            {
+                "tribe_id": 1,
+                "stage6_profile_readiness": "review",
+                "profiling_readiness": "review",
+                "profiling_readiness_issues": "stage6_readiness=review",
+                "profile_significant_interpretability_signals": 3,
+            }
+        ]
+    ).write_csv(readiness_path)
+
+    index = stage7_final_index_table(profile_path, readiness_path=readiness_path, cfg=cfg)
+    stale_card = tmp_path / "final_handoff" / "tribe_cards" / "tribe_99_card.png"
+    stale_card.parent.mkdir(parents=True, exist_ok=True)
+    stale_card.write_bytes(b"stale")
+    outputs = write_stage7_final_handoff_pack(
+        profile_path,
+        readiness_path=readiness_path,
+        output_dir=tmp_path / "final_handoff",
+        write_cards=True,
+        cfg=cfg,
+    )
+    row = index.row(0, named=True)
+    final_index_row = pl.read_csv(outputs["index_csv"]).row(0, named=True)
+    review_candidates = pl.read_csv(outputs["review_candidates_csv"])
+    story = outputs["story_markdown"].read_text(encoding="utf-8")
+    manifest = outputs["manifest_json"].read_text(encoding="utf-8")
+
+    assert index.height == 1
+    assert row["tribe_name"] == "Greek Yogurt Buyers"
+    assert row["primary_theme"] == "Dairy & Eggs Buyers"
+    assert "Dairy & Eggs Buyers" in row["theme_read"]
+    assert "Greek Yogurt" in row["primary_theme_product_evidence"]
+    assert row["actionability_proof_source"] == "data_driven_product_terms"
+    assert row["top_product"] == "Greek Yogurt"
+    assert "avg visits" in row["spend_and_visit_context"]
+    assert sorted(outputs["card_paths"]) == [0]
+    assert outputs["card_paths"][0].exists()
+    assert not stale_card.exists()
+    assert final_index_row["card_png"].endswith("tribe_00_card.png")
+    assert final_index_row["primary_theme"] == "Dairy & Eggs Buyers"
+    assert final_index_row["actionability_proof_source"] == "data_driven_product_terms"
+    assert review_candidates["tribe_id"].to_list() == [1]
+    assert outputs["index_csv"].exists()
+    assert outputs["llm_evidence_csv"].exists()
+    llm_evidence = pl.read_csv(outputs["llm_evidence_csv"])
+    assert "primary_actionability_proof" in llm_evidence["proof_role"].to_list()
+    assert "supplemental_curated_theme_context" in llm_evidence["proof_role"].to_list()
+    assert outputs["comparison_paths"]["html"].exists()
+    assert "Stage 7 Final Handoff" in story
+    assert "Review candidates held out" in story
+    assert "ready_strong" in manifest
+    assert "does not rescan raw transaction lines" in manifest
+
+
+def test_stage7_final_handoff_allows_product_term_proof_without_curated_theme(tmp_path):
+    cfg = _test_config(tmp_path)
+    profile_path = tmp_path / "profiles.parquet"
+    readiness_path = tmp_path / "stage7_profile_readiness.csv"
+
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "n_customers": 200,
+                "population_share": 0.05,
+                "profile_population_customers": 4000,
+                "profile_noise_customers": 50,
+                "core_customers": 200,
+                "soft_assigned_customers": 0,
+                "soft_assigned_share": 0.0,
+                "suggested_tribe_name": "Hummus Purchase Cluster",
+                "suggested_tribe_name_source": "data_driven_product_terms",
+                "suggested_tribe_name_evidence": "hummus (lift=2.30, coverage=35.0%, q=0.001)",
+                "suggested_tribe_name_status": "unique_working_name",
+                "top_product_ids": ["sku_hummus", "sku_falafel"],
+                "top_products": ["HUMMUS CLASICO", "FALAFEL VEGETAL"],
+                "top_product_sectors": ["P.G.C.", "P.G.C."],
+                "top_product_sector_ids": ["1", "1"],
+                "top_product_lifts": [2.0, 1.8],
+                "top_product_lifts_vs_rest": [2.5, 2.1],
+                "top_product_q_values": [0.001, 0.004],
+                "top_product_customer_counts": [60, 45],
+                "top_sectors": ["P.G.C."],
+                "top_sector_lifts": [1.1],
+                "top_sector_lifts_vs_rest": [1.1],
+                "top_sector_q_values": [0.08],
+                "top_themes": [],
+                "top_theme_lifts": [],
+                "top_theme_lifts_vs_rest": [],
+                "top_theme_q_values": [],
+                "top_theme_customer_counts": [],
+                "top_theme_product_evidence": [],
+                "top_theme_tagged_product_counts": [],
+                "top_product_terms": ["hummus"],
+                "top_product_term_lifts": [2.1],
+                "top_product_term_lifts_vs_rest": [2.3],
+                "top_product_term_q_values": [0.001],
+                "top_product_term_customer_counts": [70],
+                "avg_ticket_count": 4.0,
+                "avg_frequency_per_30d": 1.7,
+                "avg_avg_basket_value": 22.0,
+                "avg_total_spend": 130.0,
+                "avg_promo_share": 0.18,
+            }
+        ]
+    ).write_parquet(profile_path)
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "stage6_profile_readiness": "strong",
+                "profiling_readiness": "ready_strong",
+                "profiling_readiness_issues": "pass",
+                "profile_significant_interpretability_signals": 2,
+            }
+        ]
+    ).write_csv(readiness_path)
+
+    index = stage7_final_index_table(profile_path, readiness_path=readiness_path, cfg=cfg)
+    row = index.row(0, named=True)
+
+    assert index.height == 1
+    assert row["tribe_name"] == "Hummus Buyers"
+    assert row["name_source"] == "data_driven_product_terms"
+    assert row["primary_theme_confidence"] == "product_led"
+    assert row["primary_theme"] == "Product-led tribe; no broad theme evidence"
+    assert row["actionability_proof_source"] == "data_driven_product_terms"
+    assert "Product-term proof" in row["actionability_proof"]
 
 
 def test_customer_metric_anova_table_reports_between_tribe_differences(tmp_path):

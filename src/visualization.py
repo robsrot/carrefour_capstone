@@ -922,7 +922,7 @@ def plot_feature_set_summary(
     output_path: str | Path | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Compare feature-set dimensionality and PCA concentration."""
+    """Compare feature-set dimensionality and single-axis PCA concentration."""
 
     import matplotlib.pyplot as plt
     from sklearn.decomposition import PCA
@@ -963,13 +963,23 @@ def plot_feature_set_summary(
     ax_count.grid(axis="y", alpha=0.25)
 
     ax_pc.bar(pdf["name"], pdf["pc1_variance_share"], color=_color("warning"), alpha=0.82)
-    ax_pc.set_title("PCA Concentration Preview")
-    ax_pc.set_ylabel("PC1 explained variance share")
+    ax_pc.set_title("Single-Axis Variance Concentration")
+    ax_pc.set_ylabel("Share explained by PC1 only")
     ax_pc.set_ylim(0, 1)
     ax_pc.tick_params(axis="x", rotation=20)
     ax_pc.grid(axis="y", alpha=0.25)
+    ax_pc.text(
+        0.02,
+        -0.22,
+        "Diagnostic only: this is not total retained variance.",
+        transform=ax_pc.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        color=_color("muted"),
+    )
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
     path = _save_figure(fig, output, cfg, "Stage 5 figures", "wrote feature-set summary")
     plt.close(fig)
     return path
@@ -1129,18 +1139,19 @@ def plot_stage6_model_diagnostics(
 def plot_stage6_quality_evidence(
     quality_path: str | Path,
     output_path: str | Path | None = None,
+    title: str | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Plot Stage 6.3 UMAP retention and HDBSCAN validity against target ranges."""
+    """Plot Stage 6.5 UMAP retention and HDBSCAN validity against target ranges."""
 
     import matplotlib.pyplot as plt
 
     cfg.ensure_directories()
     quality = pl.read_csv(quality_path)
     if quality.is_empty():
-        raise ValueError(f"No Stage 6.3 quality rows found in {quality_path}")
+        raise ValueError(f"No Stage 6.5 quality rows found in {quality_path}")
     row = quality.row(0, named=True)
-    output = Path(output_path) if output_path else cfg.figures / "stage6_3_quality_evidence.png"
+    output = Path(output_path) if output_path else cfg.figures / "stage6_5_quality_evidence.png"
 
     specs = [
         {
@@ -1187,10 +1198,11 @@ def plot_stage6_quality_evidence(
         },
         {
             "key": "silhouette_core_only",
-            "label": "Core silhouette",
-            "ideal": ">= 0.40 strong; >= 0.25 usable",
+            "label": "Core-only silhouette",
+            "ideal": "supporting only; >= 0.40 strong; >= 0.25 usable",
             "score": _score_high_good(_as_float_for_plot(row.get("silhouette_core_only")), low=0.25, high=0.40),
             "value": row.get("silhouette_core_only"),
+            "supporting": True,
         },
         {
             "key": "coverage_adjusted_silhouette",
@@ -1209,21 +1221,25 @@ def plot_stage6_quality_evidence(
     ]
     specs = [spec for spec in specs if spec["value"] is not None and str(spec["value"]) != ""]
     if not specs:
-        raise ValueError(f"Stage 6.3 quality row did not contain plottable metrics: {quality_path}")
+        raise ValueError(f"Stage 6.5 quality row did not contain plottable metrics: {quality_path}")
 
     labels = [str(spec["label"]) for spec in specs][::-1]
     scores = [float(spec["score"]) * 100.0 for spec in specs][::-1]
     values = [_format_plot_value(spec["value"]) for spec in specs][::-1]
     ideals = [str(spec["ideal"]) for spec in specs][::-1]
-    colors = [_evidence_score_color(score / 100.0) for score in scores]
+    supporting = [bool(spec.get("supporting", False)) for spec in specs][::-1]
+    colors = [
+        "#4E79A7" if is_supporting else _evidence_score_color(score / 100.0)
+        for score, is_supporting in zip(scores, supporting)
+    ]
 
     fig_height = max(6.0, 1.02 * len(specs))
     fig, ax = plt.subplots(figsize=(12.5, fig_height))
     y = np.arange(len(specs))
     ax.barh(y, [100.0] * len(specs), color="#EEF2F6", height=0.64)
     ax.barh(y, scores, color=colors, height=0.64)
-    ax.axvline(70.0, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
-    ax.text(70.7, len(specs) - 0.35, "usable evidence", fontsize=9, color="#475467", va="top")
+    ax.axvline(50.0, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.text(50.7, len(specs) - 0.35, "usable/review threshold", fontsize=9, color="#475467", va="top")
 
     for idx, (score, value, ideal) in enumerate(zip(scores, values, ideals)):
         ax.text(min(max(score + 2.0, 4.0), 98.0), idx, f"{score:.0f}", va="center", ha="left", fontsize=9)
@@ -1233,32 +1249,51 @@ def plot_stage6_quality_evidence(
     ax.set_yticklabels(labels, fontsize=10)
     ax.set_xlim(0, 160)
     ax.set_xlabel("Evidence score, 0-100")
-    ax.set_title("Stage 6.3 Representation and Density Evidence")
+    ax.set_title(title or "Stage 6.5 Representation and Density Evidence")
     ax.grid(axis="x", alpha=0.22)
     ax.spines[["top", "right", "left"]].set_visible(False)
     ax.tick_params(axis="y", length=0)
+    from matplotlib.patches import Patch
+
+    legend_handles = [
+        Patch(facecolor="#2E7D32", label="strong/pass"),
+        Patch(facecolor="#F2A900", label="usable/review"),
+        Patch(facecolor="#C2410C", label="below threshold"),
+        Patch(facecolor="#4E79A7", label="supporting only"),
+    ]
+    fig.legend(
+        handles=[
+            *legend_handles,
+        ],
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.045),
+        ncol=4,
+        fontsize=8,
+    )
     fig.text(
         0.125,
-        0.025,
-        "Scores are pragmatic diagnostics, not model objectives. Use them with Stage 6.4 stability and Stage 7 product-lift evidence.",
+        0.015,
+        "Scores are pragmatic diagnostics, not model objectives. Core-only silhouette ignores noise; use it with coverage, DBCV, Stage 6.6 stability, and Stage 7 product-lift evidence.",
         fontsize=9,
         color=_color("subtle_text"),
     )
 
-    fig.tight_layout(rect=(0, 0.055, 1, 1))
+    fig.tight_layout(rect=(0, 0.095, 1, 1))
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=170)
     plt.close(fig)
-    log_event("Stage 6.3 diagnostics", "wrote quality evidence scorecard", cfg=cfg, path=output)
+    log_event("Stage 6.5 diagnostics", "wrote quality evidence scorecard", cfg=cfg, path=output)
     return output
 
 
 def plot_stage6_cluster_readiness(
     readiness_path: str | Path,
     output_path: str | Path | None = None,
+    title: str | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Plot Stage 6.4 cluster-level readiness before product profiling."""
+    """Plot Stage 6.6 cluster-level readiness before product profiling."""
 
     import matplotlib.pyplot as plt
 
@@ -1269,9 +1304,9 @@ def plot_stage6_cluster_readiness(
         else pl.read_parquet(readiness_path)
     )
     if readiness.is_empty():
-        raise ValueError(f"No Stage 6.4 cluster readiness rows found in {readiness_path}")
+        raise ValueError(f"No Stage 6.6 cluster readiness rows found in {readiness_path}")
     pdf = readiness.to_pandas()
-    output = Path(output_path) if output_path else cfg.figures / "stage6_4_cluster_readiness.png"
+    output = Path(output_path) if output_path else cfg.figures / "stage6_6_cluster_readiness.png"
 
     readiness_colors = {
         "strong": "#2E7D32",
@@ -1314,14 +1349,14 @@ def plot_stage6_cluster_readiness(
     ax.text(ax.get_xlim()[1] * 0.99, 0.305, "confidence review line", ha="right", va="bottom", fontsize=8)
     ax.set_xlabel("Customers in core tribe")
     ax.set_ylabel("Mean assignment confidence")
-    ax.set_title("Stage 6.4 Cluster Readiness Before Profiling")
+    ax.set_title(title or "Stage 6.6 Cluster Readiness Before Profiling")
     ax.grid(alpha=0.22)
     ax.legend(title="Profile readiness", frameon=False, loc="best")
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=170)
     plt.close(fig)
-    log_event("Stage 6.4 diagnostics", "wrote cluster readiness plot", cfg=cfg, path=output)
+    log_event("Stage 6.6 diagnostics", "wrote cluster readiness plot", cfg=cfg, path=output)
     return output
 
 
@@ -1341,8 +1376,8 @@ def _score_high_good(value: float | None, *, low: float, high: float) -> float:
     if value >= high:
         return 1.0
     if value <= low:
-        return max(0.0, 0.35 * value / low) if low > 0 else 0.0
-    return 0.35 + 0.65 * ((value - low) / (high - low))
+        return max(0.0, 0.45 * value / low) if low > 0 else 0.0
+    return 0.50 + 0.50 * ((value - low) / (high - low))
 
 
 def _score_low_good(value: float | None, *, low: float, high: float) -> float:
@@ -1351,14 +1386,14 @@ def _score_low_good(value: float | None, *, low: float, high: float) -> float:
     if value <= low:
         return 1.0
     if value >= high:
-        return max(0.0, 0.35 * (1.0 - min(value - high, high) / max(high, 1e-12)))
-    return 1.0 - 0.65 * ((value - low) / (high - low))
+        return max(0.0, 0.45 * (1.0 - min(value - high, high) / max(high, 1e-12)))
+    return 1.0 - 0.50 * ((value - low) / (high - low))
 
 
 def _evidence_score_color(score: float) -> str:
-    if score >= 0.70:
+    if score >= 0.75:
         return "#2E7D32"
-    if score >= 0.45:
+    if score >= 0.50:
         return "#F2A900"
     return "#C2410C"
 
@@ -1414,6 +1449,7 @@ def plot_stage6_hdbscan_assignment_map(
     umap_path: str | Path,
     assignment_path: str | Path,
     output_path: str | Path | None = None,
+    title: str | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
     """Plot hard HDBSCAN tribe assignments on the Stage 6.1 UMAP plane."""
@@ -1434,7 +1470,7 @@ def plot_stage6_hdbscan_assignment_map(
         coords,
         labels,
         output,
-        "Stage 6.2 Hard HDBSCAN Core Tribes on UMAP",
+        title or "Stage 6.2 Hard HDBSCAN Core Tribes on UMAP",
         allocation_summary=_tribe_allocation_summary(assignments),
     )
     log_event("Stage 6.2 figures", "wrote hard HDBSCAN assignment map", cfg=cfg, path=path)
@@ -1664,14 +1700,18 @@ def plot_tribe_vs_population_evidence_dashboard(
 
     rows = [dict(row) for row in profiles.iter_rows(named=True)]
     tribe_ids = [int(row.get("tribe_id")) for row in rows]
-    tribe_labels = [
-        f"T{row.get('tribe_id')} {shorten(str(row.get('suggested_tribe_name') or ''), width=24, placeholder='...')}".strip()
-        for row in rows
-    ]
+    def _organic_label(row: Mapping[str, Any]) -> str:
+        label = row.get("llm_working_label")
+        if not label:
+            products = row.get("top_products") or []
+            label = f"{products[0]} buyers" if products else ""
+        return shorten(str(label), width=24, placeholder="...")
+
+    tribe_labels = [f"T{row.get('tribe_id')} {_organic_label(row)}".strip() for row in rows]
     compact_labels = [f"T{tribe_id}" for tribe_id in tribe_ids]
     customers = np.array([float(row.get("n_customers") or 0.0) for row in rows], dtype=float)
     core = np.array([float(row.get("core_customers") or 0.0) for row in rows], dtype=float)
-    soft = np.array([float(row.get("soft_assigned_customers") or 0.0) for row in rows], dtype=float)
+    soft = np.zeros(len(rows), dtype=float)
     population_share = np.array([float(row.get("population_share") or 0.0) for row in rows], dtype=float)
 
     def _float_list(values: Any) -> list[float]:
@@ -1709,53 +1749,32 @@ def plot_tribe_vs_population_evidence_dashboard(
 
     max_lifts = {
         "Product": np.array(
-            [_max_customer_rate_lift_vs_rest(row, "top_product_lifts", "top_product_customer_counts") for row in rows],
+            [_max_customer_rate_lift_vs_rest(row, "top_product_lifts_vs_rest", "top_product_customer_counts") for row in rows],
             dtype=float,
         ),
-        "Theme": np.array(
-            [_max_customer_rate_lift_vs_rest(row, "top_theme_lifts", "top_theme_customer_counts") for row in rows],
-            dtype=float,
-        ),
-        "Term": np.array(
-            [
-                _max_customer_rate_lift_vs_rest(row, "top_product_term_lifts", "top_product_term_customer_counts")
-                for row in rows
-            ],
-            dtype=float,
-        ),
+        "Sector": np.array([_max_list(row.get("top_sector_lifts")) for row in rows], dtype=float),
     }
     evidence_counts = {
         "Product": np.array(
             [
-                _strong_count(row, "top_product_lifts", float(cfg.get("profiling.strong_product_lift_threshold", 1.5)))
+                _strong_count(row, "top_product_lifts_vs_rest", float(cfg.get("profiling.strong_product_lift_threshold", 1.5)))
                 for row in rows
             ],
             dtype=float,
         ),
-        "Theme": np.array(
-            [
-                _strong_count(row, "top_theme_lifts", float(cfg.get("profiling.strong_theme_lift_threshold", 1.2)))
-                for row in rows
-            ],
-            dtype=float,
-        ),
-        "Term": np.array(
-            [
-                _strong_count(row, "top_product_term_lifts", float(cfg.get("profiling.strong_term_lift_threshold", 1.25)))
-                for row in rows
-            ],
+        "Sector": np.array(
+            [_strong_count(row, "top_sector_lifts", float(cfg.get("profiling.strong_sector_lift_threshold", 1.2))) for row in rows],
             dtype=float,
         ),
     }
 
     behavior_candidates = [
         ("avg_ticket_count", "Tickets"),
-        ("avg_total_units", "Units"),
         ("avg_unique_products", "Unique products"),
-        ("avg_unique_sectors", "Unique sectors"),
         ("avg_frequency_per_30d", "Frequency"),
         ("avg_promo_share", "Promo share"),
-        ("avg_avg_basket_value", "Basket value"),
+        ("avg_basket_value", "Basket value"),
+        ("avg_recency_days", "Recency"),
     ]
     behavior_fields = [item for item in behavior_candidates if item[0] in profiles.columns]
     behavior_matrix = np.empty((len(rows), len(behavior_fields)), dtype=float)
@@ -1790,13 +1809,12 @@ def plot_tribe_vs_population_evidence_dashboard(
 
     y = np.arange(n_tribes)
     ax_size.barh(y, core, color=ASSIGNMENT_COLORS["HDBSCAN core"], label="Core assigned")
-    ax_size.barh(y, soft, left=core, color=ASSIGNMENT_COLORS["q95 soft-assigned"], label="Soft assigned")
     ax_size.set_yticks(y)
     ax_size.set_yticklabels(tribe_labels)
     ax_size.invert_yaxis()
     ax_size.set_xlabel("Customers")
-    ax_size.set_title("Tribe Size And Assignment Provenance")
-    ax_size.legend(frameon=False, loc="upper right", bbox_to_anchor=(1.0, 1.12), ncol=2)
+    ax_size.set_title("Hard Organic Tribe Size")
+    ax_size.legend(frameon=False, loc="upper right", bbox_to_anchor=(1.0, 1.12), ncol=1)
     ax_size.grid(axis="x", alpha=0.25)
     x_max = max(float(customers.max()) if customers.size else 1.0, 1.0)
     ax_size.set_xlim(0, x_max * 1.23)
@@ -1810,20 +1828,20 @@ def plot_tribe_vs_population_evidence_dashboard(
         )
 
     x = np.arange(n_tribes)
-    width = 0.24
-    lift_colors = {key: EVIDENCE_COLORS[key] for key in ["Product", "Theme", "Term"]}
+    width = 0.34
+    lift_colors = {key: EVIDENCE_COLORS[key] for key in ["Product", "Sector"]}
     all_lift_values = np.concatenate([values[np.isfinite(values)] for values in max_lifts.values()])
     lift_cap = 4.0
     if all_lift_values.size:
         lift_cap = max(3.0, min(8.0, float(np.nanpercentile(all_lift_values, 90)) * 1.15))
     for offset, (label, values) in enumerate(max_lifts.items()):
         plot_values = np.clip(values, 0, lift_cap)
-        ax_lift.bar(x + (offset - 1) * width, plot_values, width=width, color=lift_colors[label], label=label)
+        ax_lift.bar(x + (offset - 0.5) * width, plot_values, width=width, color=lift_colors[label], label=label)
     ax_lift.axhline(1.0, color=_color("line"), linewidth=1, linestyle="--")
     ax_lift.set_xticks(x)
     ax_lift.set_xticklabels(compact_labels)
     ax_lift.set_ylabel("Max lift")
-    ax_lift.set_title(f"Strongest Product/Theme/Term Signal Vs Rest (capped at {lift_cap:.1f}x)")
+    ax_lift.set_title(f"Strongest Product/Sector Signal Vs Rest (capped at {lift_cap:.1f}x)")
     ax_lift.legend(frameon=False)
     ax_lift.grid(axis="y", alpha=0.25)
 

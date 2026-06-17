@@ -14,13 +14,46 @@ STRATEGIC_THEME_PATTERNS: dict[str, list[str]] = {
         r"\bdodot\b",
         r"\bpotito(?:s)?\b",
         r"\bpapilla(?:s)?\b",
+        r"\btarrito(?:s)?\b",
+        r"\byogolino\b",
         r"\bchupete(?:s)?\b",
         r"\bbiberon(?:es)?\b",
+        r"\bhero baby\b",
+        r"\bhero recetas caseras\b",
         r"\b(?:toallita|toallitas|champu|gel|colonia|crema|locion|leche|protector solar)\b.*\b(?:bebe|baby)\b",
         r"\b(?:bebe|baby)\b.*\b(?:toallita|toallitas|champu|gel|colonia|crema|locion|panal|panales|potito|papilla|biberon|chupete|alimentacion|infantil)\b",
         r"\bcarrefour baby\b",
         r"\bcuna(?: de viaje| bebe| colecho| madera| plegable)\b",
         r"\bsilla de paseo\b",
+    ],
+    "baby_food": [
+        r"\bpotito(?:s)?\b",
+        r"\bpapilla(?:s)?\b",
+        r"\btarrito(?:s)?\b",
+        r"\byogolino\b",
+        r"\bhero baby\b",
+        r"\bhero recetas caseras\b",
+        r"\b(?:bebe|baby)\b.*\b(?:alimentacion|comida|cereal|fruta|verdura|pure|crema|leche infantil)\b",
+    ],
+    "baby_care": [
+        r"\bpanal(?:es)?\b",
+        r"\bdodot\b",
+        r"\bchupete(?:s)?\b",
+        r"\bbiberon(?:es)?\b",
+        r"\b(?:toallita|toallitas|champu|gel|colonia|crema|locion|leche|protector solar)\b.*\b(?:bebe|baby)\b",
+        r"\b(?:bebe|baby)\b.*\b(?:toallita|toallitas|champu|gel|colonia|crema|locion|panal|panales|chupete|biberon)\b",
+    ],
+    "baby_clothing": [
+        r"\b(?:bebe|baby|recien nacido|tex baby)\b.*\b(?:body|pijama|camiseta|pantalon|vestido|falda|jersey|chaqueta|calcetin|zapato|zapatilla|abrigo|ranita|pelele)\b",
+        r"\b(?:body|pijama|camiseta|pantalon|vestido|falda|jersey|chaqueta|calcetin|zapato|zapatilla|abrigo|ranita|pelele)\b.*\b(?:bebe|baby|recien nacido|tex baby)\b",
+    ],
+    "baby_girls_clothing": [
+        r"\b(?:bebe|baby|recien nacido|tex baby)\b.*\b(?:nina|vestido|falda|leotardo|diadema)\b",
+        r"\b(?:nina|vestido|falda|leotardo|diadema)\b.*\b(?:bebe|baby|recien nacido|tex baby)\b",
+    ],
+    "baby_boys_clothing": [
+        r"\b(?:bebe|baby|recien nacido|tex baby)\b.*\b(?:nino|bermuda|polo|camisa)\b",
+        r"\b(?:nino|bermuda|polo|camisa)\b.*\b(?:bebe|baby|recien nacido|tex baby)\b",
     ],
     "pet": [
         r"\bmascota(?:s)?\b",
@@ -613,6 +646,15 @@ def detect_product_themes(description: str | None) -> list[str]:
     for theme, pattern in _COMPILED_THEME_PATTERNS.items():
         if pattern.search(text):
             themes.append(theme)
+    if "baby" in themes:
+        ingredient_or_format_themes = {
+            "dairy_eggs",
+            "fresh_produce",
+            "meat_charcuterie",
+            "pantry_staples",
+            "ready_meals",
+        }
+        themes = [theme for theme in themes if theme not in ingredient_or_format_themes]
     return themes
 
 

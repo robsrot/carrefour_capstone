@@ -22,6 +22,5 @@ dependencies:
     - gensim==4.4.0
     - umap-learn==0.5.12
     - hdbscan==0.8.40
-    - anthropic==0.104.1
     - python-dotenv==1.2.2
     - pytest==9.0.3

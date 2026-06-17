@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
-import os
 import math
 import re
 from typing import Any
-
-import polars as pl
 
 
 THEME_LABELS = {
     "alcohol": "Beer & Alcohol Buyers",
     "alcohol_free": "Alcohol-Free Beer Buyers",
-    "baby": "Baby Product Signal",
-    "halal": "Halal-Labelled Product Signal",
+    "baby": "Baby Product Buyers",
+    "baby_food": "Baby Food Buyers",
+    "baby_care": "Baby Care Buyers",
+    "baby_clothing": "Baby Clothing Buyers",
+    "baby_girls_clothing": "Baby Girls' Clothing Buyers",
+    "baby_boys_clothing": "Baby Boys' Clothing Buyers",
+    "halal": "Halal-Labelled Product Buyers",
     "pet": "Pet Care Buyers",
     "pet_dog": "Dog Product Buyers",
     "pet_cat": "Cat Product Buyers",
-    "kids_general": "Kids/Toys Product Signal",
-    "kids_girls": "Doll/Girls-Labelled Product Signal",
-    "kids_boys": "Action/Vehicle Toy Product Signal",
+    "kids_general": "Kids/Toys Product Buyers",
+    "kids_girls": "Doll/Girls-Labelled Product Buyers",
+    "kids_boys": "Action/Vehicle Toy Product Buyers",
     "world_foods_asian": "Asian-Style World Food Buyers",
     "world_foods_mexican": "Mexican-Style World Food Buyers",
     "world_foods_middle_eastern": "Middle Eastern-Style World Food Buyers",
@@ -265,52 +267,3 @@ def _product_name_hint(product: str) -> str | None:
     if not words:
         return None
     return " ".join(words[:2])
-
-
-def build_tribe_prompt(profile_row: dict[str, Any]) -> str:
-    return (
-        "Name this Carrefour customer tribe using only purchase evidence.\n"
-        f"Tribe id: {profile_row.get('tribe_id')}\n"
-        f"Population share: {profile_row.get('population_share')}\n"
-        f"Top lifted products: {profile_row.get('top_products')}\n"
-        f"Product lifts: {profile_row.get('top_product_lifts')}\n"
-        f"Top lifted sectors: {profile_row.get('top_sectors')}\n"
-        f"Sector lifts: {profile_row.get('top_sector_lifts')}\n"
-        "Return a concise commercial tribe name and one sentence of rationale."
-    )
-
-
-def name_tribes(profile_path: str, use_claude: bool = False) -> pl.DataFrame:
-    """Name tribes, optionally using Claude when ANTHROPIC_API_KEY is available."""
-
-    profiles = pl.read_parquet(profile_path)
-    rows = []
-    client = None
-    if use_claude and os.getenv("ANTHROPIC_API_KEY"):
-        try:
-            import anthropic
-
-            client = anthropic.Anthropic()
-        except Exception:
-            client = None
-
-    for row in profiles.iter_rows(named=True):
-        name = fallback_tribe_name(row)
-        rationale = "Name generated from the highest lifted sector or product evidence."
-        if client is not None:
-            try:
-                response = client.messages.create(
-                    model="claude-3-5-sonnet-latest",
-                    max_tokens=120,
-                    messages=[{"role": "user", "content": build_tribe_prompt(row)}],
-                )
-                text = response.content[0].text.strip()
-                if ":" in text:
-                    name, rationale = [part.strip() for part in text.split(":", 1)]
-                else:
-                    name = text
-                    rationale = "Claude-generated name from product and sector lift evidence."
-            except Exception:
-                pass
-        rows.append({"tribe_id": row["tribe_id"], "tribe_name": name, "naming_rationale": rationale})
-    return pl.DataFrame(rows).sort("tribe_id")

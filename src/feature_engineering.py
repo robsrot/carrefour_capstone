@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from datetime import date
 from pathlib import Path
 from typing import Mapping
@@ -11,6 +13,7 @@ import polars as pl
 
 from src.config import CONFIG, PipelineConfig
 from src.data_loader import load_prepared_transactions
+from src.product_themes import STRATEGIC_THEME_PATTERNS, detect_product_themes, normalize_product_text
 from src.progress import log_event, stage_timer
 from src.utils import (
     collect_streaming,
@@ -34,6 +37,17 @@ def _promo_flag(columns: set[str]) -> pl.Expr:
         .then(1)
         .otherwise(0)
         .alias("_promo_flag")
+    )
+
+
+def _positive_units_expression(columns: set[str]) -> pl.Expr:
+    if "unidades" not in columns:
+        return pl.lit(1.0).alias("_units")
+    return (
+        pl.when(pl.col("unidades").cast(pl.Float64) > 0)
+        .then(pl.col("unidades").cast(pl.Float64))
+        .otherwise(1.0)
+        .alias("_units")
     )
 
 
@@ -133,18 +147,210 @@ def build_behavioral_features(
     return output
 
 
+PRODUCT_FAMILY_STOPWORDS = {
+    "carrefour",
+    "marca",
+    "producto",
+    "productos",
+    "pack",
+    "lote",
+    "bolsa",
+    "bandeja",
+    "caja",
+    "unidad",
+    "unidades",
+    "und",
+    "uds",
+    "peso",
+    "escurrido",
+    "aprox",
+    "granel",
+    "sabor",
+    "formato",
+    "gr",
+    "grs",
+    "gramo",
+    "gramos",
+    "litro",
+    "litros",
+    "plastico",
+    "reciclado",
+    "reciclada",
+    "reciclables",
+    "tarrina",
+    "envase",
+    "cdc",
+}
+
+PRODUCT_FAMILY_UNIGRAM_STOPWORDS = PRODUCT_FAMILY_STOPWORDS | {
+    "con",
+    "sin",
+    "para",
+    "extra",
+    "mini",
+    "maxi",
+    "super",
+    "nuevo",
+    "nueva",
+    "gran",
+}
+
+
+def build_product_exposure_features(
+    transactions: pl.LazyFrame | None = None,
+    output_path: str | Path | None = None,
+    catalog_output_path: str | Path | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Create customer-level product-derived exposure features.
+
+    Features are multi-label and product-first: one product can contribute to
+    several tags, such as organic_bio plus lactose_free, or baby plus baby_food.
+    No spend or demographic fields are used.
+    """
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    output = Path(output_path) if output_path else cfg.artifact_path(
+        "product_exposure_features",
+        "output",
+        directory=cfg.outputs / "features",
+    )
+    catalog_output = (
+        Path(catalog_output_path)
+        if catalog_output_path
+        else cfg.artifacts
+        / str(cfg.get("product_exposure_features.catalog_output_dir", "stage5"))
+        / str(cfg.get("product_exposure_features.catalog_output_csv", "product_exposure_feature_catalog.csv"))
+    )
+    settings = cfg.get("product_exposure_features", {}) or {}
+    cache_metadata = {
+        "stage": "product_exposure_features",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "settings": settings,
+        "theme_pattern_hash": _product_theme_pattern_hash(),
+    }
+    if should_use_cache(
+        output,
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ):
+        log_event("Stage 5 product exposure", "cache hit", cfg=cfg, path=output)
+        return output
+
+    with stage_timer("Stage 5 product exposure", "building product-derived exposure features", cfg=cfg, output=output):
+        lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
+        columns = set(schema_names(lf))
+        if "cliente" not in columns or "idarticu" not in columns:
+            raise ValueError("Product exposure features require 'cliente' and 'idarticu' columns.")
+
+        feature_map = _build_product_exposure_feature_map(lf, cfg=cfg)
+        if feature_map.is_empty():
+            customers = collect_streaming(lf.select("cliente").unique()).sort("cliente")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            customers.write_parquet(output)
+            write_artifact_metadata(output, cache_metadata)
+            return output
+
+        catalog_output.parent.mkdir(parents=True, exist_ok=True)
+        feature_map.select(
+            [
+                "feature_type",
+                "feature_key",
+                "feature_label",
+                "feature_name",
+                "customer_count",
+                "product_count",
+                "feature_rank",
+            ]
+        ).unique(subset=["feature_name"]).sort(["feature_type", "feature_rank"]).write_csv(catalog_output)
+
+        ticket_col = str(settings.get("ticket_column", "ticket"))
+        metrics = _product_exposure_metrics(columns, cfg)
+        base_cols = ["cliente", "idarticu"]
+        if ticket_col in columns and "basket_share" in metrics:
+            base_cols.append(ticket_col)
+        if "unidades" in columns:
+            base_cols.append("unidades")
+
+        base_cols = list(dict.fromkeys(base_cols))
+        base = lf.select(base_cols).with_columns(_positive_units_expression(set(base_cols)))
+        total_exprs = [
+            pl.len().alias("_total_lines"),
+            pl.col("_units").sum().alias("_total_units"),
+            pl.col("idarticu").n_unique().alias("_total_distinct_products"),
+        ]
+        if ticket_col in base_cols:
+            total_exprs.append(pl.col(ticket_col).n_unique().alias("_total_baskets"))
+        totals = base.group_by("cliente").agg(total_exprs)
+
+        feature_events = base.join(
+            feature_map.lazy().select(["idarticu", "feature_name"]),
+            on="idarticu",
+            how="inner",
+        )
+        agg_exprs = [
+            pl.len().alias("_feature_lines"),
+            pl.col("_units").sum().alias("_feature_units"),
+            pl.col("idarticu").n_unique().alias("_feature_distinct_products"),
+        ]
+        if ticket_col in base_cols:
+            agg_exprs.append(pl.col(ticket_col).n_unique().alias("_feature_baskets"))
+
+        long = (
+            feature_events.group_by(["cliente", "feature_name"])
+            .agg(agg_exprs)
+            .join(totals, on="cliente", how="left")
+            .with_columns(_product_exposure_metric_exprs(metrics))
+            .select(["cliente", "feature_name", *[_product_exposure_metric_col(metric) for metric in metrics]])
+        )
+        long_df = collect_streaming(long)
+        customers = collect_streaming(lf.select("cliente").unique()).sort("cliente")
+        result = customers
+        for metric in metrics:
+            value_col = _product_exposure_metric_col(metric)
+            metric_frame = _pivot_product_exposure_metric(long_df, value_col, metric)
+            result = result.join(metric_frame, on="cliente", how="left")
+
+        feature_cols = [col for col in result.columns if col != "cliente"]
+        result = result.with_columns([pl.col(col).fill_null(0.0).cast(pl.Float32).alias(col) for col in feature_cols])
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result.write_parquet(output)
+        write_artifact_metadata(output, cache_metadata)
+        log_event(
+            "Stage 5 product exposure",
+            "wrote artifact",
+            cfg=cfg,
+            customers=result.height,
+            features=len(feature_cols),
+            catalog=catalog_output,
+            path=output,
+        )
+    return output
+
+
 def build_feature_set(
     customer_embeddings_path: str | Path,
     behavior_path: str | Path | None = None,
+    product_exposure_path: str | Path | None = None,
     variant: str = "embeddings_only",
     output_path: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Create model-ready feature variants A and B."""
+    """Create model-ready feature variants."""
 
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
+    if variant == "embeddings_frequency" and behavior_path is None:
+        behavior_path = cfg.artifact_path(
+            "behavioral_features",
+            "output",
+            directory=cfg.outputs / "features",
+        )
     outputs = cfg.get("feature_sets.outputs", {})
     output = Path(output_path) if output_path else cfg.outputs / "features" / outputs.get(
         variant,
@@ -156,7 +362,11 @@ def build_feature_set(
         "variant": variant,
         "customer_embeddings": file_fingerprint(customer_embeddings_path),
         "behavior": file_fingerprint(behavior_path) if behavior_path else None,
+        "product_exposure": file_fingerprint(product_exposure_path) if product_exposure_path else None,
         "standardize_behavior": bool(cfg.get("feature_sets.standardize_behavior", True)),
+        "standardize_product_exposure": bool(cfg.get("feature_sets.standardize_product_exposure", True)),
+        "product_exposure_weight": float(cfg.get("feature_sets.product_exposure_weight", 0.35)),
+        "frequency_anchor_weight": float(cfg.get("feature_sets.frequency_anchor_weight", 0.12)),
     }
     if should_use_cache(
         output,
@@ -172,6 +382,29 @@ def build_feature_set(
         emb_cols = [col for col in embeddings.columns if col.startswith("emb_")]
         if variant == "embeddings_only":
             result = embeddings.select(["cliente", *emb_cols]).sort("cliente")
+        elif variant == "embeddings_product_exposure":
+            if product_exposure_path is None:
+                product_exposure_path = cfg.artifact_path(
+                    "product_exposure_features",
+                    "output",
+                    directory=cfg.outputs / "features",
+                )
+            exposure = pl.read_parquet(product_exposure_path)
+            joined = embeddings.select(["cliente", *emb_cols]).join(exposure, on="cliente", how="inner")
+            exposure_cols = [
+                col
+                for col in numeric_feature_columns(joined, exclude=("cliente", *emb_cols))
+                if col.startswith("pdx_")
+            ]
+            result = joined.select(["cliente", *emb_cols, *exposure_cols]).fill_null(0)
+            if cfg.get("feature_sets.standardize_product_exposure", True):
+                result = _standardize_numeric_columns(
+                    result,
+                    exposure_cols,
+                    multiplier=float(cfg.get("feature_sets.product_exposure_weight", 0.35)),
+                    rename_prefix=None,
+                )
+            result = result.sort("cliente")
         elif variant == "embeddings_behavior":
             if behavior_path is None:
                 raise ValueError("behavior_path is required for embeddings_behavior feature set")
@@ -184,15 +417,24 @@ def build_feature_set(
             ]
             result = joined.select(["cliente", *emb_cols, *behavior_cols]).fill_null(0)
             if cfg.get("feature_sets.standardize_behavior", True):
-                updates = []
-                for col in behavior_cols:
-                    values = result[col].to_numpy().astype(np.float64)
-                    mean = float(np.nanmean(values))
-                    std = float(np.nanstd(values))
-                    denom = std if std > 1e-12 else 1.0
-                    updates.append(((pl.col(col) - mean) / denom).cast(pl.Float32).alias(f"beh_{col}"))
-                result = result.with_columns(updates).drop(behavior_cols)
+                result = _standardize_numeric_columns(result, behavior_cols, rename_prefix="beh_")
             result = result.sort("cliente")
+        elif variant == "embeddings_frequency":
+            if behavior_path is None:
+                raise ValueError("behavior_path is required for embeddings_frequency feature set")
+            behavior = pl.read_parquet(behavior_path)
+            if "frequency_per_30d" not in behavior.columns:
+                raise ValueError("embeddings_frequency feature set requires 'frequency_per_30d' in behavior features")
+            frequency = _frequency_anchor_features(
+                behavior,
+                multiplier=float(cfg.get("feature_sets.frequency_anchor_weight", 0.12)),
+            )
+            result = (
+                embeddings.select(["cliente", *emb_cols])
+                .join(frequency, on="cliente", how="left")
+                .with_columns(pl.col("freq_anchor").fill_null(0.0).cast(pl.Float32))
+                .sort("cliente")
+            )
         else:
             raise ValueError(f"Unknown feature set variant: {variant}")
 
@@ -201,6 +443,324 @@ def build_feature_set(
         write_artifact_metadata(output, cache_metadata)
         log_event("Stage 5 feature set", "wrote artifact", cfg=cfg, variant=variant, rows=result.height, path=output)
     return output
+
+
+def _product_theme_pattern_hash() -> str:
+    payload = repr(sorted((key, tuple(patterns)) for key, patterns in STRATEGIC_THEME_PATTERNS.items()))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _product_exposure_metrics(columns: set[str], cfg: PipelineConfig) -> list[str]:
+    requested = list(cfg.get("product_exposure_features.metrics", ["basket_share", "distinct_product_share"]) or [])
+    normalized = []
+    ticket_col = str(cfg.get("product_exposure_features.ticket_column", "ticket"))
+    for metric in requested:
+        value = str(metric).strip().lower()
+        if value == "basket_share" and ticket_col not in columns:
+            continue
+        if value == "unit_share" and "unidades" not in columns:
+            continue
+        if value not in {"basket_share", "line_share", "unit_share", "distinct_product_share"}:
+            raise ValueError(
+                "Unknown product exposure metric "
+                f"{metric!r}. Use basket_share, line_share, unit_share, or distinct_product_share."
+            )
+        if value not in normalized:
+            normalized.append(value)
+    return normalized or ["line_share"]
+
+
+def _product_exposure_metric_col(metric: str) -> str:
+    return f"_{metric}"
+
+
+def _product_exposure_metric_exprs(metrics: list[str]) -> list[pl.Expr]:
+    exprs = []
+    if "basket_share" in metrics:
+        exprs.append(
+            (
+                pl.col("_feature_baskets")
+                / pl.when(pl.col("_total_baskets") > 0).then(pl.col("_total_baskets")).otherwise(1)
+            ).alias(_product_exposure_metric_col("basket_share"))
+        )
+    if "line_share" in metrics:
+        exprs.append(
+            (
+                pl.col("_feature_lines")
+                / pl.when(pl.col("_total_lines") > 0).then(pl.col("_total_lines")).otherwise(1)
+            ).alias(_product_exposure_metric_col("line_share"))
+        )
+    if "unit_share" in metrics:
+        exprs.append(
+            (
+                pl.col("_feature_units")
+                / pl.when(pl.col("_total_units") > 0).then(pl.col("_total_units")).otherwise(1.0)
+            ).alias(_product_exposure_metric_col("unit_share"))
+        )
+    if "distinct_product_share" in metrics:
+        exprs.append(
+            (
+                pl.col("_feature_distinct_products")
+                / pl.when(pl.col("_total_distinct_products") > 0).then(pl.col("_total_distinct_products")).otherwise(1)
+            ).alias(_product_exposure_metric_col("distinct_product_share"))
+        )
+    return exprs
+
+
+def _pivot_product_exposure_metric(long_df: pl.DataFrame, value_col: str, metric: str) -> pl.DataFrame:
+    if long_df.is_empty():
+        return pl.DataFrame(schema={"cliente": pl.Utf8})
+    try:
+        pivoted = long_df.pivot(index="cliente", on="feature_name", values=value_col, aggregate_function="first")
+    except TypeError:
+        pivoted = long_df.pivot(index="cliente", columns="feature_name", values=value_col, aggregate_function="first")
+    rename = {
+        col: f"pdx_{metric}_{col}"
+        for col in pivoted.columns
+        if col != "cliente"
+    }
+    return pivoted.rename(rename)
+
+
+def _build_product_exposure_feature_map(
+    lf: pl.LazyFrame,
+    *,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    columns = set(schema_names(lf))
+    product_meta = _product_exposure_product_metadata(lf, columns)
+    raw_map = _raw_product_exposure_feature_map(product_meta, cfg=cfg)
+    if raw_map.is_empty():
+        return raw_map
+    customer_product = lf.select(["cliente", "idarticu"]).unique()
+    counts = collect_streaming(
+        customer_product.join(raw_map.lazy(), on="idarticu", how="inner")
+        .group_by(["feature_type", "feature_key", "feature_label", "feature_name"])
+        .agg(
+            [
+                pl.col("cliente").n_unique().alias("customer_count"),
+                pl.col("idarticu").n_unique().alias("product_count"),
+            ]
+        )
+    )
+    selected = _select_product_exposure_features(counts, cfg=cfg)
+    if selected.is_empty():
+        return pl.DataFrame(schema=raw_map.schema)
+    return raw_map.join(
+        selected.select(
+            [
+                "feature_type",
+                "feature_key",
+                "feature_label",
+                "feature_name",
+                "customer_count",
+                "product_count",
+                "feature_rank",
+            ]
+        ),
+        on=["feature_type", "feature_key", "feature_label", "feature_name"],
+        how="inner",
+    )
+
+
+def _product_exposure_product_metadata(lf: pl.LazyFrame, columns: set[str]) -> pl.DataFrame:
+    agg_exprs = []
+    if "desc_larga_articulo" in columns:
+        agg_exprs.append(pl.col("desc_larga_articulo").drop_nulls().first().alias("product_description"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.Utf8).alias("product_description"))
+    if "idsector" in columns:
+        agg_exprs.append(pl.col("idsector").drop_nulls().first().cast(pl.Utf8).alias("sector_id"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.Utf8).alias("sector_id"))
+    if "desc_sector" in columns:
+        agg_exprs.append(pl.col("desc_sector").drop_nulls().first().alias("sector_label"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.Utf8).alias("sector_label"))
+    return collect_streaming(lf.group_by("idarticu").agg(agg_exprs))
+
+
+def _raw_product_exposure_feature_map(product_meta: pl.DataFrame, *, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
+    settings = cfg.get("product_exposure_features", {}) or {}
+    dimensions = settings.get("dimensions", {}) or {}
+    include_themes = bool(dimensions.get("themes", True))
+    include_sectors = bool(dimensions.get("sectors", True))
+    include_families = bool(dimensions.get("product_families", True))
+    max_families_per_product = int(settings.get("max_families_per_product", 6))
+    ngram_sizes = [int(value) for value in settings.get("family_ngram_sizes", [2, 1]) or [2, 1]]
+
+    rows = []
+    for row in product_meta.iter_rows(named=True):
+        product_id = row.get("idarticu")
+        description = "" if row.get("product_description") is None else str(row.get("product_description"))
+        if include_themes:
+            for theme in detect_product_themes(description):
+                rows.append(
+                    _product_exposure_feature_row(
+                        product_id,
+                        feature_type="theme",
+                        feature_key=theme,
+                        feature_label=theme.replace("_", " ").title(),
+                    )
+                )
+        if include_sectors:
+            sector_label = str(row.get("sector_label") or row.get("sector_id") or "").strip()
+            if sector_label:
+                rows.append(
+                    _product_exposure_feature_row(
+                        product_id,
+                        feature_type="sector",
+                        feature_key=sector_label,
+                        feature_label=sector_label,
+                    )
+                )
+        if include_families:
+            for term in _extract_product_family_terms(
+                description,
+                max_terms=max_families_per_product,
+                ngram_sizes=ngram_sizes,
+            ):
+                rows.append(
+                    _product_exposure_feature_row(
+                        product_id,
+                        feature_type="family",
+                        feature_key=term,
+                        feature_label=term,
+                    )
+                )
+    schema = {
+        "idarticu": product_meta.schema.get("idarticu", pl.Int64),
+        "feature_type": pl.Utf8,
+        "feature_key": pl.Utf8,
+        "feature_label": pl.Utf8,
+        "feature_name": pl.Utf8,
+    }
+    return pl.DataFrame(rows, schema=schema) if rows else pl.DataFrame(schema=schema)
+
+
+def _product_exposure_feature_row(
+    product_id: object,
+    *,
+    feature_type: str,
+    feature_key: str,
+    feature_label: str,
+) -> dict[str, object]:
+    safe_key = _safe_feature_token(feature_key)
+    return {
+        "idarticu": product_id,
+        "feature_type": feature_type,
+        "feature_key": feature_key,
+        "feature_label": feature_label,
+        "feature_name": f"{feature_type}_{safe_key}",
+    }
+
+
+def _select_product_exposure_features(counts: pl.DataFrame, *, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
+    if counts.is_empty():
+        return counts
+    settings = cfg.get("product_exposure_features", {}) or {}
+    min_customers = settings.get("min_customers", {}) or {}
+    max_features = settings.get("max_features", {}) or {}
+    frames = []
+    for feature_type in ["theme", "sector", "family"]:
+        frame = counts.filter(pl.col("feature_type") == feature_type)
+        if frame.is_empty():
+            continue
+        threshold = int(min_customers.get(feature_type, min_customers.get(f"{feature_type}s", 50)))
+        limit = max_features.get(feature_type, max_features.get(f"{feature_type}s", None))
+        filtered = frame.filter(pl.col("customer_count") >= threshold).sort(
+            ["customer_count", "product_count", "feature_key"],
+            descending=[True, True, False],
+        )
+        if limit is not None:
+            filtered = filtered.head(int(limit))
+        filtered = filtered.with_row_index("feature_rank", offset=1)
+        frames.append(filtered)
+    return pl.concat(frames, how="vertical") if frames else pl.DataFrame(schema=counts.schema)
+
+
+def _extract_product_family_terms(
+    description: str | None,
+    *,
+    max_terms: int,
+    ngram_sizes: list[int],
+) -> list[str]:
+    text = normalize_product_text(description)
+    raw_tokens = re.findall(r"[a-z0-9]+", text)
+    tokens = []
+    for token in raw_tokens:
+        if token in PRODUCT_FAMILY_STOPWORDS:
+            continue
+        if len(token) < 3:
+            continue
+        if any(char.isdigit() for char in token):
+            continue
+        if token.isdigit() or re.fullmatch(r"\d+(?:kg|g|gr|ml|cl|l|uds?)?", token):
+            continue
+        tokens.append(token)
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for n in ngram_sizes:
+        if n <= 0:
+            continue
+        for start in range(0, max(len(tokens) - n + 1, 0)):
+            candidate_tokens = tokens[start : start + n]
+            if n == 1 and candidate_tokens[0] in PRODUCT_FAMILY_UNIGRAM_STOPWORDS:
+                continue
+            if n > 1 and candidate_tokens[0] in {"con", "para"}:
+                continue
+            if candidate_tokens[-1] in PRODUCT_FAMILY_UNIGRAM_STOPWORDS:
+                continue
+            term = " ".join(candidate_tokens)
+            if term in seen:
+                continue
+            seen.add(term)
+            terms.append(term)
+            if len(terms) >= max_terms:
+                return terms
+    return terms
+
+
+def _safe_feature_token(value: str, *, max_length: int = 64) -> str:
+    token = normalize_product_text(value)
+    token = re.sub(r"[^a-z0-9]+", "_", token).strip("_")
+    if not token:
+        token = hashlib.blake2b(str(value).encode("utf-8"), digest_size=4).hexdigest()
+    if len(token) > max_length:
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).hexdigest()
+        token = f"{token[: max_length - 9].rstrip('_')}_{digest}"
+    return token
+
+
+def _standardize_numeric_columns(
+    frame: pl.DataFrame,
+    columns: list[str],
+    *,
+    multiplier: float = 1.0,
+    rename_prefix: str | None,
+) -> pl.DataFrame:
+    updates = []
+    for col in columns:
+        values = frame[col].to_numpy().astype(np.float64)
+        mean = float(np.nanmean(values))
+        std = float(np.nanstd(values))
+        denom = std if std > 1e-12 else 1.0
+        alias = f"{rename_prefix}{col}" if rename_prefix is not None else col
+        updates.append((((pl.col(col) - mean) / denom) * multiplier).cast(pl.Float32).alias(alias))
+    result = frame.with_columns(updates)
+    if rename_prefix is not None:
+        result = result.drop(columns)
+    return result
+
+
+def _frequency_anchor_features(frame: pl.DataFrame, *, multiplier: float) -> pl.DataFrame:
+    frequency = pl.col("frequency_per_30d").cast(pl.Float64).fill_null(0.0)
+    result = frame.select(["cliente", "frequency_per_30d"]).with_columns(
+        pl.when(frequency > 0.0).then(frequency).otherwise(0.0).log1p().alias("freq_log")
+    )
+    result = _standardize_numeric_columns(result, ["freq_log"], multiplier=multiplier, rename_prefix=None)
+    return result.rename({"freq_log": "freq_anchor"}).select(["cliente", "freq_anchor"])
 
 
 def build_feature_set_diagnostics(
@@ -234,14 +794,18 @@ def build_feature_set_diagnostics(
     )
 
     selection_feature_set = str(cfg.get("modeling.feature_set_for_selection", baseline))
-    selection_warning = (
-        "OK: official selection uses product embeddings only."
-        if selection_feature_set == baseline
-        else (
+    if selection_feature_set == "embeddings_only":
+        selection_warning = "OK: official selection uses product embeddings only."
+    elif selection_feature_set == "embeddings_product_exposure":
+        selection_warning = (
+            "REVIEW: official selection uses opt-in product-exposure challenger features; compare against "
+            "embeddings_only before promoting."
+        )
+    else:
+        selection_warning = (
             f"WARNING: official selection uses {selection_feature_set!r}; confirm Stage 6/8 evidence "
             "before allowing behavior or auxiliary features to drive organic tribes."
         )
-    )
 
     rows = []
     for name, path in feature_paths.items():

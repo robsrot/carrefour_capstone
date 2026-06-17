@@ -110,6 +110,42 @@ def test_stage6_umap_and_hdbscan_diagnostics_pass_for_hard_core_assignments(tmp_
     assert hdbscan_checks["soft_assigned_pct"] == 0.0
 
 
+def test_stage6_umap_diagnostics_include_pca_summary_when_available(tmp_path):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    feature_path, umap_path = _write_feature_and_umap(tmp_path)
+    pca_summary_path = cfg.artifacts / "stage6" / "stage6_1_pca_for_umap_summary.csv"
+    pca_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        [
+            {
+                "stage": "pca_for_umap",
+                "purpose": "Pre-reduce standardized customer product-behavior features before UMAP.",
+                "feature_path": str(feature_path),
+                "pca_path": str(tmp_path / "pca.parquet"),
+                "input_dimension_count": 128,
+                "requested_component_count": 40,
+                "retained_component_count": 40,
+                "dimension_reduction": "128 -> 40",
+                "standardized_input": True,
+                "retained_variance_ratio": 0.84,
+                "retained_variance_pct": 84.0,
+                "pc1_variance_pct": 12.0,
+                "pc5_cumulative_variance_pct": 42.0,
+                "pc10_cumulative_variance_pct": 61.0,
+            }
+        ]
+    ).write_csv(pca_summary_path)
+
+    checks = pl.read_csv(build_stage6_umap_diagnostics(feature_path, umap_path, cfg=cfg)).row(0, named=True)
+
+    assert checks["pca_pre_reduction_summary_status"] == "present"
+    assert checks["pca_dimension_reduction"] == "128 -> 40"
+    assert checks["pca_requested_component_count"] == 40
+    assert checks["pca_retained_component_count"] == 40
+    assert checks["pca_retained_variance_pct"] == 84.0
+
+
 def test_stage6_hdbscan_diagnostics_fail_when_soft_assignment_is_present(tmp_path):
     cfg = _test_config(tmp_path)
     cfg.ensure_directories()
@@ -148,6 +184,49 @@ def test_stage6_hdbscan_diagnostics_fail_when_soft_assignment_is_present(tmp_pat
     assert checks["blocking_check_status"] == "fail"
     assert "soft_assignment_enabled" in checks["check_issues"]
     assert "soft_assigned_customers_present" in checks["check_issues"]
+
+
+def test_stage6_hdbscan_diagnostics_pass_for_two_stage_hard_policy(tmp_path):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    _, umap_path = _write_feature_and_umap(tmp_path)
+    assignment_path = tmp_path / "assignments_two_stage.parquet"
+    result_path = tmp_path / "results_two_stage.parquet"
+
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3"],
+            "tribe_id": [0, 1, -1],
+            "assignment_source": [
+                "two_stage_hdbscan_stage1_core",
+                "two_stage_hdbscan_stage2_noise_core",
+                "two_stage_hdbscan_noise_unassigned",
+            ],
+        }
+    ).write_parquet(assignment_path)
+    pl.DataFrame(
+        [
+            {
+                "cluster_count": 2,
+                "noise_pct": 33.3333,
+                "core_coverage_pct": 66.6667,
+                "assignment_policy": "hard_two_stage_hdbscan_lift_core_noise_retained",
+                "soft_assignment_enabled": False,
+                "soft_assigned_pct": 0.0,
+                "passes_quality_gate": True,
+                "quality_gate_reason": "pass",
+            }
+        ]
+    ).write_parquet(result_path)
+
+    checks = pl.read_csv(build_stage6_hdbscan_diagnostics(umap_path, assignment_path, result_path, cfg=cfg)).row(
+        0,
+        named=True,
+    )
+
+    assert checks["check_status"] == "pass"
+    assert checks["blocking_check_status"] == "pass"
+    assert checks["assignment_policy"] == "hard_two_stage_hdbscan_lift_core_noise_retained"
 
 
 def test_stage6_hdbscan_diagnostics_quality_failure_does_not_block_evidence(tmp_path):
@@ -231,10 +310,10 @@ def test_stage6_representation_cluster_diagnostics_writes_umap_and_hdbscan_evide
     )
     row = pl.read_csv(path).row(0, named=True)
 
-    assert row["stage"] == "6.3_representation_cluster_quality"
+    assert row["stage"] == "6.5_representation_cluster_quality"
     assert row["aligned_rows"] == 3
     assert row["umap_component_count"] == 2
     assert row["umap_neighbor_k"] == 1
     assert row["cluster_count"] == 2
     assert row["silhouette_core_only"] == 0.25
-    assert row["hdbscan_dbcv_status"] in {"not_run", "unavailable", "failed", "pass"}
+    assert row["hdbscan_dbcv_status"] in {"not_run", "unavailable", "failed", "computed"}

@@ -46,8 +46,8 @@ def collect_cached_presentation_figures(
         ("Assignment Provenance", f"stage_09_assignment_provenance_{cfg.mode}.png"),
         ("Shopping Mission Overview", f"stage_09_shopping_mission_overview_{cfg.mode}.png"),
         ("Core Mission Lift Heatmap", f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
-        ("Stage 6.4 PCA Projection", f"stage_06_4_winner_projection_pca.png"),
-        ("Stage 6.4 UMAP Projection", f"stage_06_4_winner_projection_umap.png"),
+        ("Stage 6.6 PCA Projection", f"stage_06_6_winner_projection_pca.png"),
+        ("Stage 6.6 UMAP Projection", f"stage_06_6_winner_projection_umap.png"),
         ("Stage 9 PCA Projection", f"stage_09_final_projection_pca.png"),
         ("Stage 9 UMAP Projection", f"stage_09_final_projection_umap.png"),
     ]

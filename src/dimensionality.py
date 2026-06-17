@@ -25,6 +25,7 @@ from src.utils import (
 def build_pca_representation(
     feature_path: str | Path,
     output_path: str | Path | None = None,
+    summary_path: str | Path | None = None,
     n_components: int | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
@@ -35,11 +36,13 @@ def build_pca_representation(
     cfg.ensure_directories()
     force = cfg.get("cache.force", False) if force is None else force
     output = Path(output_path) if output_path else cfg.outputs / "features" / "feature_set_pca.parquet"
+    summary_output = Path(summary_path) if summary_path else output.with_name(f"{output.stem}_summary.csv")
     requested_components = n_components or int(cfg.get("pca.n_components", 32))
     cache_metadata = {
         "stage": "pca_representation",
         "mode": cfg.mode,
         "feature_path": file_fingerprint(feature_path),
+        "summary_path": str(summary_output),
         "n_components": requested_components,
         "random_seed": cfg.random_seed,
     }
@@ -50,14 +53,59 @@ def build_pca_representation(
     feature_cols = numeric_feature_columns(df)
     X = StandardScaler().fit_transform(frame_to_numpy(df, feature_cols))
     dims = min(requested_components, X.shape[1], X.shape[0] - 1)
-    coords = PCA(n_components=dims, random_state=cfg.random_seed).fit_transform(X)
+    if dims < 1:
+        raise ValueError("PCA requires at least one numeric feature and at least two rows.")
+    pca = PCA(n_components=dims, random_state=cfg.random_seed)
+    coords = pca.fit_transform(X)
     out = {"cliente": df["cliente"].to_list()}
     for idx in range(coords.shape[1]):
         out[f"pca_{idx:03d}"] = coords[:, idx].astype("float32")
     output.parent.mkdir(parents=True, exist_ok=True)
     pl.DataFrame(out).write_parquet(output)
+    _write_pca_summary(
+        summary_output,
+        feature_path=feature_path,
+        output_path=output,
+        feature_count=len(feature_cols),
+        requested_components=requested_components,
+        actual_components=dims,
+        explained_variance_ratio=pca.explained_variance_ratio_,
+    )
     write_artifact_metadata(output, cache_metadata)
+    write_artifact_metadata(summary_output, {**cache_metadata, "artifact": "pca_summary"})
     return output
+
+
+def _write_pca_summary(
+    output: Path,
+    *,
+    feature_path: str | Path,
+    output_path: str | Path,
+    feature_count: int,
+    requested_components: int,
+    actual_components: int,
+    explained_variance_ratio: np.ndarray,
+) -> None:
+    explained = np.asarray(explained_variance_ratio, dtype=np.float64)
+    retained = float(explained.sum())
+    row = {
+        "stage": "pca_for_umap",
+        "purpose": "Pre-reduce standardized customer product-behavior features before UMAP to denoise the neighbor graph and keep UMAP tractable.",
+        "feature_path": str(feature_path),
+        "pca_path": str(output_path),
+        "input_dimension_count": int(feature_count),
+        "requested_component_count": int(requested_components),
+        "retained_component_count": int(actual_components),
+        "dimension_reduction": f"{int(feature_count)} -> {int(actual_components)}",
+        "standardized_input": True,
+        "retained_variance_ratio": retained,
+        "retained_variance_pct": retained * 100.0,
+        "pc1_variance_pct": float(explained[0] * 100.0) if explained.size else None,
+        "pc5_cumulative_variance_pct": float(explained[:5].sum() * 100.0) if explained.size else None,
+        "pc10_cumulative_variance_pct": float(explained[:10].sum() * 100.0) if explained.size else None,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([row]).write_csv(output)
 
 
 def build_umap_representation(
