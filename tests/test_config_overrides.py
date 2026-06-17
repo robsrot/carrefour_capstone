@@ -22,6 +22,16 @@ def _flatten(values: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return flattened
 
 
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def test_config_folder_contains_only_authoritative_mode_files():
     assert sorted(path.name for path in CONFIG_DIR.glob("*.y*ml")) == [
         "base.yaml",
@@ -76,7 +86,7 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert base["customer_embeddings"]["weight_strategy"] == "quantity_idf"
     assert base["customer_embeddings"]["gates"]["min_line_coverage_pct"] == 85.0
     assert base["customer_embeddings"]["gates"]["min_unit_coverage_pct"] == 85.0
-    assert base["profiling"]["final_handoff_readiness_statuses"] == ["ready_strong"]
+    assert base["profiling"]["final_handoff_readiness_statuses"] == ["ready_strong", "ready"]
     assert base["profiling"]["final_handoff_require_actionability_proof"] is True
     assert base["profiling"]["final_handoff_require_theme_proof"] is False
     assert base["profiling"]["final_actionability_allow_theme_proof"] is False
@@ -90,12 +100,18 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert "pca64" in promoted["feature_space"]
     assert "pca64" in promoted["umap"]["output"]
     assert "pca64" in two_stage["feature_space"]
-    assert hdbscan["min_cluster_size"] == 550
-    assert hdbscan["cluster_selection_method"] == "eom"
+    assert hdbscan["min_cluster_size"] == 500
+    assert hdbscan["min_samples"] == 12
+    assert hdbscan["cluster_selection_method"] == "leaf"
     assert two_stage["enabled"] is True
     assert second_stage["allow_noise_assignment"] is False
-    assert second_stage["min_cluster_size"] >= hdbscan["min_cluster_size"]
-    assert second_stage["cluster_selection_method"] == "eom"
+    assert second_stage["min_cluster_size"] == 350
+    assert second_stage["min_samples"] == 12
+    assert second_stage["cluster_selection_method"] == "leaf"
+    assert "leaf_mcs500_ms12" in promoted["trial_name"]
+    assert "leaf_mcs500_ms12" in promoted["variant_prefix"]
+    assert "leaf_mcs500_ms12" in two_stage["trial_name"]
+    assert "leaf_mcs500_ms12" in two_stage["variant_prefix"]
     assert two_stage["lift_filter"]["min_strong_product_lifts"] >= 2
     assert two_stage["lift_filter"]["require_significant_product_lift"] is True
     assert "soft" not in promoted["trial_name"].lower()
@@ -107,12 +123,18 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert "soft" not in two_stage["output_prefix"].lower()
     assert "SoftNoiseAssignment" not in two_stage["algorithm_name"]
 
-    prod = _read_yaml(CONFIG_DIR / "prod.yaml")
+    prod_overrides = _read_yaml(CONFIG_DIR / "prod.yaml")
+    prod = _deep_merge(base, prod_overrides)
     prod_promoted = prod["official_model_suite"]["umap_hdbscan"]
     prod_two_stage = prod["official_model_suite"]["two_stage_hdbscan"]
+    prod_two_stage_overrides = prod_overrides["official_model_suite"]["two_stage_hdbscan"]
+    assert "leaf_mcs5400_ms12" in prod_promoted["trial_name"]
+    assert "leaf_mcs5400_ms12" in prod_promoted["variant_prefix"]
+    assert "leaf_mcs5400_ms12" in prod_two_stage["trial_name"]
+    assert "leaf_mcs5400_ms12" in prod_two_stage["variant_prefix"]
+    assert prod_promoted["hdbscan"]["min_cluster_size"] == 5400
+    assert prod_two_stage["second_stage_hdbscan"]["min_cluster_size"] == 3800
+    assert prod_two_stage["second_stage_hdbscan"]["min_samples"] == 12
+    assert "min_samples" not in prod_two_stage_overrides["second_stage_hdbscan"]
     assert "soft" not in prod_promoted["trial_name"].lower()
     assert "soft" not in prod_two_stage["trial_name"].lower()
-    assert (
-        prod_two_stage["second_stage_hdbscan"]["min_cluster_size"]
-        >= prod_promoted["hdbscan"]["min_cluster_size"]
-    )

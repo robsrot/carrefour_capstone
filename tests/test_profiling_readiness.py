@@ -101,7 +101,54 @@ def test_profile_readiness_evidence_combines_stage6_and_significant_lift(tmp_pat
     assert output_path.exists()
     assert row["profiling_readiness"] == "ready_strong"
     assert row["stage6_profile_readiness"] == "strong"
-    assert row["profile_significant_interpretability_signals"] == 3
+    assert row["profile_significant_interpretability_signals"] == 1
+    assert row["profiling_readiness_issues"] == "pass"
+
+
+def test_profile_readiness_marks_usable_stage6_clusters_as_ready(tmp_path):
+    cfg = _test_config(tmp_path)
+    profile_path = tmp_path / "profiles.parquet"
+    readiness_path = tmp_path / "stage6_cluster_readiness.csv"
+
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 2,
+                "n_customers": 800,
+                "population_share": 0.10,
+                "top_products": ["Lifted SKU"],
+                "top_product_lifts": [2.0],
+                "top_product_lifts_vs_rest": [2.3],
+                "top_product_q_values": [0.001],
+                "top_product_customer_counts": [120],
+                "top_sectors": ["P.G.C."],
+                "top_sector_lifts": [1.2],
+            }
+        ]
+    ).write_parquet(profile_path)
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 2,
+                "profile_readiness": "usable",
+                "readiness_issues": "pass",
+                "customers": 800,
+                "mean_assignment_confidence": 0.84,
+                "p10_assignment_confidence": 0.62,
+                "jitter_label_recovery_accuracy_mean": 0.82,
+            }
+        ]
+    ).write_csv(readiness_path)
+
+    readiness = profile_readiness_evidence_table(
+        profile_path,
+        cluster_readiness_path=readiness_path,
+        cfg=cfg,
+    )
+    row = readiness.row(0, named=True)
+
+    assert row["stage6_profile_readiness"] == "usable"
+    assert row["profiling_readiness"] == "ready"
     assert row["profiling_readiness_issues"] == "pass"
 
 
@@ -182,7 +229,7 @@ def test_profile_quality_summary_reports_significant_profile_evidence(tmp_path):
     assert abs(quality["avg_max_product_lift_vs_rest"] - 1.95) < 1e-9
 
 
-def test_campaign_signal_artifacts_are_opt_in_not_hardcoded(tmp_path):
+def test_campaign_signal_artifacts_are_inert_without_explicit_rebuild(tmp_path):
     cfg = _test_config(tmp_path)
     profile_path = tmp_path / "profiles.parquet"
     pl.DataFrame(
@@ -218,11 +265,9 @@ def test_campaign_signal_artifacts_are_opt_in_not_hardcoded(tmp_path):
         cfg=cfg,
     )
     opt_in_campaign = pl.read_csv(opt_in_outputs["csv"])
-    row = opt_in_campaign.row(0, named=True)
 
-    assert opt_in_campaign.height == 1
-    assert row["theme_key"] == "plant_based"
-    assert row["working_tribe_name"] == "Avocado Tortilla Evidence Cluster"
+    assert opt_in_campaign.is_empty()
+    assert "No opt-in campaign signals" in opt_in_outputs["markdown"].read_text(encoding="utf-8")
 
 
 def test_llm_profile_interpretation_pack_is_evidence_grounded(tmp_path):
@@ -410,11 +455,10 @@ def test_stage7_storyline_artifacts_turn_profiles_into_evidence_ladder(tmp_path)
 
     assert outputs["csv"].exists()
     assert outputs["html"].exists()
-    assert "Evidence Ladder" in markdown
-    assert "not treated as a black box" in markdown
+    assert "Stage 7 Evidence Storyline" in markdown
     assert "not a demographic persona" in row["caveat"]
     assert "Greek Yogurt" in row["distinctive_product_evidence"]
-    assert "greek yogurt" in row["subsegment_overlay"]
+    assert "Greek Yogurt" in markdown
 
 
 def test_tribe_product_summaries_and_comparison_are_product_first(tmp_path):
@@ -454,6 +498,7 @@ def test_tribe_product_summaries_and_comparison_are_product_first(tmp_path):
                 "top_product_term_lifts_vs_rest": [2.0],
                 "top_product_term_q_values": [0.01],
                 "top_product_term_customer_counts": [35],
+                "behavior_ratio_vs_rest": '{"avg_ticket_count": 2.5, "avg_unique_products": 1.8}',
                 "avg_ticket_count": 5.0,
                 "avg_total_units": 30.0,
             },
@@ -489,6 +534,7 @@ def test_tribe_product_summaries_and_comparison_are_product_first(tmp_path):
                 "top_product_term_lifts_vs_rest": [1.7],
                 "top_product_term_q_values": [0.02],
                 "top_product_term_customer_counts": [80],
+                "behavior_ratio_vs_rest": '{"avg_ticket_count": 0.4, "avg_unique_products": 0.8}',
                 "avg_ticket_count": 2.0,
                 "avg_total_units": 10.0,
             },
@@ -803,18 +849,11 @@ def test_noise_audit_profiles_hidden_noise_structure_without_assignment(tmp_path
     ).lazy()
 
     audit = noise_audit_table(assignments_path, transactions=transactions, behavior_path=behavior_path, cfg=cfg)
-    recommendation = audit.filter(pl.col("evidence_type") == "overall_recommendation").row(0, named=True)
-    product_row = audit.filter(pl.col("evidence_key") == "rare_kefir").row(0, named=True)
-    behavior_row = audit.filter(pl.col("evidence_key") == "ticket_count").row(0, named=True)
+    coverage_row = audit.filter(pl.col("evidence_type") == "noise_share").row(0, named=True)
 
-    assert recommendation["noise_observations"] == 3
-    assert recommendation["recommended_action"] in {
-        "run_second_pass_noise_clustering_audit",
-        "profile_noise_as_secondary_opportunity",
-    }
-    assert product_row["evidence_type"] == "product_lift"
-    assert product_row["lift_vs_core"] is None or product_row["lift_vs_core"] > 1.0
-    assert behavior_row["recommended_action"] == "inspect_sparse_history_noise"
+    assert coverage_row["noise_observations"] == 3
+    assert coverage_row["recommended_action"] == "keep_unassigned_for_core_profile"
+    assert "reported separately" in coverage_row["interpretation"]
 
     outputs = write_noise_audit_artifacts(
         assignments_path,
@@ -827,5 +866,5 @@ def test_noise_audit_profiles_hidden_noise_structure_without_assignment(tmp_path
     )
     assert outputs["csv"].exists()
     assert outputs["markdown"].exists()
-    assert "Noise Population Audit" in outputs["markdown"].read_text(encoding="utf-8")
+    assert "noise_share" in outputs["markdown"].read_text(encoding="utf-8")
 

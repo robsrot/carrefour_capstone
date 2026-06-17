@@ -413,6 +413,17 @@ def run_hdbscan(
         clientes = df["cliente"].to_list()
         fit_idx = _fit_indices(X.shape[0], cfg)
         X_fit = X[fit_idx]
+        log_event(
+            "Stage 6 HDBSCAN",
+            "loaded dense feature matrix",
+            cfg=cfg,
+            rows=X.shape[0],
+            features=len(feature_cols),
+            fit_rows=X_fit.shape[0],
+            full_matrix_mb=round(float(X.nbytes) / (1024**2), 1),
+            fit_matrix_mb=round(float(X_fit.nbytes) / (1024**2), 1),
+            sampled_fit=X_fit.shape[0] < X.shape[0],
+        )
 
         labels: np.ndarray
         probabilities: np.ndarray | None = None

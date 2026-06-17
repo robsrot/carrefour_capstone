@@ -272,13 +272,13 @@ official_model_suite:
       k_min: 10
       k_max: 10
   umap_hdbscan:
-    promoted_from_experiment: clustering_quality_improvement_pca64_idf_eom
-    trial_name: u20_n75_eom_mcs550_ms2_core
+    promoted_from_experiment: clustering_quality_improvement_pca64_leaf
+    trial_name: u20_n75_leaf_mcs500_ms12_core
     model_name: model_b_umap_hdbscan_core
     output_prefix: model_b_umap_hdbscan_core
     algorithm_name: UMAP_HDBSCAN
     feature_space: umap_customer_embeddings_pca64_u20_n75
-    variant_prefix: u20_n75_eom_mcs550_ms2
+    variant_prefix: u20_n75_leaf_mcs500_ms12
     pca_components: 64
     umap:
       output: feature_set_umap_pca64_u20_n75.parquet
@@ -289,21 +289,21 @@ official_model_suite:
       fit_sample_size: null
       transform_batch_size: 100000
     hdbscan:
-      min_cluster_size: 350
+      min_cluster_size: 500
       min_samples: 12
       cluster_selection_method: leaf
       allow_noise_assignment: false
   two_stage_hdbscan:
     enabled: true
-    trial_name: two_stage_u20_n75_eom_mcs550_ms2_lift_core
+    trial_name: two_stage_u20_n75_leaf_mcs500_ms12_lift_core
     model_name: model_d_two_stage_hdbscan_lift_core
     output_prefix: model_d_two_stage_hdbscan_lift_core
     algorithm_name: UMAP_HDBSCAN_TwoStageLiftCore
     feature_space: umap_customer_embeddings_pca64_u20_n75
-    variant_prefix: two_stage_u20_n75_eom_mcs550_ms2
+    variant_prefix: two_stage_u20_n75_leaf_mcs500_ms12
     second_stage_hdbscan:
-      min_cluster_size: 250
-      min_samples: 8
+      min_cluster_size: 350
+      min_samples: 12
       cluster_selection_method: leaf
       allow_noise_assignment: false
     lift_filter:
@@ -337,8 +337,8 @@ gmm:
   n_init: 2
 
 hdbscan:
-  min_cluster_size: 200
-  min_samples: 8
+  min_cluster_size: 500
+  min_samples: 12
   cluster_selection_method: leaf
   allow_noise_assignment: false
 
@@ -386,10 +386,11 @@ profiling:
   noise_audit_high_noise_pct: 60.0
   noise_audit_second_pass_signal_count: 5
   min_ready_evidence_signals: 1
-  # Final handoff promotion is stricter than profiling. Candidate clusters that
-  # do not reach these statuses remain auditable as review candidates.
+  # Final handoff promotion accepts strong and usable profileable tribes.
+  # ready_strong remains the stricter status; ready tribes carry stability caveats.
   final_handoff_readiness_statuses:
     - ready_strong
+    - ready
   # Final promotion requires actionable product evidence. By default, the proof
   # must come from data-driven product terms or repeated significant lifted SKUs.
   # Curated product themes remain supporting context unless explicitly opted in.

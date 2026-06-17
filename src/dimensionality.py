@@ -47,16 +47,35 @@ def build_pca_representation(
         "random_seed": cfg.random_seed,
     }
     if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 6 PCA", "cache hit", cfg=cfg, path=output)
         return output
 
+    source_rows = _parquet_row_count(feature_path)
+    schema_df = pl.read_parquet(feature_path, n_rows=1)
+    feature_cols = numeric_feature_columns(schema_df)
+    log_event(
+        "Stage 6 PCA",
+        "loading dense feature matrix",
+        cfg=cfg,
+        source_rows=source_rows,
+        feature_count=len(feature_cols),
+        approx_float32_mb=round(source_rows * max(len(feature_cols), 1) * 4 / (1024**2), 1),
+    )
     df = pl.read_parquet(feature_path).sort("cliente")
-    feature_cols = numeric_feature_columns(df)
-    X = StandardScaler().fit_transform(frame_to_numpy(df, feature_cols))
+    X = StandardScaler(copy=False).fit_transform(frame_to_numpy(df, feature_cols)).astype(np.float32, copy=False)
     dims = min(requested_components, X.shape[1], X.shape[0] - 1)
     if dims < 1:
         raise ValueError("PCA requires at least one numeric feature and at least two rows.")
-    pca = PCA(n_components=dims, random_state=cfg.random_seed)
-    coords = pca.fit_transform(X)
+    with stage_timer(
+        "Stage 6 PCA",
+        "fitting pre-UMAP PCA",
+        cfg=cfg,
+        source_rows=df.height,
+        input_features=len(feature_cols),
+        retained_components=dims,
+    ):
+        pca = PCA(n_components=dims, random_state=cfg.random_seed)
+        coords = pca.fit_transform(X)
     out = {"cliente": df["cliente"].to_list()}
     for idx in range(coords.shape[1]):
         out[f"pca_{idx:03d}"] = coords[:, idx].astype("float32")
@@ -73,6 +92,15 @@ def build_pca_representation(
     )
     write_artifact_metadata(output, cache_metadata)
     write_artifact_metadata(summary_output, {**cache_metadata, "artifact": "pca_summary"})
+    log_event(
+        "Stage 6 PCA",
+        "wrote artifact",
+        cfg=cfg,
+        rows=df.height,
+        retained_components=dims,
+        retained_variance_pct=round(float(pca.explained_variance_ratio_.sum() * 100.0), 2),
+        path=output,
+    )
     return output
 
 
@@ -158,15 +186,24 @@ def build_umap_representation(
         metric=metric,
         source_rows=row_count,
         fit_sample_size=fit_sample_size,
+        transform_batch_size=transform_batch_size,
     ):
         schema_df = pl.read_parquet(feature_path, n_rows=1)
         feature_cols = numeric_feature_columns(schema_df)
+        log_event(
+            "Stage 6 UMAP",
+            "resolved feature matrix policy",
+            cfg=cfg,
+            feature_count=len(feature_cols),
+            dense_fit_float32_mb=round(fit_sample_size * max(len(feature_cols), 1) * 4 / (1024**2), 1),
+            full_transform_batched=fit_sample_size < row_count,
+        )
         fit_indices = deterministic_sample_indices(row_count, fit_sample_size, cfg.random_seed)
         if fit_indices.shape[0] >= row_count:
             df = pl.read_parquet(feature_path).sort("cliente")
             X = frame_to_numpy(df, feature_cols)
             if standardize_input:
-                X = StandardScaler().fit_transform(X).astype("float32")
+                X = StandardScaler(copy=False).fit_transform(X).astype("float32", copy=False)
             else:
                 X = X.astype("float32", copy=False)
 
@@ -190,8 +227,8 @@ def build_umap_representation(
             X_fit = frame_to_numpy(sample, feature_cols)
             scaler = None
             if standardize_input:
-                scaler = StandardScaler()
-                X_fit = scaler.fit_transform(X_fit).astype("float32")
+                scaler = StandardScaler(copy=False)
+                X_fit = scaler.fit_transform(X_fit).astype("float32", copy=False)
             else:
                 X_fit = X_fit.astype("float32", copy=False)
 

@@ -22,6 +22,7 @@ from src.organic_profiler import (
     synthesize_tribe_with_gemini,
 )
 from src.progress import log_event, stage_timer
+from src.tribe_namer import THEME_LABELS
 from src.utils import collect_streaming, file_fingerprint, schema_names, should_use_cache, write_artifact_metadata
 
 
@@ -910,11 +911,13 @@ def profile_readiness_evidence_table(
         )
         signal_count = _significant_product_signal_count(row, threshold=threshold, q_threshold=q_threshold)
         issues: list[str] = []
-        if stage6_status not in {"strong", "ready", "ready_strong", "pass"}:
+        strong_stage6_statuses = {"strong", "ready_strong"}
+        profileable_stage6_statuses = strong_stage6_statuses | {"usable", "ready", "pass"}
+        if stage6_status not in profileable_stage6_statuses:
             issues.append(f"stage6_readiness={stage6_status}")
         if signal_count < min_signals:
             issues.append(f"product_signals<{min_signals}")
-        if not issues and stage6_status == "strong":
+        if not issues and stage6_status in strong_stage6_statuses:
             profiling_status = "ready_strong"
         elif not issues:
             profiling_status = "ready"
@@ -1227,7 +1230,10 @@ def write_llm_profile_interpretation_pack(
     readiness = _read_optional_table(readiness_path)
     payload = {
         "instruction": "Interpret these organic Carrefour Spain tribes from transaction evidence only. Do not infer age, gender, income, household structure, or other demographics.",
-        "tribes": [_llm_pack_row(row, _row_by_tribe(readiness, int(row["tribe_id"]))) for row in profiles.iter_rows(named=True)],
+        "tribes": [
+            _llm_pack_row(row, _row_by_tribe(readiness, int(row["tribe_id"])), cfg=cfg)
+            for row in profiles.iter_rows(named=True)
+        ],
     }
     json_path = Path(output_json) if output_json else cfg.artifacts / "stage7" / f"llm_profile_pack_{cfg.mode}.json"
     md_path = Path(output_md) if output_md else json_path.with_suffix(".md")
@@ -1244,22 +1250,12 @@ def stage7_llm_evidence_table(
     output_csv: str | Path | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> pl.DataFrame:
-    del cfg
     profiles = pl.read_parquet(profile_path).sort("tribe_id")
     readiness = _read_optional_table(readiness_path)
     rows: list[dict[str, Any]] = []
-    for row in profiles.iter_rows(named=True):
+    for row, readiness_row, actionability in _final_profile_records(profiles, readiness, cfg=cfg):
         tribe_id = int(row["tribe_id"])
-        readiness_row = _row_by_tribe(readiness, tribe_id)
-        rows.extend(
-            [
-                _evidence_row(tribe_id, "products", _product_evidence_text(row), readiness_row),
-                _evidence_row(tribe_id, "copurchase", _copurchase_text(row), readiness_row),
-                _evidence_row(tribe_id, "behavior", _behavior_ratio_summary(row, profiles), readiness_row),
-                _evidence_row(tribe_id, "temporal", _temporal_text(row), readiness_row),
-                _evidence_row(tribe_id, "loyalty", _loyalty_text(row), readiness_row),
-            ]
-        )
+        rows.extend(_stage7_llm_evidence_rows(tribe_id, row, readiness_row, actionability, cfg=cfg))
     table = pl.DataFrame(rows) if rows else pl.DataFrame()
     if output_csv is not None:
         _write_csv(table, output_csv)
@@ -1364,6 +1360,10 @@ def write_stage7_final_handoff_pack(
         "stage": "7_final_handoff",
         "mode": cfg.mode,
         "memory_policy": "Final handoff uses aggregate organic profile evidence and does not rescan raw transaction lines.",
+        "promotion_policy": {
+            "readiness_statuses": sorted(_final_readiness_statuses(None, cfg)),
+            "requires_actionability_proof": bool(cfg.get("profiling.final_handoff_require_actionability_proof", True)),
+        },
         "primary_outputs": {
             "final_index_csv": str(index_csv),
             "final_story_markdown": str(story_md),
@@ -1407,34 +1407,49 @@ def stage7_final_index_table(
     readiness_statuses: list[str] | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> pl.DataFrame:
-    del customer_metric_tests_path, readiness_statuses, cfg
+    del customer_metric_tests_path
     profiles = pl.read_parquet(profile_path).sort("tribe_id")
     readiness = _read_optional_table(readiness_path)
     comparison = _read_optional_table(comparison_path)
     if comparison.is_empty():
         comparison = tribe_comparison_table(profile_path, readiness_path=readiness_path)
     rows: list[dict[str, Any]] = []
-    for order, row in enumerate(profiles.sort("n_customers", descending=True).iter_rows(named=True), start=1):
+    final_records = _final_profile_records(
+        profiles,
+        readiness,
+        readiness_statuses=readiness_statuses,
+        cfg=cfg,
+    )
+    final_records = sorted(final_records, key=lambda item: int(item[0].get("n_customers") or 0), reverse=True)
+    for order, (row, readiness_row, actionability) in enumerate(final_records, start=1):
         tribe_id = int(row["tribe_id"])
-        readiness_row = _row_by_tribe(readiness, tribe_id)
         comparison_row = _row_by_tribe(comparison, tribe_id)
         products = _top_card_products(row, limit=1)
+        theme = _primary_theme_context(row, cfg=cfg)
         rows.append(
             {
                 "story_order": order,
                 "tribe_id": tribe_id,
-                "tribe_name": _working_label(row),
+                "tribe_name": _final_tribe_name(row),
+                "name_source": row.get("suggested_tribe_name_source") or row.get("llm_working_label_source") or "product_evidence",
                 "readiness": readiness_row.get("profiling_readiness") or "not checked",
                 "customers": int(row.get("n_customers") or 0),
                 "population_share_pct": round(float(row.get("population_share") or 0.0) * 100.0, 2),
                 "core_customers": int(row.get("core_customers") or 0),
                 "noise_customers": int(row.get("noise_customers") or 0),
+                "primary_theme": theme["primary_theme"],
+                "primary_theme_confidence": theme["primary_theme_confidence"],
+                "theme_read": theme["theme_read"],
+                "primary_theme_product_evidence": theme["primary_theme_product_evidence"],
+                "actionability_proof_source": actionability.get("actionability_proof_source"),
+                "actionability_proof": actionability.get("actionability_proof"),
                 "top_product": products[0]["product"] if products else None,
                 "top_product_reach_pct": products[0]["reach_pct"] if products else None,
                 "top_product_lift": products[0]["lift_vs_rest"] if products else None,
                 "distinctive_products": comparison_row.get("top_product_and_category_evidence") or _product_evidence_text(row),
                 "shopping_mission": row.get("llm_shopping_mission") or _copurchase_text(row),
                 "behavior_context": _behavior_ratio_summary(row, profiles),
+                "spend_and_visit_context": _spend_and_visit_context(row),
                 "dominant_shopping_day": row.get("dominant_shopping_day"),
                 "dominant_shopping_time": row.get("dominant_shopping_time"),
                 "loyalty_cohort": row.get("loyalty_cohort"),
@@ -1454,14 +1469,19 @@ def write_stage7_tribe_card_pngs(
     readiness_statuses: list[str] | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[int, Path]:
-    del readiness_path, readiness_statuses
     profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    readiness = _read_optional_table(readiness_path)
     out_dir = Path(output_dir) if output_dir else cfg.figures / "stage7_tribe_cards"
     out_dir.mkdir(parents=True, exist_ok=True)
     for stale_card in out_dir.glob("tribe_*_card.png"):
         stale_card.unlink()
     paths: dict[int, Path] = {}
-    for row in profiles.iter_rows(named=True):
+    for row, _, _ in _final_profile_records(
+        profiles,
+        readiness,
+        readiness_statuses=readiness_statuses,
+        cfg=cfg,
+    ):
         tribe_id = int(row["tribe_id"])
         output = out_dir / f"tribe_{tribe_id:02d}_card.png"
         _write_stage7_tribe_card_png(row, output, max_products=max_products)
@@ -1550,27 +1570,24 @@ def _anova_metric_row(frame: pl.DataFrame, metric: str) -> dict[str, Any]:
     }
 
 
-def _llm_pack_row(row: dict[str, Any], readiness_row: dict[str, Any]) -> dict[str, Any]:
+def _llm_pack_row(row: dict[str, Any], readiness_row: dict[str, Any], *, cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
+    theme = _primary_theme_context(row, cfg=cfg)
+    actionability = _actionability_proof(row, cfg=cfg)
     return {
         "tribe_id": row.get("tribe_id"),
-        "working_label": _working_label(row),
+        "working_label": _final_tribe_name(row),
         "readiness": readiness_row.get("profiling_readiness"),
         "size": {"customers": row.get("n_customers"), "population_share": row.get("population_share")},
+        "actionability_proof_source": actionability.get("actionability_proof_source"),
+        "actionability_proof": actionability.get("actionability_proof"),
+        "primary_theme": theme.get("primary_theme"),
+        "supporting_curated_themes": _supporting_curated_themes(row),
         "products": _product_evidence_text(row),
         "sectors": _format_lift_items(row.get("top_sectors"), row.get("top_sector_lifts"), row.get("top_sector_line_counts")),
         "copurchase": _parse_json(row.get("copurchase_pairs"), []),
         "behavior_ratios": _parse_json(row.get("behavior_ratio_vs_rest"), {}),
         "temporal_pattern": _parse_json(row.get("temporal_pattern"), {}),
         "loyalty_profile": _parse_json(row.get("loyalty_profile"), {}),
-    }
-
-
-def _evidence_row(tribe_id: int, role: str, evidence: str, readiness_row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "tribe_id": tribe_id,
-        "proof_role": role,
-        "evidence": evidence,
-        "readiness": readiness_row.get("profiling_readiness"),
     }
 
 
@@ -1644,6 +1661,434 @@ def _top_card_products(row: dict[str, Any], limit: int = 8) -> list[dict[str, An
             }
         )
     return rows
+
+
+def _final_readiness_statuses(readiness_statuses: list[str] | None, cfg: PipelineConfig) -> set[str]:
+    configured = readiness_statuses
+    if configured is None:
+        configured = cfg.get("profiling.final_handoff_readiness_statuses", ["ready_strong"])
+    if isinstance(configured, str):
+        configured = [configured]
+    values = [str(value).strip() for value in (configured or ["ready_strong"]) if str(value).strip()]
+    return set(values or ["ready_strong"])
+
+
+def _final_profile_records(
+    profiles: pl.DataFrame,
+    readiness: pl.DataFrame,
+    *,
+    readiness_statuses: list[str] | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
+    allowed_statuses = _final_readiness_statuses(readiness_statuses, cfg)
+    require_actionability = bool(cfg.get("profiling.final_handoff_require_actionability_proof", True))
+    records: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for row in profiles.iter_rows(named=True):
+        tribe_id = int(row["tribe_id"])
+        readiness_row = _row_by_tribe(readiness, tribe_id)
+        status = str(readiness_row.get("profiling_readiness") or "").strip()
+        if status not in allowed_statuses:
+            continue
+        actionability = _actionability_proof(row, cfg=cfg)
+        if require_actionability and not actionability.get("actionability_proof_source"):
+            continue
+        records.append((row, readiness_row, actionability))
+    return records
+
+
+def _actionability_proof(row: dict[str, Any], cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
+    term_signals = _actionable_product_term_signals(row, cfg=cfg)
+    if term_signals:
+        labels = "; ".join(_proof_signal_text(signal) for signal in term_signals)
+        primary = term_signals[0]
+        return {
+            "actionability_proof_source": "data_driven_product_terms",
+            "actionability_proof": f"Product-term proof: {labels}",
+            "evidence_type": "product_term",
+            "label": primary["label"],
+            "customers": primary["customers"],
+            "tribe_reach_pct": primary["reach_pct"],
+            "lift_vs_rest": primary["lift_vs_rest"],
+            "q_value": primary["q_value"],
+        }
+
+    product_signals = _actionable_lifted_product_signals(row, cfg=cfg)
+    if product_signals:
+        labels = "; ".join(_proof_signal_text(signal) for signal in product_signals)
+        primary = product_signals[0]
+        return {
+            "actionability_proof_source": "lifted_product_evidence",
+            "actionability_proof": f"Lifted-product proof: {labels}",
+            "evidence_type": "lifted_product",
+            "label": primary["label"],
+            "customers": primary["customers"],
+            "tribe_reach_pct": primary["reach_pct"],
+            "lift_vs_rest": primary["lift_vs_rest"],
+            "q_value": primary["q_value"],
+        }
+
+    theme = _primary_theme_context(row, cfg=cfg)
+    if bool(cfg.get("profiling.final_actionability_allow_theme_proof", False)) and theme.get("theme_key"):
+        return {
+            "actionability_proof_source": "curated_theme",
+            "actionability_proof": theme["theme_read"],
+            "evidence_type": "curated_theme",
+            "label": theme["primary_theme"],
+            "customers": theme.get("customers"),
+            "tribe_reach_pct": theme.get("reach_pct"),
+            "lift_vs_rest": theme.get("lift_vs_rest"),
+            "q_value": theme.get("q_value"),
+        }
+
+    return {
+        "actionability_proof_source": None,
+        "actionability_proof": None,
+        "evidence_type": None,
+        "label": None,
+        "customers": None,
+        "tribe_reach_pct": None,
+        "lift_vs_rest": None,
+        "q_value": None,
+    }
+
+
+def _actionable_product_term_signals(row: dict[str, Any], cfg: PipelineConfig) -> list[dict[str, Any]]:
+    min_signals = int(cfg.get("profiling.final_actionability_min_term_signals", 1))
+    min_lift = float(cfg.get("profiling.final_actionability_min_term_lift", 1.5))
+    min_coverage = float(cfg.get("profiling.final_actionability_min_term_coverage", 0.02))
+    min_customers = int(cfg.get("profiling.final_actionability_min_term_customers", 25))
+    q_threshold = float(cfg.get("profiling.significance_q_threshold", 0.05))
+    n_customers = max(int(row.get("n_customers") or 0), 1)
+    terms = row.get("top_product_terms") or []
+    lifts = row.get("top_product_term_lifts_vs_rest") or row.get("top_product_term_lifts") or []
+    q_values = row.get("top_product_term_q_values") or []
+    counts = row.get("top_product_term_customer_counts") or []
+    signals = []
+    for idx, term in enumerate(terms):
+        signal = _actionable_signal(
+            label=str(term),
+            lift=_value_at(lifts, idx),
+            q_value=_value_at(q_values, idx),
+            customers=_value_at(counts, idx),
+            n_customers=n_customers,
+            min_lift=min_lift,
+            min_coverage=min_coverage,
+            min_customers=min_customers,
+            q_threshold=q_threshold,
+        )
+        if signal:
+            signals.append(signal)
+    signals = sorted(signals, key=lambda item: (-float(item["lift_vs_rest"] or 0.0), -int(item["customers"] or 0), item["label"]))
+    return signals[:max(min_signals, 1)] if len(signals) >= min_signals else []
+
+
+def _actionable_lifted_product_signals(row: dict[str, Any], cfg: PipelineConfig) -> list[dict[str, Any]]:
+    min_signals = int(cfg.get("profiling.final_actionability_min_product_signals", 2))
+    min_lift = float(cfg.get("profiling.final_actionability_min_product_lift", 1.5))
+    min_coverage = float(cfg.get("profiling.final_actionability_min_product_coverage", 0.005))
+    min_customers = int(cfg.get("profiling.final_actionability_min_product_customers", 25))
+    q_threshold = float(cfg.get("profiling.significance_q_threshold", 0.05))
+    n_customers = max(int(row.get("n_customers") or 0), 1)
+    products = row.get("top_products") or []
+    lifts = row.get("top_product_lifts_vs_rest") or row.get("top_product_lifts") or []
+    q_values = row.get("top_product_q_values") or []
+    counts = row.get("top_product_customer_counts") or []
+    signals = []
+    for idx, product in enumerate(products):
+        signal = _actionable_signal(
+            label=_repair_display_text(str(product)),
+            lift=_value_at(lifts, idx),
+            q_value=_value_at(q_values, idx),
+            customers=_value_at(counts, idx),
+            n_customers=n_customers,
+            min_lift=min_lift,
+            min_coverage=min_coverage,
+            min_customers=min_customers,
+            q_threshold=q_threshold,
+        )
+        if signal:
+            signals.append(signal)
+    signals = sorted(signals, key=lambda item: (-float(item["lift_vs_rest"] or 0.0), -int(item["customers"] or 0), item["label"]))
+    return signals[:max(min_signals, 1)] if len(signals) >= min_signals else []
+
+
+def _actionable_signal(
+    *,
+    label: str,
+    lift: Any,
+    q_value: Any,
+    customers: Any,
+    n_customers: int,
+    min_lift: float,
+    min_coverage: float,
+    min_customers: int,
+    q_threshold: float,
+) -> dict[str, Any] | None:
+    lift_value = _safe_float(lift)
+    q = _safe_float(q_value)
+    count = int(_safe_float(customers) or 0)
+    reach = 100.0 * count / max(n_customers, 1)
+    if lift_value is None or lift_value < min_lift:
+        return None
+    if q is None or q > q_threshold:
+        return None
+    if count < min_customers and reach / 100.0 < min_coverage:
+        return None
+    return {
+        "label": _repair_display_text(str(label)),
+        "lift_vs_rest": lift_value,
+        "q_value": q,
+        "customers": count,
+        "reach_pct": reach,
+    }
+
+
+def _proof_signal_text(signal: dict[str, Any]) -> str:
+    q_value = signal.get("q_value")
+    q_text = "" if q_value is None else f", q={float(q_value):.3g}"
+    return (
+        f"{signal['label']} ({float(signal.get('lift_vs_rest') or 0.0):.2f}x vs rest, "
+        f"{float(signal.get('reach_pct') or 0.0):.1f}% reach, n={int(signal.get('customers') or 0)}{q_text})"
+    )
+
+
+def _primary_theme_context(row: dict[str, Any], cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
+    themes = row.get("top_themes") or []
+    if not themes:
+        return _product_led_theme_context()
+
+    min_lift = float(cfg.get("profiling.theme_label_min_lift", 1.5))
+    min_coverage = float(cfg.get("profiling.theme_label_min_coverage", 0.15))
+    q_threshold = float(cfg.get("profiling.significance_q_threshold", 0.05))
+    n_customers = max(int(row.get("n_customers") or 0), 1)
+    lifts = row.get("top_theme_lifts_vs_rest") or row.get("top_theme_lifts") or []
+    q_values = row.get("top_theme_q_values") or []
+    counts = row.get("top_theme_customer_counts") or []
+
+    for idx, theme_key in enumerate(themes):
+        key = str(theme_key)
+        label = THEME_LABELS.get(key, _theme_label_from_key(key))
+        lift = _safe_float(_value_at(lifts, idx))
+        q_value = _safe_float(_value_at(q_values, idx))
+        customers = int(_safe_float(_value_at(counts, idx)) or 0)
+        reach = 100.0 * customers / max(n_customers, 1)
+        if lift is None or lift < min_lift or reach / 100.0 < min_coverage or q_value is None or q_value > q_threshold:
+            continue
+        product_evidence = _value_at(row.get("top_theme_product_evidence"), idx) or _product_evidence_text(row)
+        return {
+            "theme_key": key,
+            "primary_theme": label,
+            "primary_theme_confidence": "curated_theme_supported",
+            "theme_read": f"{label}: {lift:.2f}x vs rest, {reach:.1f}% reach, q={q_value:.3g}. Product evidence remains primary.",
+            "primary_theme_product_evidence": _repair_display_text(str(product_evidence)),
+            "customers": customers,
+            "reach_pct": reach,
+            "lift_vs_rest": lift,
+            "q_value": q_value,
+        }
+    return _product_led_theme_context()
+
+
+def _product_led_theme_context() -> dict[str, Any]:
+    return {
+        "theme_key": None,
+        "primary_theme": "Product-led tribe; no broad theme evidence",
+        "primary_theme_confidence": "product_led",
+        "theme_read": "No curated product theme passed the reporting gate; use SKU and product-term evidence as the primary read.",
+        "primary_theme_product_evidence": "n/a",
+        "customers": None,
+        "reach_pct": None,
+        "lift_vs_rest": None,
+        "q_value": None,
+    }
+
+
+def _supporting_curated_themes(row: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
+    themes = row.get("top_themes") or []
+    lifts = row.get("top_theme_lifts_vs_rest") or row.get("top_theme_lifts") or []
+    q_values = row.get("top_theme_q_values") or []
+    counts = row.get("top_theme_customer_counts") or []
+    n_customers = max(int(row.get("n_customers") or 0), 1)
+    result = []
+    for idx, theme_key in enumerate(themes[:limit]):
+        customers = int(_safe_float(_value_at(counts, idx)) or 0)
+        result.append(
+            {
+                "theme_key": str(theme_key),
+                "theme_label": THEME_LABELS.get(str(theme_key), _theme_label_from_key(str(theme_key))),
+                "lift_vs_rest": _safe_float(_value_at(lifts, idx)),
+                "q_value": _safe_float(_value_at(q_values, idx)),
+                "customers": customers,
+                "reach_pct": 100.0 * customers / max(n_customers, 1),
+                "product_evidence": _value_at(row.get("top_theme_product_evidence"), idx),
+            }
+        )
+    return result
+
+
+def _theme_label_from_key(key: str) -> str:
+    return " ".join(part.capitalize() for part in key.replace("-", "_").split("_") if part) + " Buyers"
+
+
+def _final_tribe_name(row: dict[str, Any]) -> str:
+    raw = (
+        row.get("llm_working_label")
+        or row.get("suggested_tribe_name")
+        or row.get("working_tribe_name")
+        or _working_label(row)
+    )
+    name = _repair_display_text(str(raw)).strip()
+    for suffix in (" Product Evidence Cluster", " Evidence Cluster", " Purchase Cluster", " Cluster"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)].strip()
+            break
+    if name.endswith(" Buyers"):
+        return name
+    return f"{name} Buyers" if name else f"Tribe {row.get('tribe_id')} Buyers"
+
+
+def _spend_and_visit_context(row: dict[str, Any]) -> str:
+    parts = []
+    visits = _safe_float(row.get("avg_ticket_count"))
+    frequency = _safe_float(row.get("avg_frequency_per_30d"))
+    basket_value = _safe_float(row.get("avg_basket_value") or row.get("avg_avg_basket_value"))
+    spend = _safe_float(row.get("avg_total_spend"))
+    promo = _safe_float(row.get("avg_promo_share"))
+    if visits is not None:
+        parts.append(f"{visits:.1f} avg visits")
+    if frequency is not None:
+        parts.append(f"{frequency:.1f} visits per 30d")
+    if basket_value is not None:
+        parts.append(f"{basket_value:.2f} avg basket value")
+    if spend is not None:
+        parts.append(f"{spend:.2f} avg total spend")
+    if promo is not None:
+        parts.append(f"{promo:.1%} promo share")
+    return "; ".join(parts) if parts else "Spend and visit context unavailable."
+
+
+def _stage7_llm_evidence_rows(
+    tribe_id: int,
+    row: dict[str, Any],
+    readiness_row: dict[str, Any],
+    actionability: dict[str, Any],
+    *,
+    cfg: PipelineConfig,
+) -> list[dict[str, Any]]:
+    rows = []
+    if actionability.get("actionability_proof_source"):
+        rows.append(
+            _llm_evidence_row(
+                tribe_id,
+                evidence_rank=1,
+                evidence_type=str(actionability.get("evidence_type") or "actionability"),
+                proof_role="primary_actionability_proof",
+                label=actionability.get("label"),
+                customers=actionability.get("customers"),
+                tribe_reach_pct=actionability.get("tribe_reach_pct"),
+                lift_vs_rest=actionability.get("lift_vs_rest"),
+                q_value=actionability.get("q_value"),
+                evidence=actionability.get("actionability_proof"),
+                readiness_row=readiness_row,
+                actionability=actionability,
+            )
+        )
+
+    for product in _top_card_products(row, limit=5):
+        rows.append(
+            _llm_evidence_row(
+                tribe_id,
+                evidence_rank=int(product["rank"]),
+                evidence_type="lifted_product",
+                proof_role="primary_candidate",
+                label=product["product"],
+                customers=product["customers"],
+                tribe_reach_pct=product["reach_pct"],
+                lift_vs_rest=product["lift_vs_rest"],
+                q_value=_value_at(row.get("top_product_q_values"), int(product["rank"]) - 1),
+                evidence=_proof_signal_text(
+                    {
+                        "label": product["product"],
+                        "lift_vs_rest": product["lift_vs_rest"],
+                        "reach_pct": product["reach_pct"],
+                        "customers": product["customers"],
+                        "q_value": _value_at(row.get("top_product_q_values"), int(product["rank"]) - 1),
+                    }
+                ),
+                readiness_row=readiness_row,
+                actionability=actionability,
+            )
+        )
+
+    sector_lifts = row.get("top_sector_lifts_vs_rest") or row.get("top_sector_lifts") or []
+    for idx, sector in enumerate((row.get("top_sectors") or [])[:3], start=1):
+        rows.append(
+            _llm_evidence_row(
+                tribe_id,
+                evidence_rank=idx,
+                evidence_type="sector",
+                proof_role="supporting_category_context",
+                label=sector,
+                customers=_value_at(row.get("top_sector_line_counts"), idx - 1),
+                tribe_reach_pct=None,
+                lift_vs_rest=_value_at(sector_lifts, idx - 1),
+                q_value=_value_at(row.get("top_sector_q_values"), idx - 1),
+                evidence=f"{sector}: {_fmt_number(_value_at(sector_lifts, idx - 1))}x vs rest",
+                readiness_row=readiness_row,
+                actionability=actionability,
+            )
+        )
+
+    for idx, theme in enumerate(_supporting_curated_themes(row, limit=3), start=1):
+        rows.append(
+            _llm_evidence_row(
+                tribe_id,
+                evidence_rank=idx,
+                evidence_type="curated_theme",
+                proof_role="supplemental_curated_theme_context",
+                label=theme["theme_label"],
+                customers=theme["customers"],
+                tribe_reach_pct=theme["reach_pct"],
+                lift_vs_rest=theme["lift_vs_rest"],
+                q_value=theme["q_value"],
+                evidence=theme.get("product_evidence") or theme["theme_label"],
+                readiness_row=readiness_row,
+                actionability=actionability,
+            )
+        )
+    return rows
+
+
+def _llm_evidence_row(
+    tribe_id: int,
+    *,
+    evidence_rank: int,
+    evidence_type: str,
+    proof_role: str,
+    label: Any,
+    customers: Any,
+    tribe_reach_pct: Any,
+    lift_vs_rest: Any,
+    q_value: Any,
+    evidence: Any,
+    readiness_row: dict[str, Any],
+    actionability: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "tribe_id": tribe_id,
+        "evidence_rank": evidence_rank,
+        "evidence_type": evidence_type,
+        "proof_role": proof_role,
+        "label": _repair_display_text(str(label)) if label is not None else None,
+        "customers": int(_safe_float(customers) or 0) if customers is not None else None,
+        "tribe_reach_pct": _safe_float(tribe_reach_pct),
+        "lift_vs_rest": _safe_float(lift_vs_rest),
+        "q_value": _safe_float(q_value),
+        "profiling_readiness": readiness_row.get("profiling_readiness"),
+        "actionability_proof_source": actionability.get("actionability_proof_source"),
+        "actionability_proof": actionability.get("actionability_proof"),
+        "evidence": _repair_display_text(str(evidence)) if evidence is not None else None,
+    }
 
 
 def _product_evidence_text(row: dict[str, Any], limit: int = 5) -> str:
@@ -1732,7 +2177,7 @@ def _final_story_markdown(final_index: pl.DataFrame, review_candidates: pl.DataF
         lines.append("No tribes were promoted into the final index.")
     else:
         lines.append(_markdown_table(final_index))
-    lines.extend(["", "## Review Candidates", ""])
+    lines.extend(["", "## Review Candidates", "", "Review candidates held out of the final tribe story remain auditable below.", ""])
     lines.append(_markdown_table(review_candidates) if not review_candidates.is_empty() else "No review candidates.")
     return "\n".join(lines) + "\n"
 
