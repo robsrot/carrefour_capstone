@@ -70,6 +70,7 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     two_stage = official["two_stage_hdbscan"]
     hdbscan = promoted["hdbscan"]
     second_stage = two_stage["second_stage_hdbscan"]
+    stage3_probe = two_stage["stage3_noise_probe"]
 
     assert base["modeling"]["feature_set_for_selection"] == "embeddings_only"
     assert base["product_exposure_features"]["dimensions"] == {
@@ -86,9 +87,8 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert base["customer_embeddings"]["weight_strategy"] == "quantity_idf"
     assert base["customer_embeddings"]["gates"]["min_line_coverage_pct"] == 85.0
     assert base["customer_embeddings"]["gates"]["min_unit_coverage_pct"] == 85.0
-    assert base["profiling"]["final_handoff_readiness_statuses"] == ["ready_strong", "ready"]
-    assert base["profiling"]["final_handoff_require_actionability_proof"] is True
-    assert base["profiling"]["final_handoff_require_theme_proof"] is False
+    assert base["profiling"]["final_handoff_readiness_statuses"] == ["strong", "usable", "ready_strong", "ready", "pass"]
+    assert base["profiling"]["tribe_name_lookup"] == {}
     assert base["profiling"]["final_actionability_allow_theme_proof"] is False
     assert official["include_umap_hdbscan"] is True
     assert official["include_gmm"] is False
@@ -108,6 +108,12 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert second_stage["min_cluster_size"] == 350
     assert second_stage["min_samples"] == 12
     assert second_stage["cluster_selection_method"] == "leaf"
+    assert stage3_probe["enabled"] is True
+    assert stage3_probe["run_candidate_hdbscan_after_visual_review"] is False
+    assert stage3_probe["hdbscan"]["allow_noise_assignment"] is False
+    assert stage3_probe["hdbscan"]["min_cluster_size"] < second_stage["min_cluster_size"]
+    assert stage3_probe["lift_filter"]["min_strong_product_lifts"] >= 2
+    assert stage3_probe["lift_filter"]["require_significant_product_lift"] is True
     assert "leaf_mcs500_ms12" in promoted["trial_name"]
     assert "leaf_mcs500_ms12" in promoted["variant_prefix"]
     assert "leaf_mcs500_ms12" in two_stage["trial_name"]
@@ -134,6 +140,7 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert "leaf_mcs5400_ms12" in prod_two_stage["variant_prefix"]
     assert prod_promoted["hdbscan"]["min_cluster_size"] == 5400
     assert prod_two_stage["second_stage_hdbscan"]["min_cluster_size"] == 3800
+    assert prod_two_stage["stage3_noise_probe"]["hdbscan"]["min_cluster_size"] < 3800
     assert prod_two_stage["second_stage_hdbscan"]["min_samples"] == 12
     assert "min_samples" not in prod_two_stage_overrides["second_stage_hdbscan"]
     assert "soft" not in prod_promoted["trial_name"].lower()

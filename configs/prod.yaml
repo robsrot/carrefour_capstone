@@ -33,6 +33,10 @@ official_model_suite:
     variant_prefix: two_stage_u20_n75_leaf_mcs5400_ms12
     second_stage_hdbscan:
       min_cluster_size: 3800
+    stage3_noise_probe:
+      min_noise_customers: 1000
+      hdbscan:
+        min_cluster_size: 1200
 
 hdbscan:
   # Prod raw-HDBSCAN diagnostics, if enabled, use a scaled minimum density share.

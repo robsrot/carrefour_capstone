@@ -11,8 +11,13 @@ from typing import Any
 import polars as pl
 
 from src.config import CONFIG, PipelineConfig
-from src.profiling import flatten_profiles_for_csv, profile_quality_summary
 from src.evaluation import quality_gate_result
+from src.profiling import (
+    PRODUCT_RANKING_BASIS,
+    flatten_profiles_for_csv,
+    profile_quality_summary,
+    stage68_artifact_paths,
+)
 from src.progress import log_event, stage_timer
 
 
@@ -48,6 +53,7 @@ def collect_cached_presentation_figures(
         ("Core Mission Lift Heatmap", f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
         ("Stage 6.6 PCA Projection", f"stage_06_6_winner_projection_pca.png"),
         ("Stage 6.6 UMAP Projection", f"stage_06_6_winner_projection_umap.png"),
+        ("Stage 6.7 Remaining Noise UMAP Probe", "stage6_7_remaining_noise_umap_probe.png"),
         ("Stage 9 PCA Projection", f"stage_09_final_projection_pca.png"),
         ("Stage 9 UMAP Projection", f"stage_09_final_projection_umap.png"),
     ]
@@ -80,6 +86,33 @@ def merge_stage9_figure_paths(*figure_maps: Mapping[str, Any] | None) -> dict[st
             merged[_unique_stage9_label(label, merged)] = path
             seen_paths.add(path_key)
     return merged
+
+
+def collect_cached_stage9_evidence_paths(*, cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
+    """Return final-handoff support exports that should appear in the Stage 9 manifest."""
+
+    support_dir = cfg.artifacts / "stage7" / "final_handoff" / "supporting_tables"
+    stage68_paths = stage68_artifact_paths(cfg)
+    candidates = {
+        "Stage 6.8 Tribe Evidence Manifest": stage68_paths["manifest_json"],
+        "Stage 6.8 Product Lift Table": stage68_paths["product_lifts_path"],
+        "Stage 6.8 Sector Lift Table": stage68_paths["sector_lifts_path"],
+        "Stage 6.8 Customer Metric Tests": stage68_paths["customer_metric_tests_csv"],
+        "Stage 6.8 Raw Transaction Export Directory": stage68_paths["transaction_export_dir"],
+        "Stage 6.8 Customer Summary Export Directory": stage68_paths["customer_export_dir"],
+        "Noise Vs Core Customer Metric Diagnostic": (
+            support_dir / f"stage7_final_noise_vs_core_customer_metrics_{cfg.mode}.csv"
+        ),
+        "Per-Tribe Raw Transaction Export Manifest": (
+            support_dir / "tribe_raw_transactions" / f"tribe_raw_transactions_manifest_{cfg.mode}.csv"
+        ),
+        "Per-Tribe Raw Transaction Export Directory": support_dir / "tribe_raw_transactions",
+        "Per-Tribe Customer Summary Export Manifest": (
+            support_dir / "tribe_customer_summaries" / f"tribe_customer_summaries_manifest_{cfg.mode}.csv"
+        ),
+        "Per-Tribe Customer Summary Export Directory": support_dir / "tribe_customer_summaries",
+    }
+    return {label: path for label, path in candidates.items() if path.exists()}
 
 
 def build_model_comparison(
@@ -479,6 +512,10 @@ def write_stage9_presentation_pack(
         collect_cached_presentation_figures(cfg=cfg),
         figure_paths or {},
     )
+    evidence_for_manifest = {
+        **collect_cached_stage9_evidence_paths(cfg=cfg),
+        **(evidence_paths or {}),
+    }
     manifest = _stage9_artifact_manifest(
         core_summary_path=core_summary_path,
         mission_summary_path=mission_summary_path,
@@ -486,7 +523,7 @@ def write_stage9_presentation_pack(
         assignment_path=assignment_path,
         profile_path=profile_path,
         figure_paths=figures_for_manifest,
-        evidence_paths=evidence_paths or {},
+        evidence_paths=evidence_for_manifest,
         base_dir=out_dir,
     )
     manifest.write_csv(manifest_output)
@@ -561,7 +598,7 @@ def _stage9_artifact_manifest(
     for label, path in _flatten_stage9_paths(figure_paths):
         rows.append(_stage9_artifact_row("presentation visual", label, path, base_dir))
     for label, path in _flatten_stage9_paths(evidence_paths):
-        rows.append(_stage9_artifact_row("evidence", label, path, base_dir))
+        rows.append(_stage9_artifact_row(_stage9_tier_for_extra_artifact(label), label, path, base_dir))
     return pl.DataFrame(rows)
 
 
@@ -618,6 +655,13 @@ def _unique_stage9_label(label: str, existing: Mapping[str, Any]) -> str:
     return f"{base} {idx}"
 
 
+def _stage9_tier_for_extra_artifact(label: str) -> str:
+    text = label.lower()
+    if "raw transaction export" in text or "customer summary export" in text:
+        return "official export"
+    return "evidence"
+
+
 def _cached_stage9_figure_label(path: Path, cfg: PipelineConfig) -> str:
     stem = path.stem
     mode_suffix = f"_{cfg.mode}"
@@ -641,6 +685,26 @@ def _cached_stage9_figure_label(path: Path, cfg: PipelineConfig) -> str:
 
 def _stage9_purpose_for_label(label: str, tier: str) -> str:
     text = label.lower()
+    if "raw transaction export" in text:
+        return "Analyst per-tribe prepared transaction-line parquet exports with tribe_id and assignment confidence attached."
+    if "customer summary export" in text:
+        return "Analyst per-tribe customer-level KPI parquet exports with tribe_id and assignment confidence attached."
+    if "noise vs core" in text:
+        return "Noise population diagnostic comparing behavioral KPIs against assigned core customers; profiling context only."
+    if "stage 6.8" in text and "manifest" in text:
+        return "Cache manifest for the precomputed tribe evidence bundle consumed by Stage 7."
+    if "stage 6.8" in text and "product lift" in text:
+        return "Full tribe-by-product lift table precomputed before Stage 7 interpretation."
+    if "stage 6.8" in text and "sector lift" in text:
+        return "Full tribe-by-sector lift table precomputed before Stage 7 interpretation."
+    if "stage 6.8" in text and "customer metric" in text:
+        return "Precomputed customer-level behavioral ANOVA table for Stage 7 and appendix review."
+    if "stage 6.8" in text and "raw transaction" in text:
+        return "Analyst per-tribe prepared transaction-line parquet exports written before Stage 7."
+    if "stage 6.8" in text and "customer summary" in text:
+        return "Analyst per-tribe customer-level behavioral summary parquet exports written before Stage 7."
+    if "remaining noise" in text and "umap probe" in text:
+        return "Visual review of remaining HDBSCAN noise before any optional candidate-only third clustering pass."
     if "core tribe summary" in text:
         return "First read: compact list of organic core tribes, sizes, soft-assignment share, and product evidence."
     if "shopping mission" in text:
@@ -698,6 +762,7 @@ def _stage9_storyboard_markdown(
         "4. **Evidence backup**: the atlas and evidence folder show the products, themes, terms, and confidence behind the claims.",
         "",
         "Labels are purchase-behavior summaries, not demographic, religious, household, or identity claims.",
+        PRODUCT_RANKING_BASIS,
         "",
         "## Core Tribe Preview",
         "",
@@ -784,6 +849,7 @@ a:hover {{ text-decoration: underline; }}
 <h1>Stage 9 Tribe and Shopping Mission Storyboard</h1>
 <p class="muted">Run mode: {escape(str(cfg.mode))}. Model: {escape(str(selected.get('model_name')))} ({escape(str(selected.get('model_variant')))}).</p>
 <p class="muted">Labels are purchase-behavior summaries, not demographic, religious, household, or identity claims.</p>
+<p class="muted">{escape(PRODUCT_RANKING_BASIS)}</p>
 <div class="snapshot">
 <div class="metric">Core tribes<strong>{stats.get('core_tribes')}</strong></div>
 <div class="metric">Assigned customers<strong>{int(stats.get('assigned_customers') or 0):,}</strong></div>

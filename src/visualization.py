@@ -1445,6 +1445,271 @@ def plot_stage6_umap_representation(
     return path
 
 
+def plot_stage6_noise_umap_probe(
+    umap_path: str | Path,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot the first two dimensions of the remaining-noise-only UMAP probe."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path) if output_path else cfg.figures / "stage6_7_remaining_noise_umap_probe.png"
+    umap_df = pl.read_parquet(umap_path)
+    umap_cols = [col for col in numeric_feature_columns(umap_df) if col.startswith("umap_")]
+    if len(umap_cols) < 2:
+        raise ValueError(f"Noise UMAP probe needs at least two numeric components for plotting: {umap_path}")
+    sample = _sample_frame(umap_df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
+
+    fig, ax = plt.subplots(figsize=(7.4, 5.8))
+    ax.scatter(
+        sample[umap_cols[0]].to_numpy(),
+        sample[umap_cols[1]].to_numpy(),
+        s=4,
+        color=_color("neutral"),
+        alpha=0.34,
+        linewidths=0,
+    )
+    ax.set_title("Stage 6.7 Remaining-Noise UMAP Probe")
+    ax.set_xlabel(umap_cols[0])
+    ax.set_ylabel(umap_cols[1])
+    ax.grid(alpha=0.22)
+    ax.text(
+        0.02,
+        -0.14,
+        "Visual review only: run HDBSCAN only if coherent sub-structure is visible.",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8.5,
+        color=_color("subtle_text"),
+    )
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 6.7 figures", "wrote remaining-noise UMAP probe")
+    plt.close(fig)
+    return path
+
+
+def plot_stage68_evidence_overview(
+    profile_path: str | Path,
+    *,
+    noise_vs_core_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot the compact Stage 6.8 evidence handoff without reopening raw inputs."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    output = (
+        Path(output_path)
+        if output_path
+        else cfg.figures / f"stage6_8_tribe_evidence_overview_{cfg.mode}.png"
+    )
+    if profiles.is_empty():
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.text(0.5, 0.5, "No Stage 6.8 tribe evidence available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        path = _save_figure(fig, output, cfg, "Stage 6.8 figures", "wrote empty evidence overview")
+        plt.close(fig)
+        return path
+
+    rows = [dict(row) for row in profiles.iter_rows(named=True)]
+    tribe_labels = [f"T{int(row.get('tribe_id'))}" for row in rows]
+    customers = np.array([float(row.get("n_customers") or 0.0) for row in rows], dtype=float)
+    noise_customers = _first_numeric_profile_value(
+        profiles,
+        ["unassigned_noise_customers_global", "profile_noise_customers", "noise_customers"],
+    )
+
+    max_product_lift = np.array(
+        [_max_numeric_list(row.get("top_product_lifts_vs_rest") or row.get("top_product_lifts")) for row in rows],
+        dtype=float,
+    )
+    top_product_reach = np.array([_max_numeric_list(row.get("top_product_reach_pct")) for row in rows], dtype=float)
+    strong_threshold = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+
+    behavior_fields = [
+        ("avg_ticket_count", "Tickets"),
+        ("avg_unique_products", "Products"),
+        ("avg_frequency_per_30d", "Frequency"),
+        ("avg_basket_value", "Basket value"),
+        ("avg_promo_share", "Promo share"),
+        ("mean_recency_days", "Recency"),
+    ]
+    behavior_fields = [(col, label) for col, label in behavior_fields if col in profiles.columns]
+    behavior_matrix = _weighted_behavior_ratio_matrix(rows, customers, behavior_fields)
+
+    noise_rows = _read_noise_vs_core_rows(noise_vs_core_path)
+
+    fig, axes = plt.subplots(2, 2, figsize=(15.5, 9.5))
+    ax_size, ax_lift, ax_behavior, ax_noise = axes.ravel()
+
+    size_labels = [*tribe_labels, "Unassigned\nnoise"] if noise_customers else tribe_labels
+    size_values = [*customers.tolist(), float(noise_customers)] if noise_customers else customers.tolist()
+    size_colors = [_color("secondary")] * len(tribe_labels) + ([_color("neutral")] if noise_customers else [])
+    ax_size.bar(np.arange(len(size_labels)), size_values, color=size_colors)
+    ax_size.set_title("Assigned Tribe Customers And Remaining Noise")
+    ax_size.set_xticks(np.arange(len(size_labels)))
+    ax_size.set_xticklabels(size_labels)
+    ax_size.set_ylabel("Customers")
+    ax_size.grid(axis="y", alpha=0.22)
+
+    x = np.arange(len(tribe_labels))
+    ax_lift.bar(x, max_product_lift, color=EVIDENCE_COLORS["Product"], label="max lift vs rest")
+    ax_lift_twin = ax_lift.twinx()
+    ax_lift_twin.plot(x, top_product_reach, color=_color("line"), marker="o", linewidth=1.5, label="max reach")
+    ax_lift.axhline(strong_threshold, color=_color("warning"), linewidth=1, linestyle="--")
+    ax_lift.set_title("Product Evidence Strength")
+    ax_lift.set_xticks(x)
+    ax_lift.set_xticklabels(tribe_labels)
+    ax_lift.set_ylabel("Max product lift vs rest")
+    ax_lift_twin.set_ylabel("Max product reach %")
+    ax_lift.grid(axis="y", alpha=0.22)
+
+    if behavior_fields and behavior_matrix.size:
+        image = ax_behavior.imshow(
+            behavior_matrix,
+            aspect="auto",
+            cmap=DIVERGING_CMAP,
+            vmin=0.5,
+            vmax=1.5,
+        )
+        ax_behavior.set_title("Behavior KPIs Vs Assigned Population")
+        ax_behavior.set_xticks(np.arange(len(behavior_fields)))
+        ax_behavior.set_xticklabels([label for _, label in behavior_fields], rotation=35, ha="right")
+        ax_behavior.set_yticks(np.arange(len(tribe_labels)))
+        ax_behavior.set_yticklabels(tribe_labels)
+        fig.colorbar(image, ax=ax_behavior, fraction=0.046, pad=0.04, label="ratio")
+    else:
+        ax_behavior.text(0.5, 0.5, "No behavioral KPI columns found.", ha="center", va="center")
+        ax_behavior.axis("off")
+
+    if noise_rows:
+        metric_labels = [shorten(row["label"], width=18, placeholder="...") for row in noise_rows]
+        ratios = np.array([row["ratio"] for row in noise_rows], dtype=float)
+        y = np.arange(len(noise_rows))
+        colors = [_color("secondary") if value >= 1.0 else _color("neutral") for value in ratios]
+        ax_noise.barh(y, ratios, color=colors)
+        ax_noise.axvline(1.0, color=_color("line"), linewidth=1, linestyle="--")
+        ax_noise.set_yticks(y)
+        ax_noise.set_yticklabels(metric_labels)
+        ax_noise.set_xlabel("Noise / core mean")
+        ax_noise.set_title("Noise Population Behavioral Profile")
+        ax_noise.grid(axis="x", alpha=0.22)
+    else:
+        ax_noise.text(0.5, 0.5, "Noise-vs-core metrics unavailable.", ha="center", va="center")
+        ax_noise.axis("off")
+
+    fig.suptitle("Stage 6.8 Tribe Evidence Assembly Overview", fontsize=14)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    path = _save_figure(fig, output, cfg, "Stage 6.8 figures", "wrote tribe evidence overview")
+    plt.close(fig)
+    return path
+
+
+def _first_numeric_profile_value(profiles: pl.DataFrame, columns: Sequence[str]) -> int:
+    for column in columns:
+        if column not in profiles.columns:
+            continue
+        values = [
+            float(value)
+            for value in profiles[column].drop_nulls().to_list()
+            if value is not None and math.isfinite(float(value))
+        ]
+        if values:
+            return int(round(values[0]))
+    return 0
+
+
+def _max_numeric_list(values: Any) -> float:
+    if values is None:
+        return 0.0
+    if not isinstance(values, (list, tuple, np.ndarray)):
+        values = [values]
+    cleaned: list[float] = []
+    for value in values:
+        if value is None:
+            continue
+        numeric = float(value)
+        if math.isfinite(numeric):
+            cleaned.append(numeric)
+    return max(cleaned) if cleaned else 0.0
+
+
+def _weighted_behavior_ratio_matrix(
+    rows: list[dict[str, Any]],
+    weights: np.ndarray,
+    fields: list[tuple[str, str]],
+) -> np.ndarray:
+    matrix = np.empty((len(rows), len(fields)), dtype=float)
+    matrix[:] = np.nan
+    for col_idx, (column, _) in enumerate(fields):
+        values = np.array(
+            [
+                np.nan if row.get(column) is None else float(row.get(column))
+                for row in rows
+            ],
+            dtype=float,
+        )
+        valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+        if not valid.any():
+            continue
+        population_mean = float(np.average(values[valid], weights=weights[valid]))
+        if abs(population_mean) < 1e-12:
+            continue
+        matrix[:, col_idx] = values / population_mean
+    return matrix
+
+
+def _read_noise_vs_core_rows(noise_vs_core_path: str | Path | None) -> list[dict[str, Any]]:
+    if noise_vs_core_path is None or not Path(noise_vs_core_path).exists():
+        return []
+    frame = pl.read_csv(noise_vs_core_path)
+    if frame.is_empty() or "noise_vs_core_ratio" not in frame.columns:
+        return []
+    preferred = [
+        "ticket_count",
+        "frequency_per_30d",
+        "basket_value",
+        "total_spend",
+        "unique_products",
+        "recency_days",
+        "promo_share",
+    ]
+    label_map = {
+        "ticket_count": "Tickets",
+        "frequency_per_30d": "Frequency",
+        "basket_value": "Basket value",
+        "total_spend": "Total spend",
+        "unique_products": "Products",
+        "recency_days": "Recency",
+        "promo_share": "Promo share",
+    }
+    rows = []
+    for metric in preferred:
+        metric_frame = frame.filter(pl.col("metric") == metric)
+        if metric_frame.is_empty():
+            continue
+        row = metric_frame.row(0, named=True)
+        ratio = row.get("noise_vs_core_ratio")
+        if ratio is None or not math.isfinite(float(ratio)):
+            continue
+        rows.append({"label": label_map.get(metric, metric), "ratio": float(ratio)})
+    if rows:
+        return rows
+    for row in frame.head(7).iter_rows(named=True):
+        ratio = row.get("noise_vs_core_ratio")
+        if ratio is None or not math.isfinite(float(ratio)):
+            continue
+        rows.append({"label": str(row.get("metric") or "metric"), "ratio": float(ratio)})
+    return rows
+
+
 def plot_stage6_hdbscan_assignment_map(
     umap_path: str | Path,
     assignment_path: str | Path,
@@ -2559,7 +2824,10 @@ def plot_experiment8_shortlist_cluster_sizes(
         profiles = pl.read_parquet(str(item["profile_path"])).sort("tribe_id")
         tribe_labels = [str(value) for value in profiles["tribe_id"].to_list()]
         counts = profiles["n_customers"].to_list()
-        noise = int(profiles[0, "profile_noise_customers"]) if profiles.height and "profile_noise_customers" in profiles.columns else 0
+        noise = _first_numeric_profile_value(
+            profiles,
+            ["unassigned_noise_customers_global", "profile_noise_customers", "noise_customers"],
+        )
         labels = [*tribe_labels, "noise"] if noise else tribe_labels
         values = [*counts, noise] if noise else counts
         colors = [_color("secondary")] * len(tribe_labels) + ([_color("muted")] if noise else [])

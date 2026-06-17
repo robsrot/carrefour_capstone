@@ -392,6 +392,49 @@ def official_two_stage_hdbscan_settings(cfg: PipelineConfig = CONFIG) -> dict[st
     }
 
 
+def stage3_noise_probe_settings(cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
+    """Return settings for a candidate-only HDBSCAN pass over remaining official noise."""
+
+    settings = official_two_stage_hdbscan_settings(cfg)
+    probe = cfg.get("official_model_suite.two_stage_hdbscan.stage3_noise_probe", {}) or {}
+    hdbscan_overrides = {
+        **dict(settings["second_stage_overrides"]),
+        **dict(probe.get("hdbscan", {}) or {}),
+    }
+    if bool(hdbscan_overrides.get("allow_noise_assignment", False)):
+        raise ValueError(
+            "Stage 3 remaining-noise probe must keep HDBSCAN noise unassigned. "
+            "Set official_model_suite.two_stage_hdbscan.stage3_noise_probe.hdbscan.allow_noise_assignment=false."
+        )
+    hdbscan_overrides["allow_noise_assignment"] = False
+    hdbscan_overrides.pop("noise_assignment_strategy", None)
+    umap_overrides = {
+        **dict(settings["base"]["umap_overrides"]),
+        **dict(probe.get("umap", {}) or {}),
+    }
+    output_prefix = str(probe.get("output_prefix", f"{settings['output_prefix']}_stage3_remaining_noise_probe"))
+    return {
+        "enabled": bool(probe.get("enabled", False)),
+        "base": settings,
+        "probe": probe,
+        "trial_cfg": _config_with_section_overrides(cfg, "hdbscan", hdbscan_overrides),
+        "umap_overrides": umap_overrides,
+        "hdbscan_overrides": hdbscan_overrides,
+        "pca_components": int(probe.get("pca_components", settings["base"].get("pca_components", 64))),
+        "min_noise_customers": int(probe.get("min_noise_customers", hdbscan_overrides.get("min_cluster_size", 2))),
+        "model_name": str(probe.get("model_name", f"{settings['model_name']}_stage3_noise_probe")),
+        "output_prefix": output_prefix,
+        "trial_name": str(probe.get("trial_name", output_prefix)),
+        "variant_prefix": str(probe.get("variant_prefix", output_prefix)),
+        "algorithm_name": str(probe.get("algorithm_name", "UMAP_HDBSCAN_Stage3RemainingNoise")),
+        "feature_space": str(probe.get("feature_space", "remaining_noise_umap_customer_embeddings")),
+        "lift_filter": {
+            **dict(settings["lift_filter"]),
+            **dict(probe.get("lift_filter", {}) or {}),
+        },
+    }
+
+
 def two_stage_hdbscan_artifact_paths(
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
@@ -412,6 +455,26 @@ def two_stage_hdbscan_artifact_paths(
         "unfiltered_profile_path": cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}_unfiltered.parquet",
         "lift_evidence_path": lift_evidence_path,
         "lift_evidence_csv_path": lift_evidence_path.with_suffix(".csv"),
+    }
+
+
+def stage3_noise_probe_artifact_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
+    settings = stage3_noise_probe_settings(cfg)
+    output_prefix = settings["output_prefix"]
+    return {
+        "noise_feature_path": cfg.model_selection_cache / f"{output_prefix}_remaining_noise_features.parquet",
+        "noise_pca_path": cfg.outputs / "features" / f"{output_prefix}_pca.parquet",
+        "noise_pca_summary_path": cfg.artifacts / "stage6" / f"{output_prefix}_pca_summary.csv",
+        "noise_umap_path": cfg.outputs / "features" / f"{output_prefix}_umap.parquet",
+        "noise_umap_summary_path": cfg.artifacts / "stage6" / f"{output_prefix}_umap_probe_summary.csv",
+        "diagnostics_path": cfg.artifacts / "stage6" / "stage6_7_remaining_noise_probe_diagnostics.csv",
+        "assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}.parquet",
+        "results_path": cfg.model_selection_cache / f"{output_prefix}_results.parquet",
+        "candidate_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_lift_candidates.parquet",
+        "candidate_results_path": cfg.model_selection_cache / f"{output_prefix}_lift_candidate_results.parquet",
+        "profile_path": cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}.parquet",
+        "lift_evidence_path": cfg.artifacts / "stage6" / f"{output_prefix}_lift_filter_evidence.parquet",
+        "lift_evidence_csv_path": cfg.artifacts / "stage6" / f"{output_prefix}_lift_filter_evidence.csv",
     }
 
 
@@ -521,6 +584,265 @@ def run_official_two_stage_hdbscan_second_pass(
         cfg=settings["second_stage_cfg"],
     )
     return noise_feature_path, noise_rows, stage2_assignment, stage2_results, stage2_best
+
+
+def build_stage6_stage3_noise_umap_probe(
+    feature_path: str | Path,
+    assignment_path: str | Path,
+    *,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Any]:
+    """Build a noise-only UMAP artifact for visual review before any third-pass clustering."""
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = stage3_noise_probe_settings(cfg)
+    if not settings["enabled"]:
+        raise RuntimeError("Stage 3 remaining-noise probe is disabled in config.")
+    paths = stage3_noise_probe_artifact_paths(cfg)
+    noise_rows = _write_remaining_noise_feature_subset(
+        feature_path,
+        assignment_path,
+        paths["noise_feature_path"],
+        cfg=cfg,
+    )
+    status = (
+        "ready_for_visual_review"
+        if noise_rows >= max(int(settings["min_noise_customers"]), 3)
+        else "skipped_insufficient_remaining_noise"
+    )
+    row: dict[str, Any] = {
+        "stage": "6.7_remaining_noise_umap_probe",
+        "status": status,
+        "noise_customers": int(noise_rows),
+        "min_noise_customers": int(settings["min_noise_customers"]),
+        "source_feature_path": str(feature_path),
+        "source_assignment_path": str(assignment_path),
+        "noise_feature_path": str(paths["noise_feature_path"]),
+        "noise_pca_path": None,
+        "noise_umap_path": None,
+        "visual_review_required_before_hdbscan": True,
+        "recommendation": (
+            "Plot the UMAP artifact. Run stage3 HDBSCAN only if visible sub-structure is present."
+            if status == "ready_for_visual_review"
+            else "Stop: not enough remaining noise customers for a responsible third-pass probe."
+        ),
+    }
+    if status == "ready_for_visual_review":
+        pca_path = build_pca_representation(
+            paths["noise_feature_path"],
+            output_path=paths["noise_pca_path"],
+            summary_path=paths["noise_pca_summary_path"],
+            n_components=settings["pca_components"],
+            force=force,
+            cfg=cfg,
+        )
+        umap_path = build_umap_representation(
+            pca_path,
+            output_path=paths["noise_umap_path"],
+            umap_overrides=settings["umap_overrides"],
+            force=force,
+            cfg=settings["trial_cfg"],
+        )
+        row["noise_pca_path"] = str(pca_path)
+        row["noise_umap_path"] = str(umap_path)
+
+    paths["noise_umap_summary_path"].parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([row]).write_csv(paths["noise_umap_summary_path"])
+    write_artifact_metadata(
+        paths["noise_umap_summary_path"],
+        {
+            "stage": "stage6_7_remaining_noise_umap_probe",
+            "mode": cfg.mode,
+            "feature_path": file_fingerprint(feature_path),
+            "assignment_path": file_fingerprint(assignment_path),
+            "settings": settings["probe"],
+        },
+    )
+    result = {**paths, **row}
+    result["summary_csv"] = paths["noise_umap_summary_path"]
+    return result
+
+
+def run_stage6_stage3_noise_hdbscan_lift_probe(
+    feature_path: str | Path,
+    assignment_path: str | Path,
+    *,
+    transactions: Any = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Any]:
+    """Run candidate-only hard HDBSCAN over remaining noise, then apply the product-lift gate."""
+
+    from src.profiling import profile_tribes
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = stage3_noise_probe_settings(cfg)
+    if not settings["enabled"]:
+        raise RuntimeError("Stage 3 remaining-noise probe is disabled in config.")
+    paths = stage3_noise_probe_artifact_paths(cfg)
+    probe = build_stage6_stage3_noise_umap_probe(feature_path, assignment_path, force=force, cfg=cfg)
+    if probe["status"] != "ready_for_visual_review":
+        skipped = _stage3_noise_probe_result_row(settings, paths, probe, status="skipped")
+        pl.DataFrame([skipped]).write_parquet(paths["candidate_results_path"])
+        return {**paths, "result": skipped, "umap_probe": probe}
+
+    raw_assignment_path, raw_results_path, raw_best = run_hdbscan(
+        probe["noise_umap_path"],
+        output_prefix=settings["output_prefix"],
+        model_label="Model D Stage 3",
+        model_name=settings["model_name"],
+        algorithm_name=settings["algorithm_name"],
+        feature_space=settings["feature_space"],
+        trial_name=settings["trial_name"],
+        variant_prefix=settings["variant_prefix"],
+        scale_features=False,
+        force=force,
+        allow_noise_assignment=False,
+        cfg=settings["trial_cfg"],
+    )
+    profile_path = profile_tribes(
+        raw_assignment_path,
+        transactions=transactions,
+        output_path=paths["profile_path"],
+        force=force,
+        enable_copurchase=False,
+        enable_temporal=False,
+        enable_loyalty=False,
+        enable_llm=False,
+        cfg=cfg,
+    )
+    lift_evidence = _product_lift_filter_evidence(pl.read_parquet(profile_path), settings["lift_filter"], cfg=cfg)
+    paths["lift_evidence_path"].parent.mkdir(parents=True, exist_ok=True)
+    lift_evidence.write_parquet(paths["lift_evidence_path"])
+    _lift_evidence_csv_frame(lift_evidence).write_csv(paths["lift_evidence_csv_path"])
+    raw_assignments = pl.read_parquet(raw_assignment_path)
+    candidate_assignments, lift_stats = _apply_lift_filter_to_assignments(
+        raw_assignments,
+        lift_evidence,
+        rejected_source="stage3_remaining_noise_lift_rejected",
+    )
+    paths["candidate_assignment_path"].parent.mkdir(parents=True, exist_ok=True)
+    candidate_assignments.write_parquet(paths["candidate_assignment_path"])
+    metrics, confidence_mean = _evaluate_assignment_on_umap(probe["noise_umap_path"], candidate_assignments, cfg=settings["trial_cfg"])
+    passes_gate, gate_reason = quality_gate_result(metrics, cfg=settings["trial_cfg"])
+    result = _stage3_noise_probe_result_row(
+        settings,
+        paths,
+        probe,
+        status="hdbscan_lift_filter_complete",
+        raw_best=raw_best,
+        metrics=metrics,
+        confidence_mean=confidence_mean,
+        lift_stats=lift_stats,
+        passes_gate=passes_gate,
+        gate_reason=gate_reason,
+        raw_assignment_path=raw_assignment_path,
+        raw_results_path=raw_results_path,
+    )
+    pl.DataFrame([result]).write_parquet(paths["candidate_results_path"])
+    write_artifact_metadata(paths["candidate_assignment_path"], {"stage": "stage3_remaining_noise_lift_candidates", "mode": cfg.mode})
+    write_artifact_metadata(paths["candidate_results_path"], {"stage": "stage3_remaining_noise_lift_candidates", "mode": cfg.mode})
+    return {**paths, "result": result, "umap_probe": probe}
+
+
+def build_stage6_remaining_noise_probe_diagnostics(
+    probe: dict[str, Any],
+    candidate_probe: dict[str, Any] | None = None,
+    *,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Write the notebook-facing Stage 6.7 remaining-noise probe status table."""
+
+    cfg.ensure_directories()
+    paths = stage3_noise_probe_artifact_paths(cfg)
+    output = Path(output_path) if output_path else paths["diagnostics_path"]
+    candidate_result = dict((candidate_probe or {}).get("result") or {}) if candidate_probe else {}
+    probe_status = str(probe.get("status") or "not_run")
+    candidate_status = str(candidate_result.get("status") or "not_run_visual_review_pending")
+    candidate_hdbscan_run = candidate_status == "hdbscan_lift_filter_complete"
+    remaining_noise_customers = int(
+        candidate_result.get("remaining_noise_customers")
+        or probe.get("noise_customers")
+        or 0
+    )
+    lift_supported = int(candidate_result.get("lift_supported_candidate_tribes") or 0)
+    row = {
+        "stage": "6.7_remaining_noise_structure_probe",
+        "section": "Stage 6.7",
+        "status": candidate_status if candidate_probe else probe_status,
+        "remaining_noise_customers": remaining_noise_customers,
+        "min_noise_customers": int(probe.get("min_noise_customers") or stage3_noise_probe_settings(cfg)["min_noise_customers"]),
+        "noise_feature_path": str(probe.get("noise_feature_path") or paths["noise_feature_path"]),
+        "noise_umap_path": str(probe.get("noise_umap_path") or "") or None,
+        "noise_umap_summary_path": str(probe.get("summary_csv") or paths["noise_umap_summary_path"]),
+        "visual_review_required_before_hdbscan": bool(probe.get("visual_review_required_before_hdbscan", True)),
+        "visual_review_status": _stage6_remaining_noise_visual_review_status(
+            probe_status,
+            candidate_hdbscan_run=candidate_hdbscan_run,
+        ),
+        "candidate_hdbscan_run": candidate_hdbscan_run,
+        "candidate_hdbscan_status": candidate_status,
+        "candidate_only_not_merged": True,
+        "official_assignment_changed": False,
+        "soft_assignment_enabled": bool(candidate_result.get("soft_assignment_enabled") or False),
+        "stage3_raw_cluster_count": int(candidate_result.get("stage3_raw_cluster_count") or 0),
+        "stage3_raw_noise_pct": candidate_result.get("stage3_raw_noise_pct"),
+        "lift_supported_candidate_tribes": lift_supported,
+        "lift_rejected_candidate_tribes": int(candidate_result.get("lift_rejected_candidate_tribes") or 0),
+        "lift_rejected_customers": int(candidate_result.get("lift_rejected_customers") or 0),
+        "candidate_assignment_path": candidate_result.get("assignment_path"),
+        "candidate_results_path": candidate_result.get("result_path"),
+        "recommendation": _stage6_remaining_noise_recommendation(
+            probe_status,
+            candidate_hdbscan_run=candidate_hdbscan_run,
+            lift_supported_candidate_tribes=lift_supported,
+        ),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([row]).write_csv(output)
+    write_artifact_metadata(
+        output,
+        {
+            "stage": "stage6_7_remaining_noise_structure_probe",
+            "mode": cfg.mode,
+            "noise_umap_summary": file_fingerprint(probe.get("summary_csv") or paths["noise_umap_summary_path"]),
+            "candidate_results": file_fingerprint(candidate_result.get("result_path")) if candidate_result else None,
+        },
+    )
+    return output
+
+
+def _stage6_remaining_noise_visual_review_status(
+    probe_status: str,
+    *,
+    candidate_hdbscan_run: bool,
+) -> str:
+    if candidate_hdbscan_run:
+        return "reviewed_candidate_hdbscan_run"
+    if probe_status == "ready_for_visual_review":
+        return "pending_visual_review"
+    if probe_status == "skipped_insufficient_remaining_noise":
+        return "not_required_insufficient_remaining_noise"
+    return "not_available"
+
+
+def _stage6_remaining_noise_recommendation(
+    probe_status: str,
+    *,
+    candidate_hdbscan_run: bool,
+    lift_supported_candidate_tribes: int,
+) -> str:
+    if probe_status == "skipped_insufficient_remaining_noise":
+        return "Stop: remaining noise is below the configured minimum for a responsible third-pass probe."
+    if not candidate_hdbscan_run:
+        return "Review the noise-only UMAP plot; run candidate HDBSCAN only if coherent sub-structure is visible."
+    if lift_supported_candidate_tribes > 0:
+        return "Candidate-only lifted structure found; review before any future promotion into official tribes."
+    return "Candidate HDBSCAN ran, but no lift-supported candidate tribes survived the product evidence gate."
 
 
 def merge_official_two_stage_hdbscan_lift_core(
@@ -934,16 +1256,33 @@ def _write_stage2_noise_feature_subset(
     output_path: str | Path,
     cfg: PipelineConfig,
 ) -> int:
+    return _write_remaining_noise_feature_subset(
+        umap_path,
+        stage1_assignment_path,
+        output_path,
+        cfg=cfg,
+        metadata_stage="two_stage_hdbscan_noise_feature_subset",
+    )
+
+
+def _write_remaining_noise_feature_subset(
+    feature_path: str | Path,
+    assignment_path: str | Path,
+    output_path: str | Path,
+    *,
+    cfg: PipelineConfig,
+    metadata_stage: str = "remaining_noise_feature_subset",
+) -> int:
     output = Path(output_path)
-    umap = pl.read_parquet(umap_path).sort("cliente")
-    feature_cols = numeric_feature_columns(umap)
+    features = pl.read_parquet(feature_path).sort("cliente")
+    feature_cols = numeric_feature_columns(features)
     assignments = (
-        pl.read_parquet(stage1_assignment_path)
+        pl.read_parquet(assignment_path)
         .select(["cliente", "tribe_id"])
         .unique(subset=["cliente"], keep="first")
     )
     noise_features = (
-        umap.join(assignments, on="cliente", how="left")
+        features.join(assignments, on="cliente", how="left")
         .with_columns(pl.col("tribe_id").fill_null(-1).cast(pl.Int32))
         .filter(pl.col("tribe_id") < 0)
         .select(["cliente", *feature_cols])
@@ -954,13 +1293,69 @@ def _write_stage2_noise_feature_subset(
     write_artifact_metadata(
         output,
         {
-            "stage": "two_stage_hdbscan_noise_feature_subset",
+            "stage": metadata_stage,
             "mode": cfg.mode,
-            "umap_path": file_fingerprint(umap_path),
-            "stage1_assignment_path": file_fingerprint(stage1_assignment_path),
+            "feature_path": file_fingerprint(feature_path),
+            "assignment_path": file_fingerprint(assignment_path),
         },
     )
     return noise_features.height
+
+
+def _stage3_noise_probe_result_row(
+    settings: dict[str, Any],
+    paths: dict[str, Path],
+    probe: dict[str, Any],
+    *,
+    status: str,
+    raw_best: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+    confidence_mean: float | None = None,
+    lift_stats: dict[str, int] | None = None,
+    passes_gate: bool | None = None,
+    gate_reason: str | None = None,
+    raw_assignment_path: str | Path | None = None,
+    raw_results_path: str | Path | None = None,
+) -> dict[str, Any]:
+    raw_best = raw_best or {}
+    metrics = metrics or {}
+    lift_stats = lift_stats or {"kept_cluster_count": 0, "rejected_cluster_count": 0, "rejected_customer_count": 0}
+    return {
+        "model": "Model D Stage 3",
+        "model_id": settings["model_name"],
+        "model_name": settings["model_name"],
+        "algorithm_name": settings["algorithm_name"],
+        "model_variant": settings["variant_prefix"],
+        "feature_space": settings["feature_space"],
+        "trial_name": settings["trial_name"],
+        "stage": "stage3_remaining_noise_hdbscan_lift_probe",
+        "status": status,
+        "promotion_status": "candidate_only_not_merged",
+        "assignment_policy": "hard_stage3_remaining_noise_hdbscan_lift_candidates",
+        "soft_assignment_enabled": False,
+        "soft_assignment_strategy": None,
+        "soft_assigned_customers": 0,
+        "soft_assigned_pct": 0.0,
+        "remaining_noise_customers": int(probe.get("noise_customers") or 0),
+        "stage3_raw_cluster_count": int(raw_best.get("cluster_count") or 0),
+        "stage3_raw_noise_pct": raw_best.get("noise_pct"),
+        "lift_supported_candidate_tribes": int(lift_stats.get("kept_cluster_count") or 0),
+        "lift_rejected_candidate_tribes": int(lift_stats.get("rejected_cluster_count") or 0),
+        "lift_rejected_customers": int(lift_stats.get("rejected_customer_count") or 0),
+        "avg_assignment_confidence": confidence_mean,
+        "passes_quality_gate": bool(passes_gate) if passes_gate is not None else False,
+        "quality_gate_reason": gate_reason or ("not_run" if status == "skipped" else "pass"),
+        "visual_review_summary_path": str(paths["noise_umap_summary_path"]),
+        "noise_umap_path": str(paths["noise_umap_path"]) if Path(paths["noise_umap_path"]).exists() else None,
+        "raw_stage3_assignment_path": str(raw_assignment_path) if raw_assignment_path else None,
+        "raw_stage3_result_path": str(raw_results_path) if raw_results_path else None,
+        "assignment_path": str(paths["candidate_assignment_path"]),
+        "result_path": str(paths["candidate_results_path"]),
+        "profile_path": str(paths["profile_path"]),
+        "lift_filter_evidence_path": str(paths["lift_evidence_path"]),
+        "stage6_flow": "stage3_remaining_noise_probe_candidate_only",
+        **metrics,
+    }
 
 
 def _assignment_stage_frame(path: str | Path | None, prefix: str) -> pl.DataFrame:
@@ -1158,6 +1553,8 @@ def _lift_evidence_csv_frame(evidence: pl.DataFrame) -> pl.DataFrame:
 def _apply_lift_filter_to_assignments(
     assignments: pl.DataFrame,
     lift_evidence: pl.DataFrame,
+    *,
+    rejected_source: str = "two_stage_hdbscan_lift_rejected",
 ) -> tuple[pl.DataFrame, dict[str, int]]:
     cluster_ids = sorted({int(label) for label in assignments["tribe_id"].to_list() if int(label) >= 0})
     kept_ids = (
@@ -1204,7 +1601,7 @@ def _apply_lift_filter_to_assignments(
                 pl.when(kept)
                 .then(pl.col("assignment_source"))
                 .when(clustered)
-                .then(pl.lit("two_stage_hdbscan_lift_rejected"))
+                .then(pl.lit(rejected_source))
                 .otherwise(pl.col("assignment_source"))
                 .alias("final_assignment_source"),
             ]

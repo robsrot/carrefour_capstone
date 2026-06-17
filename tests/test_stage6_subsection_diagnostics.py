@@ -1,10 +1,15 @@
+from pathlib import Path
+
 import polars as pl
 
 from src.config import PipelineConfig
 from src.model_selection import (
     build_stage6_hdbscan_diagnostics,
     build_stage6_representation_cluster_diagnostics,
+    build_stage6_remaining_noise_probe_diagnostics,
+    build_stage6_stage3_noise_umap_probe,
     build_stage6_umap_diagnostics,
+    run_stage6_stage3_noise_hdbscan_lift_probe,
 )
 
 
@@ -35,6 +40,22 @@ def _test_config(tmp_path):
                         "cluster_selection_method": "eom",
                         "allow_noise_assignment": False,
                     },
+                },
+                "two_stage_hdbscan": {
+                    "stage3_noise_probe": {
+                        "enabled": True,
+                        "output_prefix": "tiny_stage3_noise_probe",
+                        "pca_components": 2,
+                        "min_noise_customers": 2,
+                        "umap": {"n_components": 2, "n_neighbors": 2, "min_dist": 0.0, "metric": "cosine"},
+                        "hdbscan": {
+                            "min_cluster_size": 2,
+                            "min_samples": 1,
+                            "cluster_selection_method": "eom",
+                            "allow_noise_assignment": False,
+                        },
+                        "lift_filter": {"min_strong_product_lifts": 1, "require_significant_product_lift": True},
+                    }
                 },
             },
             "umap": {"enabled": True, "n_components": 2, "n_neighbors": 2, "min_dist": 0.0, "metric": "cosine"},
@@ -317,3 +338,166 @@ def test_stage6_representation_cluster_diagnostics_writes_umap_and_hdbscan_evide
     assert row["cluster_count"] == 2
     assert row["silhouette_core_only"] == 0.25
     assert row["hdbscan_dbcv_status"] in {"not_run", "unavailable", "failed", "computed"}
+
+
+def test_stage3_noise_umap_probe_filters_remaining_noise_before_visual_review(tmp_path, monkeypatch):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    feature_path = tmp_path / "features.parquet"
+    assignment_path = tmp_path / "assignments.parquet"
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "c5"],
+            "emb_000": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "emb_001": [5.0, 4.0, 3.0, 2.0, 1.0],
+        }
+    ).write_parquet(feature_path)
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "c5"],
+            "tribe_id": [0, -1, -1, 1, -1],
+        }
+    ).write_parquet(assignment_path)
+
+    def fake_pca(source, output_path=None, summary_path=None, **_):
+        frame = pl.read_parquet(source).select(["cliente", "emb_000", "emb_001"])
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        frame.write_parquet(output_path)
+        Path(summary_path).parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame([{"stage": "fake"}]).write_csv(summary_path)
+        return output_path
+
+    def fake_umap(source, output_path=None, **_):
+        frame = pl.read_parquet(source)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "cliente": frame["cliente"].to_list(),
+                "umap_000": list(range(frame.height)),
+                "umap_001": list(reversed(range(frame.height))),
+            }
+        ).write_parquet(output_path)
+        return output_path
+
+    monkeypatch.setattr("src.model_selection.build_pca_representation", fake_pca)
+    monkeypatch.setattr("src.model_selection.build_umap_representation", fake_umap)
+
+    probe = build_stage6_stage3_noise_umap_probe(feature_path, assignment_path, force=True, cfg=cfg)
+    noise_features = pl.read_parquet(probe["noise_feature_path"])
+    summary = pl.read_csv(probe["summary_csv"]).row(0, named=True)
+
+    assert probe["status"] == "ready_for_visual_review"
+    assert noise_features["cliente"].to_list() == ["c2", "c3", "c5"]
+    assert summary["visual_review_required_before_hdbscan"] is True
+    assert Path(probe["noise_umap_path"]).exists()
+
+
+def test_stage6_remaining_noise_probe_diagnostics_marks_visual_review_pending(tmp_path):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    summary_path = cfg.artifacts / "stage6" / "tiny_stage3_noise_probe_umap_probe_summary.csv"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([{"status": "ready_for_visual_review"}]).write_csv(summary_path)
+    probe = {
+        "status": "ready_for_visual_review",
+        "noise_customers": 3,
+        "min_noise_customers": 2,
+        "noise_feature_path": cfg.model_selection_cache / "remaining_noise.parquet",
+        "noise_umap_path": cfg.outputs / "features" / "remaining_noise_umap.parquet",
+        "summary_csv": summary_path,
+        "visual_review_required_before_hdbscan": True,
+    }
+
+    path = build_stage6_remaining_noise_probe_diagnostics(probe, cfg=cfg)
+    row = pl.read_csv(path).row(0, named=True)
+
+    assert row["stage"] == "6.7_remaining_noise_structure_probe"
+    assert row["remaining_noise_customers"] == 3
+    assert row["visual_review_status"] == "pending_visual_review"
+    assert row["candidate_hdbscan_run"] is False
+    assert row["candidate_only_not_merged"] is True
+    assert row["official_assignment_changed"] is False
+    assert row["soft_assignment_enabled"] is False
+
+
+def test_stage3_noise_hdbscan_lift_probe_writes_candidate_only_assignments(tmp_path, monkeypatch):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    feature_path = tmp_path / "features.parquet"
+    assignment_path = tmp_path / "assignments.parquet"
+    pl.DataFrame({"cliente": ["c2", "c3", "c4"], "emb_000": [1.0, 1.1, 5.0]}).write_parquet(feature_path)
+    pl.DataFrame({"cliente": ["c2", "c3", "c4"], "tribe_id": [-1, -1, -1]}).write_parquet(assignment_path)
+
+    def fake_probe(*_, **__):
+        paths = {
+            "noise_umap_path": cfg.outputs / "features" / "tiny_stage3_noise_probe_umap.parquet",
+            "noise_umap_summary_path": cfg.artifacts / "stage6" / "tiny_stage3_noise_probe_umap_probe_summary.csv",
+        }
+        paths["noise_umap_path"].parent.mkdir(parents=True, exist_ok=True)
+        paths["noise_umap_summary_path"].parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "cliente": ["c2", "c3", "c4"],
+                "umap_000": [0.0, 0.1, 5.0],
+                "umap_001": [0.0, 0.1, 5.0],
+            }
+        ).write_parquet(paths["noise_umap_path"])
+        pl.DataFrame([{"status": "ready_for_visual_review"}]).write_csv(paths["noise_umap_summary_path"])
+        return {
+            "status": "ready_for_visual_review",
+            "noise_customers": 3,
+            **paths,
+        }
+
+    def fake_hdbscan(*_, output_prefix=None, **__):
+        raw_assignment = cfg.model_selection_cache / f"cluster_assignments_{output_prefix}.parquet"
+        raw_result = cfg.model_selection_cache / f"{output_prefix}_results.parquet"
+        raw_assignment.parent.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame(
+            {
+                "cliente": ["c2", "c3", "c4"],
+                "tribe_id": [0, 0, -1],
+                "model_name": ["m"] * 3,
+                "model_variant": ["v"] * 3,
+                "assignment_probability": [0.9, 0.8, None],
+                "assignment_confidence_score": [0.9, 0.8, None],
+                "assignment_confidence_type": ["hdbscan_membership_strength", "hdbscan_membership_strength", None],
+                "assignment_source": ["hdbscan_fit", "hdbscan_fit", "hdbscan_noise_unassigned"],
+            }
+        ).write_parquet(raw_assignment)
+        result = {
+            "cluster_count": 1,
+            "noise_pct": 33.33,
+            "passes_quality_gate": True,
+            "quality_gate_reason": "pass",
+        }
+        pl.DataFrame([result]).write_parquet(raw_result)
+        return raw_assignment, raw_result, result
+
+    def fake_profile(assignments, output_path=None, **__):
+        pl.DataFrame(
+            {
+                "tribe_id": [0],
+                "n_customers": [2],
+                "top_product_ids": [["p1"]],
+                "top_products": [["Lifted Product"]],
+                "top_product_lifts": [[2.0]],
+                "top_product_q_values": [[0.01]],
+            }
+        ).write_parquet(output_path)
+        return output_path
+
+    monkeypatch.setattr("src.model_selection.build_stage6_stage3_noise_umap_probe", fake_probe)
+    monkeypatch.setattr("src.model_selection.run_hdbscan", fake_hdbscan)
+    monkeypatch.setattr("src.profiling.profile_tribes", fake_profile)
+
+    result = run_stage6_stage3_noise_hdbscan_lift_probe(feature_path, assignment_path, force=True, cfg=cfg)
+    candidates = pl.read_parquet(result["candidate_assignment_path"]).sort("cliente")
+    row = result["result"]
+
+    assert candidates["tribe_id"].to_list() == [0, 0, -1]
+    assert row["promotion_status"] == "candidate_only_not_merged"
+    assert row["soft_assignment_enabled"] is False
+    assert row["lift_supported_candidate_tribes"] == 1

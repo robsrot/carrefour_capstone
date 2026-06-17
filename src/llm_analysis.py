@@ -320,7 +320,8 @@ def _gemini_project_context() -> dict[str, Any]:
         ],
         "stage6_summary": (
             "Stage 6 discovered hard UMAP-HDBSCAN core tribes, reran stricter HDBSCAN on first-pass noise, merged "
-            "the two passes, and retained clusters only when strong product-lift evidence existed."
+            "the two passes, retained clusters only when strong product-lift evidence existed, and separately "
+            "visualized remaining noise as a candidate-only follow-up probe."
         ),
         "stage7_summary": (
             "Stage 7 computed aggregate product, product-term, sector, theme, confidence, readiness, and commercial "
