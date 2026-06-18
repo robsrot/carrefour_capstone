@@ -1463,7 +1463,7 @@ def build_stage68_tribe_evidence(
         )
     ):
         log_event("Stage 6.8 evidence", "cache hit", cfg=cfg, manifest=paths["manifest_json"])
-        return _stage68_result_from_manifest(paths["manifest_json"])
+        return _stage68_result_from_manifest(paths["manifest_json"], cfg=cfg)
 
     transactions = pl.scan_parquet(cfg.prepared_transactions_path)
     force_profile = (
@@ -1539,7 +1539,7 @@ def build_stage68_tribe_evidence(
         write_artifact_metadata(paths["manifest_json"], cache_metadata)
         write_artifact_metadata(paths["tribe_evidence_path"], cache_metadata)
         log_event("Stage 6.8 evidence", "wrote evidence bundle", cfg=cfg, manifest=paths["manifest_json"])
-    return _stage68_result_from_manifest(paths["manifest_json"])
+    return _stage68_result_from_manifest(paths["manifest_json"], cfg=cfg)
 
 
 def _stage68_manifest(
@@ -1728,9 +1728,50 @@ def _csv_row_count(path: str | Path) -> int:
     return int(pl.read_csv(file_path).height)
 
 
-def _stage68_result_from_manifest(manifest_path: str | Path) -> dict[str, Any]:
+def _stage68_rebased_path(path: str | Path, *, cfg: PipelineConfig) -> Path:
+    """Return the active checkout's Stage 6.8 artifact when a manifest path is stale."""
+
+    original = Path(path)
+    if original.exists():
+        return original
+
+    parts = [part for part in str(path).replace("\\", "/").split("/") if part and part != "."]
+    try:
+        anchor_index = parts.index("stage6_8_evidence")
+    except ValueError:
+        return original
+
+    suffix = parts[anchor_index + 1 :]
+    candidate = stage68_output_dir(cfg).joinpath(*suffix)
+    return candidate if candidate.exists() else original
+
+
+def _stage68_manifest_with_local_paths(manifest: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, Any]:
+    """Rebase portable Stage 6.8 paths from a manifest onto the current repo if present."""
+
+    normalized = dict(manifest)
+    outputs = {
+        key: str(_stage68_rebased_path(value, cfg=cfg))
+        for key, value in (manifest.get("outputs") or {}).items()
+        if value
+    }
+    normalized["outputs"] = outputs
+
+    for export_key in ["transaction_exports", "customer_exports"]:
+        entries: list[dict[str, Any]] = []
+        for entry in manifest.get(export_key) or []:
+            normalized_entry = dict(entry)
+            if normalized_entry.get("path"):
+                normalized_entry["path"] = str(_stage68_rebased_path(normalized_entry["path"], cfg=cfg))
+            entries.append(normalized_entry)
+        normalized[export_key] = entries
+
+    return normalized
+
+
+def _stage68_result_from_manifest(manifest_path: str | Path, *, cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
     manifest_file = Path(manifest_path)
-    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest = _stage68_manifest_with_local_paths(json.loads(manifest_file.read_text(encoding="utf-8")), cfg=cfg)
     outputs = {key: Path(value) for key, value in (manifest.get("outputs") or {}).items() if value}
     return {
         "manifest_json": manifest_file,
@@ -1739,19 +1780,19 @@ def _stage68_result_from_manifest(manifest_path: str | Path) -> dict[str, Any]:
     }
 
 
-def _stage68_manifest_paths(stage68_manifest_path: str | Path | None) -> dict[str, Any]:
+def _stage68_manifest_paths(stage68_manifest_path: str | Path | None, *, cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
     if not stage68_manifest_path:
         return {}
     manifest_file = Path(stage68_manifest_path)
     if not manifest_file.exists():
         return {}
-    return _stage68_result_from_manifest(manifest_file)
+    return _stage68_result_from_manifest(manifest_file, cfg=cfg)
 
 
-def _require_stage68_manifest_paths(stage68_manifest_path: str | Path | None) -> dict[str, Any]:
+def _require_stage68_manifest_paths(stage68_manifest_path: str | Path | None, *, cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
     if not stage68_manifest_path or not Path(stage68_manifest_path).exists():
         raise RuntimeError(STAGE7_STAGE68_REQUIRED_MESSAGE)
-    paths = _stage68_manifest_paths(stage68_manifest_path)
+    paths = _stage68_manifest_paths(stage68_manifest_path, cfg=cfg)
     if not paths.get("manifest"):
         raise RuntimeError(STAGE7_STAGE68_REQUIRED_MESSAGE)
     return paths
@@ -2404,7 +2445,7 @@ def write_stage7_final_handoff_pack(
     out_dir = Path(output_dir) if output_dir else cfg.artifacts / "stage7" / "final_handoff"
     support_dir = out_dir / "supporting_tables"
     card_dir = out_dir / "tribe_cards"
-    stage68_paths = _require_stage68_manifest_paths(stage68_manifest_path)
+    stage68_paths = _require_stage68_manifest_paths(stage68_manifest_path, cfg=cfg)
     stage68_manifest = stage68_paths.get("manifest") or {}
     out_dir.mkdir(parents=True, exist_ok=True)
     support_dir.mkdir(parents=True, exist_ok=True)

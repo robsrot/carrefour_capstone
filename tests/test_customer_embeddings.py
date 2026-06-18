@@ -177,6 +177,22 @@ def test_customer_embedding_weight_diagnostics_can_be_built_without_rebuilding_v
     assert paths["top_products_csv"].exists()
 
 
+def test_customer_embeddings_trust_existing_cache_without_revalidating_diagnostics(tmp_path):
+    cfg = _test_config(tmp_path)
+    cached_output = cfg.outputs / "features" / "customer_embeddings.parquet"
+    cached_output.parent.mkdir(parents=True, exist_ok=True)
+    cached_output.write_text("trusted cache placeholder", encoding="utf-8")
+
+    output = build_customer_embeddings(
+        tmp_path / "missing_product_embeddings.parquet",
+        transactions=pl.DataFrame({"not_needed": [1]}).lazy(),
+        cfg=cfg,
+    )
+
+    assert output == cached_output
+    assert not (cfg.artifacts / "stage4" / "customer_embedding_weight_diagnostics.csv").exists()
+
+
 def test_customer_embedding_coverage_gate_fails_when_products_are_unembedded(tmp_path):
     cfg = _test_config(
         tmp_path,

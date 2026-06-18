@@ -46,8 +46,17 @@ def build_pca_representation(
         "n_components": requested_components,
         "random_seed": cfg.random_seed,
     }
-    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
-        log_event("Stage 6 PCA", "cache hit", cfg=cfg, path=output)
+    summary_metadata = {**cache_metadata, "artifact": "pca_summary"}
+    if (
+        should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
+        and should_use_cache(
+            summary_output,
+            force=force,
+            use_cached=cfg.get("cache.use_cached", True),
+            metadata=summary_metadata,
+        )
+    ):
+        log_event("Stage 6 PCA", "cache hit", cfg=cfg, path=output, summary=summary_output)
         return output
 
     source_rows = _parquet_row_count(feature_path)
@@ -91,7 +100,7 @@ def build_pca_representation(
         explained_variance_ratio=pca.explained_variance_ratio_,
     )
     write_artifact_metadata(output, cache_metadata)
-    write_artifact_metadata(summary_output, {**cache_metadata, "artifact": "pca_summary"})
+    write_artifact_metadata(summary_output, summary_metadata)
     log_event(
         "Stage 6 PCA",
         "wrote artifact",

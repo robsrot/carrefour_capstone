@@ -16,6 +16,7 @@ from src.profiling import (
     profile_readiness_evidence_table,
     stage7_final_index_table,
     stage7_storyline_table,
+    stage68_artifact_paths,
     tribe_comparison_table,
     tribe_product_summary_tables,
     write_tribe_product_summary_artifacts,
@@ -629,6 +630,76 @@ def test_tribe_product_summaries_and_comparison_are_product_first(tmp_path):
     assert "lift_vs_rest x log(customer_count + 1)" in comparison_row["product_ranking_basis"]
     assert "Tickets" in comparison_row["customer_behavior_over_under_index"]
     assert outputs["combined_csv"].exists()
+
+
+def test_stage68_cache_hit_rebases_stale_manifest_paths_to_local_outputs(tmp_path):
+    cfg = PipelineConfig(
+        values={
+            "paths": {"outputs": "outputs", "dev": "data/dev", "processed": "data/processed"},
+            "data": {"prepared_transactions": "prepared_transactions.parquet"},
+        },
+        mode="dev",
+        root=tmp_path,
+    )
+    paths = stage68_artifact_paths(cfg)
+    local_transaction_path = paths["transaction_export_dir"] / "tribe_00_transactions_dev.parquet"
+    local_customer_path = paths["customer_export_dir"] / "tribe_00_customers_dev.parquet"
+    required_outputs = [
+        paths["tribe_evidence_path"],
+        paths["product_lifts_path"],
+        paths["sector_lifts_path"],
+        paths["customer_metric_tests_csv"],
+        paths["noise_vs_core_customer_metrics_csv"],
+        paths["transaction_export_dir"] / "tribe_transactions_manifest_dev.csv",
+        paths["customer_export_dir"] / "tribe_customers_manifest_dev.csv",
+        local_transaction_path,
+        local_customer_path,
+    ]
+    for output in required_outputs:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("cached", encoding="utf-8")
+
+    old_root = "/home/capstone06/carrefour_capstone/outputs/dev/artifacts/stage6/stage6_8_evidence"
+    paths["manifest_json"].parent.mkdir(parents=True, exist_ok=True)
+    paths["manifest_json"].write_text(
+        json.dumps(
+            {
+                "stage": "6.8_tribe_evidence_assembly",
+                "mode": "dev",
+                "outputs": {
+                    "tribe_evidence_path": f"{old_root}/tribe_evidence_dev.parquet",
+                    "product_lifts_path": f"{old_root}/product_lifts_dev.parquet",
+                    "sector_lifts_path": f"{old_root}/sector_lifts_dev.parquet",
+                    "customer_metric_tests_csv": f"{old_root}/customer_metric_tests_dev.csv",
+                    "noise_vs_core_customer_metrics_csv": f"{old_root}/noise_vs_core_customer_metrics_dev.csv",
+                    "transaction_export_dir": f"{old_root}/tribe_transactions",
+                    "transaction_export_manifest_csv": f"{old_root}/tribe_transactions/tribe_transactions_manifest_dev.csv",
+                    "customer_export_dir": f"{old_root}/tribe_customers",
+                    "customer_export_manifest_csv": f"{old_root}/tribe_customers/tribe_customers_manifest_dev.csv",
+                },
+                "transaction_exports": [
+                    {"tribe_id": 0, "path": f"{old_root}/tribe_transactions/tribe_00_transactions_dev.parquet"}
+                ],
+                "customer_exports": [
+                    {"tribe_id": 0, "path": f"{old_root}/tribe_customers/tribe_00_customers_dev.parquet"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    stage68 = build_stage68_tribe_evidence(
+        tmp_path / "missing_assignments.parquet",
+        behavior_path=tmp_path / "missing_behavior.parquet",
+        cfg=cfg,
+    )
+
+    assert stage68["tribe_evidence_path"] == paths["tribe_evidence_path"]
+    assert stage68["product_lifts_path"] == paths["product_lifts_path"]
+    assert stage68["transaction_export_manifest_csv"] == paths["transaction_export_dir"] / "tribe_transactions_manifest_dev.csv"
+    assert stage68["manifest"]["outputs"]["tribe_evidence_path"] == str(paths["tribe_evidence_path"])
+    assert stage68["manifest"]["transaction_exports"][0]["path"] == str(local_transaction_path)
+    assert stage68["manifest"]["customer_exports"][0]["path"] == str(local_customer_path)
 
 
 def test_stage68_evidence_bundle_feeds_stage7_without_raw_inputs(tmp_path):

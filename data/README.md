@@ -4,7 +4,7 @@ Data files are local artifacts and are not committed to this repository.
 
 ## Purpose
 
-`data/` holds raw inputs and prepared transaction tables only. The ML pipeline writes generated embeddings, features, models, reports, figures, profiles, and experiments to `outputs/<mode>/`.
+`data/` holds raw inputs and prepared transaction tables only. The ML pipeline writes generated embeddings, features, models, diagnostics, reports, figures, profiles, experiments, and final handoff artifacts to `outputs/<mode>/`.
 
 ## Expected Layout
 
@@ -35,6 +35,8 @@ verify_csv_checksums()
 convert_csv_to_parquet()
 ```
 
+Use `verify_csv_checksums(record=True)` only on the machine that establishes the canonical raw files.
+
 ## Prepared Data Artifacts
 
 Production preprocessing writes to `data/processed/`:
@@ -43,7 +45,7 @@ Production preprocessing writes to `data/processed/`:
 |---|---|
 | `quality_report.json` | Full data quality gate results |
 | `df_combined.parquet` | Clean joined ticket/product table |
-| `customer_kpis.parquet` | Per-customer spend, visit, promo, and basket metrics for profiling |
+| `customer_kpis.parquet` | Per-customer spend, visit, promo, and basket metrics for profiling only |
 | `product_eda_*.parquet` | Optional product EDA tables |
 
 Dev subset generation writes to `data/dev/`:
@@ -59,19 +61,26 @@ Generated ML artifacts belong under:
 
 ```text
 outputs/<mode>/
+  .artifact_metadata.json
+  artifacts/
+    stage1/
+    stage2/
+    stage3/
+    stage4/
+    stage5/
+    stage6/
+      stage6_8_evidence/
+    stage7/
+      final_handoff/
   embeddings/
   features/
   figures/
-    model_selection/
-    presentation/
     tribe_lifts/
+    stage7_tribe_cards/
   models/
     model_selection/
   profiles/
   reports/
-    evidence/
-    model_selection/
-    presentation/
   experiments/   # dev only
 ```
 
@@ -81,4 +90,5 @@ If embeddings, cluster labels, figures, model binaries, profile outputs, or repo
 
 - Never commit files under `data/raw/`, `data/processed/`, or `data/dev/` except `.gitkeep` and documentation.
 - Keep prod and dev prepared data separate by setting `CARREFOUR_MODE` before running pipeline code.
-- Regenerate downstream caches with the relevant `force=True` flag after changing upstream feature definitions or hyperparameters.
+- Keep spend/KPI data in prepared/profile tables only; it must not feed official customer embeddings or clustering.
+- Regenerate downstream caches with the relevant `force=True` flag, disabled cache, or targeted artifact deletion after changing upstream feature definitions or hyperparameters.

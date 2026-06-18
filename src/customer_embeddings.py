@@ -1244,35 +1244,6 @@ def build_customer_embeddings(
         use_cached=cfg.get("cache.use_cached", True),
         metadata=cache_metadata,
     ):
-        diagnostics_cfg = cfg.get("customer_embeddings.diagnostics", {}) or {}
-        gates_cfg = cfg.get("customer_embeddings.gates", {}) or {}
-        gates_apply = output_path is None or bool(gates_cfg.get("apply_to_custom_outputs", False))
-        if (output_path is None and bool(diagnostics_cfg.get("enabled", True))) or (
-            gates_apply and bool(gates_cfg.get("enabled", False))
-        ):
-            lf = transactions if transactions is not None else load_prepared_transactions(cfg=cfg)
-            columns = set(schema_names(lf))
-            needed = _customer_embedding_required_columns(columns, weight_strategy=selected_weight_strategy, cfg=cfg)
-            base_lf = lf.select(needed)
-            diagnostic_result = _write_customer_embedding_weight_diagnostics(
-                _build_customer_product_weights(
-                    base_lf,
-                    columns,
-                    weight_strategy=selected_weight_strategy,
-                    quantity_transform=selected_quantity_transform,
-                    max_customer_product_weight=selected_max_customer_product_weight,
-                    cfg=cfg,
-                ),
-                lf,
-                weight_strategy=selected_weight_strategy,
-                quantity_transform=selected_quantity_transform,
-                max_customer_product_weight=selected_max_customer_product_weight,
-                normalize_vectors=bool(normalize_vectors),
-                embeddings_path=embeddings_path,
-                cfg=cfg,
-            )
-            if gates_apply:
-                _enforce_customer_embedding_gates(diagnostic_result["metrics"], cfg)
         log_event("Stage 4 customer embeddings", "cache hit", cfg=cfg, path=output)
         return output
 
