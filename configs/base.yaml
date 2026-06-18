@@ -466,6 +466,7 @@ exports:
 
 visualization:
   max_scatter_points: 50000
+  noise_umap_probe_zoom_quantile: 0.995
   random_state: 42
   umap:
     n_neighbors: 30

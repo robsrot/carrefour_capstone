@@ -1462,10 +1462,19 @@ def plot_stage6_noise_umap_probe(
         raise ValueError(f"Noise UMAP probe needs at least two numeric components for plotting: {umap_path}")
     sample = _sample_frame(umap_df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
 
+    x = sample[umap_cols[0]].to_numpy()
+    y = sample[umap_cols[1]].to_numpy()
+    zoom_quantile = float(cfg.get("visualization.noise_umap_probe_zoom_quantile", 0.995))
+    x_limits, y_limits, outside_zoom = _central_zoom_limits(
+        x,
+        y,
+        quantile=zoom_quantile,
+    )
+
     fig, ax = plt.subplots(figsize=(7.4, 5.8))
     ax.scatter(
-        sample[umap_cols[0]].to_numpy(),
-        sample[umap_cols[1]].to_numpy(),
+        x,
+        y,
         s=4,
         color=_color("neutral"),
         alpha=0.34,
@@ -1474,11 +1483,20 @@ def plot_stage6_noise_umap_probe(
     ax.set_title("Stage 6.7 Remaining-Noise UMAP Probe")
     ax.set_xlabel(umap_cols[0])
     ax.set_ylabel(umap_cols[1])
+    if x_limits and y_limits:
+        ax.set_xlim(*x_limits)
+        ax.set_ylim(*y_limits)
     ax.grid(alpha=0.22)
+    zoom_pct = min(max(zoom_quantile, 0.50), 1.0) * 100.0
+    zoom_note = (
+        f" Central {zoom_pct:.1f}% zoom; {outside_zoom:,} sampled outlier points outside axes."
+        if outside_zoom
+        else f" Central {zoom_pct:.1f}% zoom."
+    )
     ax.text(
         0.02,
         -0.14,
-        "Visual review only: run HDBSCAN only if coherent sub-structure is visible.",
+        f"Visual review only: run HDBSCAN only if coherent sub-structure is visible.{zoom_note}",
         transform=ax.transAxes,
         ha="left",
         va="top",
@@ -1489,6 +1507,44 @@ def plot_stage6_noise_umap_probe(
     path = _save_figure(fig, output, cfg, "Stage 6.7 figures", "wrote remaining-noise UMAP probe")
     plt.close(fig)
     return path
+
+
+def _central_zoom_limits(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    quantile: float = 0.995,
+) -> tuple[tuple[float, float] | None, tuple[float, float] | None, int]:
+    """Return robust plot limits so a few UMAP outliers do not collapse the main mass."""
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 10:
+        return None, None, 0
+    quantile = min(max(float(quantile), 0.50), 1.0)
+    tail = (1.0 - quantile) / 2.0
+    x_low, x_high = np.nanquantile(x[finite], [tail, 1.0 - tail])
+    y_low, y_high = np.nanquantile(y[finite], [tail, 1.0 - tail])
+    if not all(np.isfinite([x_low, x_high, y_low, y_high])) or x_low >= x_high or y_low >= y_high:
+        return None, None, 0
+
+    x_pad = max((x_high - x_low) * 0.06, 1e-6)
+    y_pad = max((y_high - y_low) * 0.06, 1e-6)
+    x_limits = (float(x_low - x_pad), float(x_high + x_pad))
+    y_limits = (float(y_low - y_pad), float(y_high + y_pad))
+    outside_zoom = int(
+        np.sum(
+            finite
+            & (
+                (x < x_limits[0])
+                | (x > x_limits[1])
+                | (y < y_limits[0])
+                | (y > y_limits[1])
+            )
+        )
+    )
+    return x_limits, y_limits, outside_zoom
 
 
 def plot_stage68_evidence_overview(

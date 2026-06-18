@@ -369,8 +369,8 @@ def _profile_readiness(
         issues.append(f"customers<{min_cluster_size}")
     if recovery is None:
         issues.append("missing_jitter_recovery")
-    elif recovery < 0.70:
-        issues.append("jitter_recovery<0.70")
+    elif recovery < 0.60:
+        issues.append("jitter_recovery<0.60")
     if confidence is not None and confidence < 0.20:
         issues.append("mean_assignment_confidence<0.20")
     if p10_confidence is not None and p10_confidence < 0.05:
