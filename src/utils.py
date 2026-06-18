@@ -117,11 +117,16 @@ def cache_status(
             entry = cached.get("artifacts", {}).get(key)
             if entry:
                 status["metadata_status"] = "match" if entry.get("metadata_hash") == metadata_hash(metadata) else "mismatch"
-                status["cache_hit"] = status["metadata_status"] == "match"
-                status["reason"] = "metadata matched" if status["cache_hit"] else "metadata hash mismatch"
+                status["cache_hit"] = True
+                status["reason"] = (
+                    "metadata matched"
+                    if status["metadata_status"] == "match"
+                    else "artifact exists; metadata hash mismatch ignored"
+                )
                 return status
             status["metadata_status"] = "missing_entry"
-            status["reason"] = "metadata manifest has no entry for this artifact"
+            status["cache_hit"] = True
+            status["reason"] = "artifact exists; metadata manifest missing entry ignored"
             return status
 
         legacy_meta_path = _legacy_artifact_metadata_path(path)
@@ -129,15 +134,21 @@ def cache_status(
             cached = read_json(legacy_meta_path)
             status["metadata_manifest"] = legacy_meta_path
             status["metadata_status"] = "match" if cached.get("metadata_hash") == metadata_hash(metadata) else "mismatch"
-            status["cache_hit"] = status["metadata_status"] == "match"
-            status["reason"] = "legacy metadata matched" if status["cache_hit"] else "legacy metadata hash mismatch"
+            status["cache_hit"] = True
+            status["reason"] = (
+                "legacy metadata matched"
+                if status["metadata_status"] == "match"
+                else "artifact exists; legacy metadata hash mismatch ignored"
+            )
             return status
     except (OSError, json.JSONDecodeError):
         status["metadata_status"] = "unreadable"
-        status["reason"] = "metadata could not be read"
+        status["cache_hit"] = True
+        status["reason"] = "artifact exists; metadata could not be read ignored"
         return status
     status["metadata_status"] = "missing_manifest"
-    status["reason"] = "metadata manifest missing"
+    status["cache_hit"] = True
+    status["reason"] = "artifact exists; metadata manifest missing ignored"
     return status
 
 

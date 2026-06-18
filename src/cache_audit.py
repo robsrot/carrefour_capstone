@@ -220,6 +220,24 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
             "metadata": _basket_metadata(paths["basket_sentences"], cfg),
         },
         {
+            "stage": "1",
+            "artifact": "basket_product_ubiquity_diagnostics",
+            "path": paths["basket_staple_diagnostics"]["product_diagnostics"],
+            "metadata": _basket_staple_diagnostics_metadata(cfg),
+        },
+        {
+            "stage": "1",
+            "artifact": "basket_common_product_exposure",
+            "path": paths["basket_staple_diagnostics"]["basket_exposure"],
+            "metadata": _basket_staple_diagnostics_metadata(cfg),
+        },
+        {
+            "stage": "1",
+            "artifact": "basket_common_product_candidates",
+            "path": paths["basket_staple_diagnostics"]["common_products_csv"],
+            "metadata": _basket_staple_diagnostics_metadata(cfg),
+        },
+        {
             "stage": "2",
             "artifact": "item2vec_model",
             "path": paths["item2vec_model"],
@@ -263,6 +281,15 @@ def _stage_1_6_cache_specs(cfg: PipelineConfig) -> list[dict[str, Any]]:
                 "artifact": "product_exposure_features",
                 "path": paths["product_exposure_features"],
                 "metadata": _product_exposure_metadata(cfg),
+            }
+        )
+    if bool(cfg.get("baskets.diagnostics.write_markdown_report", True)):
+        specs.append(
+            {
+                "stage": "1",
+                "artifact": "basket_common_product_diagnostics_md",
+                "path": paths["basket_staple_diagnostics"]["summary_md"],
+                "metadata": _basket_staple_diagnostics_metadata(cfg),
             }
         )
     for variant, path in paths["feature_sets"].items():
@@ -348,8 +375,19 @@ def _official_stage_paths(cfg: PipelineConfig) -> dict[str, Any]:
     promoted = cfg.get("official_model_suite.umap_hdbscan", {}) or {}
     model_b_name = str(promoted.get("output_prefix", promoted.get("model_name", "model_b_umap_hdbscan")))
     embedding_validation_dir = cfg.artifacts / str(cfg.get("embedding_validation.output_dir", "stage3"))
+    basket_diagnostics_dir = cfg.artifacts / str(cfg.get("baskets.diagnostics.output_dir", "stage1"))
     paths = {
         "basket_sentences": cfg.artifact_path("baskets", "output", directory=cfg.outputs / "embeddings"),
+        "basket_staple_diagnostics": {
+            "product_diagnostics": basket_diagnostics_dir
+            / str(cfg.get("baskets.diagnostics.product_ubiquity_output", "product_ubiquity_diagnostics.parquet")),
+            "basket_exposure": basket_diagnostics_dir
+            / str(cfg.get("baskets.diagnostics.basket_exposure_output", "basket_common_product_exposure.parquet")),
+            "common_products_csv": basket_diagnostics_dir
+            / str(cfg.get("baskets.diagnostics.common_products_csv", "common_product_candidates.csv")),
+            "summary_md": basket_diagnostics_dir
+            / str(cfg.get("baskets.diagnostics.summary_md", "basket_common_product_diagnostics.md")),
+        },
         "item2vec_model": cfg.models / str(cfg.get("word2vec.model_name")),
         "product_embeddings": cfg.artifact_path("word2vec", "embeddings_output", directory=cfg.outputs / "embeddings"),
         "embedding_validation_csv": embedding_validation_dir / str(cfg.get("embedding_validation.output_csv")),
@@ -400,14 +438,24 @@ def _status_row(
     cfg: PipelineConfig,
 ) -> dict[str, Any]:
     if metadata is None:
+        status = cache_status(
+            path,
+            force=bool(cfg.get("cache.force", False)),
+            use_cached=bool(cfg.get("cache.use_cached", True)),
+            metadata=None,
+        )
         return {
             "stage": stage,
             "artifact": artifact,
-            "cache_hit": False,
-            "exists": path.exists(),
+            "cache_hit": bool(status["cache_hit"]),
+            "exists": bool(status["exists"]),
             "metadata_status": "unavailable",
-            "reason": "cache metadata could not be computed for audit",
-            "path": str(path),
+            "reason": (
+                "artifact exists; cache metadata unavailable ignored"
+                if status["cache_hit"]
+                else status["reason"]
+            ),
+            "path": str(status["path"]),
         }
     status = cache_status(
         path,
@@ -439,6 +487,16 @@ def _basket_metadata(output: Path, cfg: PipelineConfig) -> dict[str, Any]:
         if strategy == "common_downsampled"
         else None,
         "ordering": "deterministic_ticket_hash",
+    }
+
+
+def _basket_staple_diagnostics_metadata(cfg: PipelineConfig) -> dict[str, Any]:
+    return {
+        "stage": "basket_staple_diagnostics",
+        "mode": cfg.mode,
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "thresholds": _diagnostic_threshold_metadata(cfg),
+        "top_n_common_products": int(cfg.get("baskets.diagnostics.top_n_common_products", 50)),
     }
 
 

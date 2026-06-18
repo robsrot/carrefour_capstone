@@ -4,7 +4,7 @@ from src.cluster_validation import build_cluster_validity_stability_report
 from src.config import PipelineConfig
 
 
-def _test_config(tmp_path):
+def _test_config(tmp_path, *, use_cached=False):
     return PipelineConfig(
         values={
             "run": {"random_seed": 42},
@@ -15,7 +15,7 @@ def _test_config(tmp_path):
                 "raw_parquet": "data/raw/parquet",
                 "outputs": "outputs",
             },
-            "cache": {"use_cached": False},
+            "cache": {"force": False, "use_cached": use_cached},
             "stability": {"sample_size": 4, "repeats": 1, "jitter_scale": 0.0},
             "model_selection": {"write_summary_markdown": False},
             "official_model_suite": {
@@ -77,3 +77,62 @@ def test_cluster_readiness_uses_promoted_candidate_min_cluster_size(tmp_path):
 
     assert clusters["min_cluster_size_reference"].to_list() == [2, 2]
     assert not any("customers<5" in issue for issue in clusters["readiness_issues"].to_list())
+
+
+def test_cluster_stability_report_reuses_cached_artifacts(tmp_path):
+    cfg = _test_config(tmp_path, use_cached=True)
+    cfg.ensure_directories()
+    feature_path = tmp_path / "features.parquet"
+    assignment_path = tmp_path / "assignments.parquet"
+    output_path = tmp_path / "stage6_6_cluster_stability_readiness.parquet"
+
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4"],
+            "umap_000": [0.0, 0.1, 5.0, 5.1],
+            "umap_001": [0.0, 0.1, 5.0, 5.1],
+        }
+    ).write_parquet(feature_path)
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4"],
+            "tribe_id": [0, 0, 1, 1],
+            "model_name": ["model_b_umap_hdbscan_core"] * 4,
+            "model_variant": ["u8_n75_leaf_mcs2_ms1_hdbscan_mcs2_ms1_leaf"] * 4,
+            "assignment_confidence_score": [0.9, 0.8, 0.9, 0.8],
+            "assignment_source": ["hdbscan_fit"] * 4,
+        }
+    ).write_parquet(assignment_path)
+
+    candidate_key = "model_b_umap_hdbscan_core::u8_n75_leaf_mcs2_ms1_hdbscan_mcs2_ms1_leaf"
+    model_suite = {
+        "candidate_results": [
+            {
+                "model_name": "model_b_umap_hdbscan_core",
+                "model_variant": "u8_n75_leaf_mcs2_ms1_hdbscan_mcs2_ms1_leaf",
+            }
+        ],
+        "assignment_paths": {candidate_key: assignment_path},
+        "official_candidate_key": candidate_key,
+    }
+
+    first = build_cluster_validity_stability_report(
+        model_suite,
+        feature_path,
+        output_path=output_path,
+        force=True,
+        cfg=cfg,
+    )
+    feature_path.unlink()
+    second = build_cluster_validity_stability_report(
+        model_suite,
+        feature_path,
+        output_path=output_path,
+        cfg=cfg,
+    )
+
+    assert second == first
+    assert first["parquet"].exists()
+    assert first["summary_csv"].exists()
+    assert first["cluster_parquet"].exists()
+    assert first["cluster_summary_csv"].exists()

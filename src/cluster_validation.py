@@ -13,13 +13,22 @@ from src.config import CONFIG, PipelineConfig
 from src.evaluation import cluster_size_summary
 from src.experiment_reporting import write_summary_artifacts
 from src.progress import log_event, stage_timer
-from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns
+from src.utils import (
+    collect_streaming,
+    deterministic_sample_indices,
+    file_fingerprint,
+    frame_to_numpy,
+    numeric_feature_columns,
+    should_use_cache,
+    write_artifact_metadata,
+)
 
 
 def build_cluster_validity_stability_report(
     model_suite: dict[str, Any],
     feature_path: str | Path,
     output_path: str | Path | None = None,
+    force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Path]:
     """Write a compact report on candidate validity and label-geometry stability.
@@ -31,9 +40,28 @@ def build_cluster_validity_stability_report(
 
     cfg.ensure_directories()
     output = Path(output_path) if output_path else cfg.model_selection / "cluster_validity_stability.parquet"
+    force = bool(cfg.get("cache.force", False)) if force is None else force
     sample_size = int(cfg.get("stability.sample_size", 10000))
     repeats = int(cfg.get("stability.repeats", 5))
     jitter_scale = float(cfg.get("stability.jitter_scale", 0.02))
+    artifact_paths = _cluster_stability_artifact_paths(output, cfg)
+    cache_metadata = _cluster_stability_cache_metadata(
+        model_suite=model_suite,
+        feature_path=feature_path,
+        sample_size=sample_size,
+        repeats=repeats,
+        jitter_scale=jitter_scale,
+        cfg=cfg,
+    )
+
+    if _cluster_stability_cache_hit(
+        artifact_paths,
+        cache_metadata=cache_metadata,
+        force=force,
+        cfg=cfg,
+    ):
+        log_event("Cluster validity", "cache hit", cfg=cfg, path=output)
+        return artifact_paths
 
     with stage_timer(
         "Cluster validity",
@@ -107,7 +135,7 @@ def build_cluster_validity_stability_report(
     report = pl.DataFrame(rows).sort("candidate_id") if rows else pl.DataFrame()
     output.parent.mkdir(parents=True, exist_ok=True)
     report.write_parquet(output)
-    cluster_output = output.with_name(f"{output.stem}_clusters.parquet")
+    cluster_output = artifact_paths["cluster_parquet"]
     cluster_report = (
         pl.DataFrame(cluster_rows).sort(["candidate_id", "tribe_id"]) if cluster_rows else pl.DataFrame()
     )
@@ -150,12 +178,97 @@ def build_cluster_validity_stability_report(
         write_markdown=bool(cfg.get("model_selection.write_summary_markdown", True)),
     )
     log_event("Cluster validity", "wrote validity and stability report", cfg=cfg, path=output)
-    return {
+    result = {
         "parquet": output,
         **summaries,
         "cluster_parquet": cluster_output,
         "cluster_summary_csv": cluster_summaries["summary_csv"],
         "cluster_summary_md": cluster_summaries.get("summary_md"),
+    }
+    for path in result.values():
+        if path is not None:
+            write_artifact_metadata(path, cache_metadata)
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _cluster_stability_artifact_paths(output: Path, cfg: PipelineConfig) -> dict[str, Path]:
+    cluster_output = output.with_name(f"{output.stem}_clusters.parquet")
+    summary_csv, summary_md = _summary_paths_for(output)
+    cluster_summary_csv, cluster_summary_md = _summary_paths_for(cluster_output)
+    paths = {
+        "parquet": output,
+        "summary_csv": summary_csv,
+        "cluster_parquet": cluster_output,
+        "cluster_summary_csv": cluster_summary_csv,
+    }
+    if bool(cfg.get("model_selection.write_summary_markdown", True)):
+        paths["summary_md"] = summary_md
+        paths["cluster_summary_md"] = cluster_summary_md
+    return paths
+
+
+def _summary_paths_for(output_base: Path) -> tuple[Path, Path]:
+    stem = output_base.stem
+    for suffix in ["_diagnostics", "_manifest"]:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    summary_stem = f"{stem}_summary"
+    return output_base.with_name(summary_stem).with_suffix(".csv"), output_base.with_name(summary_stem).with_suffix(".md")
+
+
+def _cluster_stability_cache_hit(
+    artifact_paths: dict[str, Path],
+    *,
+    cache_metadata: dict[str, Any],
+    force: bool,
+    cfg: PipelineConfig,
+) -> bool:
+    use_cached = bool(cfg.get("cache.use_cached", True))
+    return all(
+        should_use_cache(path, force=force, use_cached=use_cached, metadata=cache_metadata)
+        for path in artifact_paths.values()
+    )
+
+
+def _cluster_stability_cache_metadata(
+    *,
+    model_suite: dict[str, Any],
+    feature_path: str | Path,
+    sample_size: int,
+    repeats: int,
+    jitter_scale: float,
+    cfg: PipelineConfig,
+) -> dict[str, Any]:
+    assignment_paths = {
+        str(candidate_key): file_fingerprint(path)
+        for candidate_key, path in sorted((model_suite.get("assignment_paths") or {}).items())
+    }
+    candidate_results = [
+        {
+            "model_name": candidate.get("model_name"),
+            "model_variant": candidate.get("model_variant"),
+        }
+        for candidate in (model_suite.get("candidate_results") or [])
+    ]
+    return {
+        "stage": "cluster_validity_stability_report",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "assignment_paths": assignment_paths,
+        "candidate_results": candidate_results,
+        "official_candidate_key": model_suite.get("official_candidate_key"),
+        "stability": {
+            "sample_size": sample_size,
+            "repeats": repeats,
+            "jitter_scale": jitter_scale,
+        },
+        "hdbscan": {
+            "default_min_cluster_size": cfg.get("hdbscan.min_cluster_size", 0),
+            "official_umap_min_cluster_size": cfg.get("official_model_suite.umap_hdbscan.hdbscan.min_cluster_size"),
+        },
+        "profile_readiness_logic_version": 1,
+        "random_seed": cfg.random_seed,
     }
 
 

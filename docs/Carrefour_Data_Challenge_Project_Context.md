@@ -6,6 +6,17 @@ Source: The Data Refinery analytical manifesto v4.01.
 
 This document preserves the original project brief. It is not the current implementation status. For the current status, missing work, and roadmap, see [PROJECT_STATUS_AND_ROADMAP.md](PROJECT_STATUS_AND_ROADMAP.md).
 
+## Current Implementation Note
+
+As of 2026-06-18, the active repository implements the original brief through a YAML-driven product-first pipeline:
+
+- Stage 1 builds product-token basket sentences with common-product downsampling.
+- Stage 2 trains Item2Vec product embeddings.
+- Stage 4 aggregates customer vectors with `quantity_idf`, `log1p(unidades)`, recency decay, customer-product basket-frequency weighting, and vector normalization.
+- Official clustering uses `embeddings_only`; spend and KPIs are reserved for post-clustering profiling.
+- Stage 6 uses hard two-stage UMAP-HDBSCAN with product-lift filtering and honest noise retention.
+- Stage 6.8 assembles raw-data evidence once, and Stage 7 reads that evidence to produce the final business-facing handoff pack.
+
 ## 1. Core Objective
 
 Build an end-to-end machine learning pipeline that segments Carrefour customers into behavioral clusters, or "organic tribes", derived from purchase history alone.

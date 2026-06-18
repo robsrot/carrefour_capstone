@@ -1,26 +1,27 @@
 # Carrefour Data Challenge
 
-Product-first behavioral customer segmentation for Carrefour checkout data. The goal is to discover actionable customer tribes from what people buy, not from demographic attributes.
+Product-first behavioral customer segmentation for Carrefour checkout data. The goal is to discover actionable customer tribes from what people buy and how much they buy, not from demographics or spend-driven shortcuts.
 
 ## Current Status
 
-As of 2026-06-15:
+As of 2026-06-18:
 
-- Production preprocessing and EDA are complete: raw CSVs have been converted, cleaned, joined, quality-checked, and summarized into `data/processed/`.
-- The ML pipeline is product-first: official customer vectors aggregate product embeddings using product quantities plus configured recency and product-frequency weighting, not spend. Spend remains available for profiling and business interpretation after clustering.
-- UMAP is used as a dimensionality-reduction aid and candidate clustering representation. It is not treated as an automatic winner.
-- Official Stage 6 compares committed model families without forcing a curated 10-15 cluster target. The client expectation is treated as a hypothesis checked after the model is evaluated.
-- Stage 6.4 validity/stability diagnostics and Stage 7 deep profiling are the official final evidence flow before handoff.
-- Stage 7 now writes a primary evidence storyline, with product-lift profiles, a dedicated noise-population audit, tribe dossiers, subsegment overlays, clustering atlas, and aggregate-only LLM interpretation prompt pack as supporting proof.
-- Visualization outputs now belong under `outputs/<mode>/figures/`, including `figures/model_selection/`, `figures/presentation/`, and `figures/tribe_lifts/`.
-- Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader UMAP-HDBSCAN sweeps belong there before any setting is promoted into YAML.
-- Local prod artifacts exist for embeddings/features/model-selection caches. If `outputs/prod/profiles/` is empty, prod Stage 7 is still a cold profile build and can take a long time on the 9.8 GB prepared transaction table.
+- Production preprocessing and dev-subset generation are complete in the local workspace: prepared tables live under `data/processed/` and `data/dev/`, while generated ML artifacts live under `outputs/<mode>/`.
+- The official modeling recipe is product-first and YAML-driven. Stage 4 uses `customer_embeddings.weight_strategy: quantity_idf`, `quantity_transform: log1p`, product-purchase recency decay, product-specific basket-count frequency scaling, and normalized customer vectors.
+- Official customer vectors do not use `importe`, total spend, average basket value, revenue tier, or demographics. Spend and KPIs are interpretation context only after clustering.
+- Official model selection uses the `embeddings_only` feature set. Behavioral and product-exposure features can be built for diagnostics, challenger evidence, and profiling, but they are not the default clustering signal.
+- Stage 6 is now a hard two-stage UMAP-HDBSCAN flow: PCA pre-reduction, UMAP representation, first HDBSCAN pass, stricter second pass over first-pass noise, merge, product-lift filtering, density evidence, readiness checks, remaining-noise probe, and Stage 6.8 evidence assembly.
+- HDBSCAN noise stays honest as `tribe_id = -1`. Stage 6.7 can inspect remaining noise and optionally run candidate-only HDBSCAN after visual review, but it does not alter the official assignment.
+- Stage 7 is a read-only communication layer. It consumes the Stage 6.8 evidence bundle and writes the final story, final index, manifest, tribe cards, product summaries, comparison tables, customer-metric context, and aggregate-only LLM evidence.
+- UMAP is a clustering representation aid, not automatic proof. The 10-15 tribe range is a client hypothesis, not a hard clustering constraint.
+- Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`. Existing artifacts are reused when caching is enabled and `force=False`; metadata status is diagnostic, so use `force=True`, disable cache, or delete targeted generated files when rebuilding after logic/config changes.
+- Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader sweeps belong there before any setting is promoted into YAML.
 
-For the detailed status, gaps, and product-first improvement plan, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
+For the detailed status, gaps, and next actions, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
 ## Quick Start
 
-### 1. Create the environment
+### 1. Create the Environment
 
 ```bash
 conda env create -f environment.yml
@@ -42,7 +43,7 @@ conda install -c conda-forge scikit-learn=1.7.2
 pip install --force-reinstall --no-deps hdbscan==0.8.40
 ```
 
-### 2. Add the raw CSV files
+### 2. Add the Raw CSV Files
 
 Raw data is not committed. Place the source files here:
 
@@ -51,7 +52,7 @@ data/raw/csv/ie_maestra_articulos.csv
 data/raw/csv/ie_linea_ticket.csv
 ```
 
-### 3. Convert raw CSVs to Parquet
+### 3. Convert Raw CSVs to Parquet
 
 Run once from Python or from a notebook:
 
@@ -64,7 +65,7 @@ convert_csv_to_parquet()
 
 Use `verify_csv_checksums(record=True)` only on the machine that establishes the canonical raw files.
 
-### 4. Run the notebooks in order
+### 4. Run the Notebooks in Order
 
 ```bash
 jupyter notebook notebooks/01_exploration.ipynb
@@ -85,16 +86,16 @@ $env:CARREFOUR_MODE = "dev"
 jupyter notebook notebooks/04_experiment_sandbox.ipynb
 ```
 
-Promote only the winning settings from the sandbox summaries into YAML. Then run the clean ML pipeline in dev mode:
+Promote only evidence-backed settings into YAML. Then run the official ML pipeline:
 
 ```powershell
 $env:CARREFOUR_MODE = "dev"
 jupyter notebook notebooks/03_ml_pipeline.ipynb
 ```
 
-After pulling the current repo or changing vectorization/modeling code, rerun from Stage 4 onward before interpreting Stage 6+ results.
+Use `CARREFOUR_MODE=prod` for the full production run. Prod mode is the default when `CARREFOUR_MODE` is unset.
 
-Prod mode is the default when `CARREFOUR_MODE` is unset.
+After pulling the current repo or changing vectorization/modeling code, rerun from the affected upstream stage before interpreting Stage 6+ or Stage 7 outputs. The current Stage 4 `quantity_idf` recipe requires rebuilding Stage 4 onward when changed.
 
 ## Colleague Handoff Checklist
 
@@ -106,7 +107,7 @@ pytest
 git status --short
 ```
 
-The source handoff must include configs, notebooks, docs, and all `src/*.py` modules used by the official flow. In the current local tree, `src/cache_audit.py` is required by Stage 0. Generated data/model/output artifacts stay local and should not be committed.
+The source handoff must include configs, notebooks, docs, tests, `environment.yml`, and all `src/*.py` modules used by the official flow. Generated data/model/output artifacts stay local and should not be committed.
 
 For experimentation:
 
@@ -120,53 +121,39 @@ For experimentation:
 
 ```text
 configs/          Hyperparameters and dev/prod overrides
-data/             Local raw, processed, and dev data artifacts; never committed
-  raw/csv/        Source CSVs supplied outside git
-  raw/parquet/    Raw Parquet conversions
-  processed/      Production prepared data from Notebook 02
-  dev/            Stratified dev subset
-docs/             Project context, current status, run contracts, and inventory
+data/             Local raw, processed, and dev data artifacts; never committed except docs/.gitkeep
+docs/             Project context, status, run contracts, reproducibility notes, and inventory
 notebooks/        Ordered analysis, official pipeline, and sandbox notebooks
 outputs/          Mode-scoped generated artifacts; never committed
 src/              Reusable pipeline modules
-tests/            Test package placeholder; add source tests here
+tests/            Unit tests for config, caching, embeddings, model selection, profiling, exports, and visuals
 ```
 
 Generated ML artifacts stay under `outputs/<mode>/`. Dev includes an experiment workbench; prod does not.
 
 ```text
-outputs/dev/
+outputs/<mode>/
   .artifact_metadata.json  Central cache metadata manifest
+  artifacts/    Stage diagnostics and handoff support files
+    stage1/
+    stage2/
+    stage3/
+    stage4/
+    stage5/
+    stage6/
+      stage6_8_evidence/
+    stage7/
+      final_handoff/
   embeddings/   Basket sentences and product embedding tables
-  features/     Customer vectors and model-ready feature sets
-  figures/      Client-facing plots and diagnostics
-    model_selection/
-    presentation/
+  features/     Customer vectors, feature sets, PCA/UMAP representations
+  figures/      Notebook and presentation figures
     tribe_lifts/
-  models/       Trained local model binaries and internal model-selection caches
+    stage7_tribe_cards/
+  models/       Trained local model binaries and assignment/result caches
     model_selection/
-  profiles/     Tribe profile parquet outputs
-  reports/      Human-readable summaries, exports, and final selection evidence
-    evidence/
-    model_selection/
-    presentation/
-  experiments/  Optional sandbox runs, one flat folder per experiment
-
-outputs/prod/
-  .artifact_metadata.json  Central cache metadata manifest after prod stages run
-  embeddings/   Basket sentences and product embedding tables
-  features/     Customer vectors and model-ready feature sets
-  figures/      Client-facing plots and diagnostics
-    model_selection/
-    presentation/
-    tribe_lifts/
-  models/       Trained local model binaries and internal model-selection caches
-    model_selection/
-  profiles/     Tribe profile parquet outputs
-  reports/      Human-readable summaries, exports, and final selection evidence
-    evidence/
-    model_selection/
-    presentation/
+  profiles/     Legacy/profile parquet outputs retained for compatibility
+  reports/      Compact notebook-facing stage reports
+  experiments/  Optional sandbox runs in dev only
 ```
 
 ## Operating Conventions
@@ -175,25 +162,22 @@ outputs/prod/
 - Put shared hyperparameters in `configs/base.yaml`, dev overrides in `configs/dev.yaml`, and production-scale overrides in `configs/prod.yaml`; expose new values through `src/config.py`.
 - Use `CARREFOUR_MODE=dev` for fast iteration and `CARREFOUR_MODE=prod` for full artifacts.
 - Use `notebooks/04_experiment_sandbox.ipynb` for hyperparameter experiments and `notebooks/03_ml_pipeline.ipynb` for the official YAML-driven run.
-- Do not commit raw data, Parquet caches, trained models, or output images.
-- Keep sandbox outputs in `outputs/dev/experiments/<experiment_name>/` with no nested subfolders; promote only the selected settings back into YAML.
+- Do not commit raw data, Parquet caches, trained models, output images, `.env`, or secrets.
+- Keep sandbox outputs in `outputs/dev/experiments/<experiment_name>/`; promote only the selected settings back into YAML.
 - Experiments are disabled in prod. Production should only run the official pipeline with the scale-aware settings in `configs/prod.yaml`.
-- Sandbox diagnostics keep Parquet as the canonical artifact and also write compact `*_summary.csv` / `*_summary.md` files so experiments can be inspected quickly.
-- Keep `reports/` for concise human-facing outputs. Official Stage 6 compares only the committed candidates from `official_model_suite`; broader sweeps belong in the sandbox notebook.
-- Official customer vectorization must not use `importe` or other spend fields. Use the shared quantity plus recency/frequency weighting recipe in the pipeline; test alternate vector recipes, including IDF, only in the sandbox.
-- Stage 6.4 writes cluster validity and perturbation-stability diagnostics after Stage 6, so selection is based on more than silhouette/noise alone.
-- Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`.
-- Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`; avoid per-file `.meta.json` sidecars.
-- Prod Stage 6 is intentionally sample-fit/full-assign: UMAP fits on the configured customer sample, transforms the full population in batches, and HDBSCAN fits on the same deterministic sample before assigning all customers.
-- Stage 7 profiling can be the slowest interpretation step in prod because it scans prepared transactions to compute product, sector, theme, term, noise-audit, subsegment, and customer-context evidence, then packages the result into a compact evidence storyline.
-- Stage 7 keeps HDBSCAN noise outside the official core-tribe story, but writes a noise-population audit with behavior contrasts, product/theme/term over-indexing, and a recommended action before any soft-assignment or second-pass-clustering decision.
+- Official customer vectorization must not use `importe` or other spend fields. The current official recipe is `quantity_idf` with `log1p(unidades)`, recency decay, product basket-frequency weighting, and vector normalization.
+- Official clustering should remain on `embeddings_only`. Behavior/spend-derived columns are allowed for profiling and business interpretation after clustering.
+- Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`; diagnostics live under `outputs/<mode>/artifacts/stage6/`.
+- Stage 6.8 is the raw-evidence boundary. After it runs, Stage 7 should read the saved evidence bundle and per-tribe exports rather than reopening global transactions or assignments.
+- Stage 7 accepts Stage 6.6 readiness as final and does not apply extra promotion gates.
 - Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
 
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) is the agent/operator guide for this repo.
-- [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md) is the current state, missing work, and next experiment plan.
+- [data/README.md](data/README.md) documents local data expectations.
+- [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md) is the current state, remaining risks, and next actions.
 - [docs/PROJECT_FILE_INVENTORY.md](docs/PROJECT_FILE_INVENTORY.md) is the current source-file and artifact inventory.
 - [docs/notebook_contract.md](docs/notebook_contract.md) is the stage-by-stage notebook operating contract.
+- [docs/CROSS_MACHINE_REPRODUCIBILITY.md](docs/CROSS_MACHINE_REPRODUCIBILITY.md) captures reproducibility guardrails.
 - [docs/Carrefour_Data_Challenge_Project_Context.md](docs/Carrefour_Data_Challenge_Project_Context.md) preserves the original project brief and methodological constraints.
-

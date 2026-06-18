@@ -458,6 +458,120 @@ def two_stage_hdbscan_artifact_paths(
     }
 
 
+def _two_stage_primary_cache_paths(paths: dict[str, Path]) -> list[Path]:
+    return [
+        paths["assignment_path"],
+        paths["results_path"],
+    ]
+
+
+def _two_stage_required_sidecar_paths(paths: dict[str, Path]) -> list[Path]:
+    return [
+        paths["lift_evidence_path"],
+        paths["lift_evidence_csv_path"],
+    ]
+
+
+def _should_use_cached_artifact_set(
+    paths: list[Path],
+    *,
+    force: bool,
+    use_cached: bool,
+    metadata: dict[str, Any],
+) -> bool:
+    return all(
+        should_use_cache(path, force=force, use_cached=use_cached, metadata=metadata)
+        for path in paths
+    )
+
+
+def _ensure_two_stage_lift_evidence_artifacts(
+    paths: dict[str, Path],
+    settings: dict[str, Any],
+    cache_metadata: dict[str, Any],
+    cfg: PipelineConfig,
+) -> bool:
+    """Backfill lift evidence sidecars when the heavy two-stage cache is present."""
+
+    lift_evidence_path = paths["lift_evidence_path"]
+    lift_evidence_csv_path = paths["lift_evidence_csv_path"]
+    lift_evidence: pl.DataFrame | None = None
+    if not lift_evidence_path.exists() and paths["unfiltered_profile_path"].exists():
+        lift_evidence = _product_lift_filter_evidence(
+            pl.read_parquet(paths["unfiltered_profile_path"]),
+            settings["lift_filter"],
+            cfg=cfg,
+        )
+        lift_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        lift_evidence.write_parquet(lift_evidence_path)
+        write_artifact_metadata(lift_evidence_path, cache_metadata)
+    if lift_evidence_path.exists() and not lift_evidence_csv_path.exists():
+        lift_evidence = lift_evidence if lift_evidence is not None else pl.read_parquet(lift_evidence_path)
+        lift_evidence_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        _lift_evidence_csv_frame(lift_evidence).write_csv(lift_evidence_csv_path)
+        write_artifact_metadata(lift_evidence_csv_path, cache_metadata)
+    return all(path.exists() for path in _two_stage_required_sidecar_paths(paths))
+
+
+def _current_optional_result_path(
+    cached_result: dict[str, Any],
+    key: str,
+    current_path: Path | None,
+    explicit_path: Path | None = None,
+) -> str | None:
+    if explicit_path is not None:
+        return str(explicit_path)
+    if cached_result.get(key) is None or current_path is None:
+        return None
+    return str(current_path)
+
+
+def _with_current_two_stage_result_paths(
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    *,
+    stage1_assignment_path: Path | None = None,
+    stage1_results_path: Path | None = None,
+    stage2_assignment_path: Path | None = None,
+    stage2_results_path: Path | None = None,
+    stage2_noise_feature_path: Path | None = None,
+) -> dict[str, Any]:
+    """Replace environment-specific cached paths with the current config paths."""
+
+    patched = dict(result)
+    patched["assignment_path"] = str(paths["assignment_path"])
+    patched["unfiltered_assignment_path"] = str(paths["unfiltered_assignment_path"])
+    patched["unfiltered_profile_path"] = str(paths["unfiltered_profile_path"])
+    patched["lift_filter_evidence_path"] = str(paths["lift_evidence_path"])
+    patched["lift_filter_evidence_csv_path"] = str(paths["lift_evidence_csv_path"])
+    patched["stage1_assignment_path"] = _current_optional_result_path(
+        patched,
+        "stage1_assignment_path",
+        paths["stage1_assignment_path"],
+        stage1_assignment_path,
+    )
+    patched["stage1_result_path"] = _current_optional_result_path(
+        patched,
+        "stage1_result_path",
+        paths["stage1_results_path"],
+        stage1_results_path,
+    )
+    patched["stage2_noise_feature_path"] = str(stage2_noise_feature_path or paths["stage2_noise_feature_path"])
+    patched["stage2_assignment_path"] = _current_optional_result_path(
+        patched,
+        "stage2_assignment_path",
+        paths["stage2_assignment_path"],
+        stage2_assignment_path,
+    )
+    patched["stage2_result_path"] = _current_optional_result_path(
+        patched,
+        "stage2_result_path",
+        paths["stage2_results_path"],
+        stage2_results_path,
+    )
+    return patched
+
+
 def stage3_noise_probe_artifact_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
     settings = stage3_noise_probe_settings(cfg)
     output_prefix = settings["output_prefix"]
@@ -878,13 +992,26 @@ def merge_official_two_stage_hdbscan_lift_core(
     stage2_results = Path(stage2_results_path) if stage2_results_path is not None else None
     behavior_path = _optional_behavior_feature_path(cfg)
     cache_metadata = _two_stage_cache_metadata(umap_path, settings, behavior_path, cfg)
-    if (
-        should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
-        and should_use_cache(results_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
-    ):
+    use_cached = cfg.get("cache.use_cached", True)
+    if _should_use_cached_artifact_set(
+        _two_stage_primary_cache_paths(paths),
+        force=force,
+        use_cached=use_cached,
+        metadata=cache_metadata,
+    ) and _ensure_two_stage_lift_evidence_artifacts(paths, settings, cache_metadata, cfg):
         log_event("Stage 6.4 two-stage merge", "cache hit", cfg=cfg, results=results_path)
         result = pl.read_parquet(results_path).row(0, named=True)
-        result["assignment_path"] = str(assignment_path)
+        result = _with_current_two_stage_result_paths(
+            result,
+            paths,
+            stage1_assignment_path=stage1_assignment,
+            stage1_results_path=stage1_results,
+            stage2_assignment_path=stage2_assignment,
+            stage2_results_path=stage2_results,
+            stage2_noise_feature_path=noise_feature_path,
+        )
+        pl.DataFrame([result]).write_parquet(results_path)
+        write_artifact_metadata(results_path, cache_metadata)
         return assignment_path, results_path, result
 
     stage1_best = pl.read_parquet(stage1_results).row(0, named=True) if stage1_results.exists() else {}
@@ -1023,13 +1150,14 @@ def run_official_two_stage_hdbscan_lift_core(
     force = cfg.get("cache.force", False) if force is None else force
     settings = official_two_stage_hdbscan_settings(cfg)
     output_prefix = settings["output_prefix"]
-    assignment_path = cfg.model_selection_cache / f"cluster_assignments_{output_prefix}.parquet"
-    results_path = cfg.model_selection_cache / f"{output_prefix}_results.parquet"
-    unfiltered_assignment_path = cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_unfiltered.parquet"
-    noise_feature_path = cfg.model_selection_cache / f"{output_prefix}_stage2_noise_features.parquet"
-    unfiltered_profile_path = cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}_unfiltered.parquet"
-    lift_evidence_path = cfg.artifacts / "stage6" / f"{output_prefix}_lift_filter_evidence.parquet"
-    lift_evidence_csv_path = lift_evidence_path.with_suffix(".csv")
+    paths = two_stage_hdbscan_artifact_paths(cfg)
+    assignment_path = paths["assignment_path"]
+    results_path = paths["results_path"]
+    unfiltered_assignment_path = paths["unfiltered_assignment_path"]
+    noise_feature_path = paths["stage2_noise_feature_path"]
+    unfiltered_profile_path = paths["unfiltered_profile_path"]
+    lift_evidence_path = paths["lift_evidence_path"]
+    lift_evidence_csv_path = paths["lift_evidence_csv_path"]
     behavior_path = _optional_behavior_feature_path(cfg)
     cache_metadata = {
         "stage": "two_stage_hdbscan_lift_core",
@@ -1049,13 +1177,18 @@ def run_official_two_stage_hdbscan_lift_core(
         "quality_gates": cfg.get("quality_gates", {}),
         "assignment_schema_version": 2,
     }
-    if (
-        should_use_cache(assignment_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
-        and should_use_cache(results_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata)
-    ):
+    use_cached = cfg.get("cache.use_cached", True)
+    if _should_use_cached_artifact_set(
+        _two_stage_primary_cache_paths(paths),
+        force=force,
+        use_cached=use_cached,
+        metadata=cache_metadata,
+    ) and _ensure_two_stage_lift_evidence_artifacts(paths, settings, cache_metadata, cfg):
         log_event("Stage 6.2 two-stage HDBSCAN", "cache hit", cfg=cfg, results=results_path)
         result = pl.read_parquet(results_path).row(0, named=True)
-        result["assignment_path"] = str(assignment_path)
+        result = _with_current_two_stage_result_paths(result, paths)
+        pl.DataFrame([result]).write_parquet(results_path)
+        write_artifact_metadata(results_path, cache_metadata)
         return assignment_path, results_path, result
 
     with stage_timer(
