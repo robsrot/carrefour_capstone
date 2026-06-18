@@ -1,334 +1,389 @@
-"""Phase 3 — Dimensionality reduction for 1.48M customer vectors.
+"""Dimensionality-reduction helpers used for baselines and visualization."""
 
-Two methods are compared:
-  UMAP  (primary)   — preserves non-linear topology; better for density-based clustering
-  PCA   (baseline)  — linear, fast, interpretable; run to measure structural loss
-
-Scale strategy for UMAP (1.48M × 100 is too large for a single fit call):
-  1. Fit UMAP on a stratified random sample of UMAP_FIT_SAMPLE rows.
-  2. Transform the remaining customers in a single .transform() call.
-  3. This is O(sample × log(sample)) for fit, O(n) for transform.
-  PCA uses full-population SVD — sklearn handles 1.48M × 100 natively in ~30 s.
-
-Public API
-----------
-reduce_umap_cluster()  → data/processed/umap_cluster_50d.parquet
-reduce_umap_viz()      → data/processed/umap_viz_2d.parquet
-reduce_pca()           → data/processed/pca_cluster_50d.parquet
-
-All functions accept a Polars DataFrame with columns [cliente, vector, promo_rate]
-and return one with [cliente, <dim columns>, promo_rate].
-"""
 from __future__ import annotations
 
-import logging
+import shutil
 from pathlib import Path
-
-import pickle
+from typing import Any
 
 import numpy as np
 import polars as pl
-from sklearn.decomposition import PCA
-import umap
 
-from src.config import (
-    DATA_PROCESSED,
-    RANDOM_SEED,
-    UMAP_CLUSTER_DIMS,
-    UMAP_VIZ_DIMS,
-    UMAP_N_NEIGHBORS,
-    UMAP_MIN_DIST_CLUSTER,
-    UMAP_MIN_DIST_VIZ,
-    UMAP_METRIC,
+from src.config import CONFIG, PipelineConfig
+from src.progress import log_event, stage_timer
+from src.utils import (
+    collect_streaming,
+    deterministic_sample_indices,
+    file_fingerprint,
+    frame_to_numpy,
+    numeric_feature_columns,
+    should_use_cache,
+    write_artifact_metadata,
 )
 
-_log = logging.getLogger(__name__)
 
-# How many customers to fit UMAP on — large enough to capture density structure,
-# small enough that fit() finishes in a few minutes on 10 cores.
-UMAP_FIT_SAMPLE = 300_000   # 100k was only 6.7% of population; rare customer types were underrepresented in the learned manifold
+def build_pca_representation(
+    feature_path: str | Path,
+    output_path: str | Path | None = None,
+    summary_path: str | Path | None = None,
+    n_components: int | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
 
-_UMAP_CLUSTER_CACHE = DATA_PROCESSED / "umap_cluster_20d.parquet"
-_UMAP_VIZ_CACHE     = DATA_PROCESSED / "umap_viz_2d.parquet"
-_PCA_CACHE          = DATA_PROCESSED / "pca_cluster_20d.parquet"
-_PCA_MODEL_CACHE    = DATA_PROCESSED / "pca_model.pkl"
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    output = Path(output_path) if output_path else cfg.outputs / "features" / "feature_set_pca.parquet"
+    summary_output = Path(summary_path) if summary_path else output.with_name(f"{output.stem}_summary.csv")
+    requested_components = n_components or int(cfg.get("pca.n_components", 32))
+    cache_metadata = {
+        "stage": "pca_representation",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "summary_path": str(summary_output),
+        "n_components": requested_components,
+        "random_seed": cfg.random_seed,
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 6 PCA", "cache hit", cfg=cfg, path=output)
+        return output
 
-
-# ─── helpers ──────────────────────────────────────────────────────────────────
-
-def _vectors_to_numpy(df: pl.DataFrame) -> np.ndarray:
-    """Extract the 'vector' list column → (n, dims) float32 array."""
-    return np.array(df["vector"].to_list(), dtype=np.float32)
-
-
-def _df_from_embedding(
-    cliente: pl.Series,
-    embedding: np.ndarray,
-    promo_rate: pl.Series,
-    prefix: str,
-) -> pl.DataFrame:
-    """Build a Polars DataFrame from a numpy embedding array."""
-    n_dims = embedding.shape[1]
-    cols = {f"{prefix}{i}": pl.Series(embedding[:, i]) for i in range(n_dims)}
-    return pl.DataFrame({"cliente": cliente, **cols, "promo_rate": promo_rate})
-
-
-# ─── UMAP clustering embedding (50D) ─────────────────────────────────────────
-
-def reduce_umap_cluster(
-    customer_vectors: pl.DataFrame | None = None,
-    *,
-    force: bool = False,
-    n_jobs: int = -1,
-) -> pl.DataFrame:
-    """UMAP 100D → 20D embedding for HDBSCAN clustering.
-
-    Fits on UMAP_FIT_SAMPLE random customers, transforms the rest.
-    Cached to umap_cluster_20d.parquet.
-
-    Parameters
-    ----------
-    customer_vectors : DataFrame with [cliente, vector, promo_rate].
-                       If None, loads customer_vectors_weighted.parquet.
-    n_jobs           : parallel threads for UMAP fit (-1 = all cores).
-    """
-    if _UMAP_CLUSTER_CACHE.exists() and not force:
-        n = pl.scan_parquet(_UMAP_CLUSTER_CACHE).select(pl.len()).collect().item()
-        _log.info("UMAP cluster cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_UMAP_CLUSTER_CACHE)
-
-    if customer_vectors is None:
-        _log.info("Loading customer_vectors_weighted.parquet ...")
-        customer_vectors = pl.read_parquet(DATA_PROCESSED / "customer_vectors_weighted.parquet")
-
-    X = _vectors_to_numpy(customer_vectors)          # (N, 100)
-    # Append promo_rate as 101st feature so promotional sensitivity influences UMAP topology,
-    # not just post-hoc profiling — this is the key axis separating promo-surfers from loyalists
-    promo = customer_vectors["promo_rate"].fill_null(0.0).to_numpy().reshape(-1, 1).astype(np.float32)
-    X = np.hstack([X, promo])                        # (N, 101)
-
-    # Append store affinity features — separates store-format loyalists from cross-format shoppers
-    # as a first-class UMAP dimension, not just a post-hoc label
-    _store_path = DATA_PROCESSED / "customer_store_features.parquet"
-    if not _store_path.exists():
-        from src.customer_vectors import build_store_features as _bsf
-        _store_df = _bsf()
-    else:
-        _store_df = pl.read_parquet(_store_path)
-    _store_cols = [c for c in _store_df.columns if c != "cliente"]
-    _store_aligned = (
-        customer_vectors.select("cliente")
-        .join(_store_df, on="cliente", how="left")
-        .fill_null(0.0)
-        .select(_store_cols)
+    source_rows = _parquet_row_count(feature_path)
+    schema_df = pl.read_parquet(feature_path, n_rows=1)
+    feature_cols = numeric_feature_columns(schema_df)
+    log_event(
+        "Stage 6 PCA",
+        "loading dense feature matrix",
+        cfg=cfg,
+        source_rows=source_rows,
+        feature_count=len(feature_cols),
+        approx_float32_mb=round(source_rows * max(len(feature_cols), 1) * 4 / (1024**2), 1),
     )
-    store_arr = _store_aligned.to_numpy().astype(np.float32)
-    X = np.hstack([X, store_arr])                    # (N, 101 + n_stores)
+    df = pl.read_parquet(feature_path).sort("cliente")
+    X = StandardScaler(copy=False).fit_transform(frame_to_numpy(df, feature_cols)).astype(np.float32, copy=False)
+    dims = min(requested_components, X.shape[1], X.shape[0] - 1)
+    if dims < 1:
+        raise ValueError("PCA requires at least one numeric feature and at least two rows.")
+    with stage_timer(
+        "Stage 6 PCA",
+        "fitting pre-UMAP PCA",
+        cfg=cfg,
+        source_rows=df.height,
+        input_features=len(feature_cols),
+        retained_components=dims,
+    ):
+        pca = PCA(n_components=dims, random_state=cfg.random_seed)
+        coords = pca.fit_transform(X)
+    out = {"cliente": df["cliente"].to_list()}
+    for idx in range(coords.shape[1]):
+        out[f"pca_{idx:03d}"] = coords[:, idx].astype("float32")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(out).write_parquet(output)
+    _write_pca_summary(
+        summary_output,
+        feature_path=feature_path,
+        output_path=output,
+        feature_count=len(feature_cols),
+        requested_components=requested_components,
+        actual_components=dims,
+        explained_variance_ratio=pca.explained_variance_ratio_,
+    )
+    write_artifact_metadata(output, cache_metadata)
+    write_artifact_metadata(summary_output, {**cache_metadata, "artifact": "pca_summary"})
+    log_event(
+        "Stage 6 PCA",
+        "wrote artifact",
+        cfg=cfg,
+        rows=df.height,
+        retained_components=dims,
+        retained_variance_pct=round(float(pca.explained_variance_ratio_.sum() * 100.0), 2),
+        path=output,
+    )
+    return output
 
-    # Append KPI features — spend level, visit frequency, basket size, product diversity.
-    # These capture HOW customers shop (not just WHAT they buy) and have the highest
-    # variance of any feature in the dataset (CV 1.4–10x). Without them, a VIP who
-    # shops weekly and a casual visitor who buys the same products once land in the
-    # same tribe. Log1p handles extreme right skew; z-score centres per feature;
-    # KPI_WEIGHT=3 gives ~10% total signal weight vs being drowned by 100 product dims.
-    _KPI_WEIGHT = 3.0
-    _kpi_path = DATA_PROCESSED / "customer_kpis.parquet"
-    if _kpi_path.exists():
-        _kpi_cols = ["total_spend_6m", "visit_count", "avg_basket_size", "unique_products"]
-        _kpi_aligned = (
-            customer_vectors.select("cliente")
-            .join(
-                pl.read_parquet(_kpi_path).select(["cliente"] + _kpi_cols),
-                on="cliente", how="left",
-            )
-            .fill_null(0.0)
-            .select(_kpi_cols)
+
+def _write_pca_summary(
+    output: Path,
+    *,
+    feature_path: str | Path,
+    output_path: str | Path,
+    feature_count: int,
+    requested_components: int,
+    actual_components: int,
+    explained_variance_ratio: np.ndarray,
+) -> None:
+    explained = np.asarray(explained_variance_ratio, dtype=np.float64)
+    retained = float(explained.sum())
+    row = {
+        "stage": "pca_for_umap",
+        "purpose": "Pre-reduce standardized customer product-behavior features before UMAP to denoise the neighbor graph and keep UMAP tractable.",
+        "feature_path": str(feature_path),
+        "pca_path": str(output_path),
+        "input_dimension_count": int(feature_count),
+        "requested_component_count": int(requested_components),
+        "retained_component_count": int(actual_components),
+        "dimension_reduction": f"{int(feature_count)} -> {int(actual_components)}",
+        "standardized_input": True,
+        "retained_variance_ratio": retained,
+        "retained_variance_pct": retained * 100.0,
+        "pc1_variance_pct": float(explained[0] * 100.0) if explained.size else None,
+        "pc5_cumulative_variance_pct": float(explained[:5].sum() * 100.0) if explained.size else None,
+        "pc10_cumulative_variance_pct": float(explained[:10].sum() * 100.0) if explained.size else None,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame([row]).write_csv(output)
+
+
+def build_umap_representation(
+    feature_path: str | Path,
+    output_path: str | Path | None = None,
+    umap_overrides: dict | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Build a high-dimensional UMAP representation intended for clustering candidates."""
+
+    import umap
+    from sklearn.preprocessing import StandardScaler
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    umap_cfg = {**(cfg.get("umap", {}) or {}), **(umap_overrides or {})}
+    output = Path(output_path) if output_path else cfg.outputs / "features" / str(
+        umap_cfg.get("output", "feature_set_umap_cluster.parquet")
+    )
+    n_components = int(umap_cfg.get("n_components", 20))
+    n_neighbors = int(umap_cfg.get("n_neighbors", 30))
+    min_dist = float(umap_cfg.get("min_dist", 0.0))
+    metric = str(umap_cfg.get("metric", "cosine"))
+    standardize_input = bool(umap_cfg.get("standardize_input", False))
+    row_count = _parquet_row_count(feature_path)
+    fit_sample_size = _umap_fit_sample_size(umap_cfg, row_count, cfg)
+    transform_batch_size = int(umap_cfg.get("transform_batch_size", 100000))
+    cache_metadata = {
+        "stage": "umap_representation",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "umap": umap_cfg,
+        "resolved_fit_sample_size": fit_sample_size,
+        "source_rows": row_count,
+        "transform_batch_size": transform_batch_size,
+        "random_seed": cfg.random_seed,
+        "purpose": "clustering_candidate",
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 6 UMAP", "cache hit", cfg=cfg, path=output)
+        return output
+
+    with stage_timer(
+        "Stage 6 UMAP",
+        "building clustering representation",
+        cfg=cfg,
+        components=n_components,
+        n_neighbors=n_neighbors,
+        metric=metric,
+        source_rows=row_count,
+        fit_sample_size=fit_sample_size,
+        transform_batch_size=transform_batch_size,
+    ):
+        schema_df = pl.read_parquet(feature_path, n_rows=1)
+        feature_cols = numeric_feature_columns(schema_df)
+        log_event(
+            "Stage 6 UMAP",
+            "resolved feature matrix policy",
+            cfg=cfg,
+            feature_count=len(feature_cols),
+            dense_fit_float32_mb=round(fit_sample_size * max(len(feature_cols), 1) * 4 / (1024**2), 1),
+            full_transform_batched=fit_sample_size < row_count,
         )
-        _kpi_arr = np.log1p(_kpi_aligned.to_numpy().astype(np.float64))
-        _kpi_arr = (_kpi_arr - _kpi_arr.mean(axis=0)) / (_kpi_arr.std(axis=0) + 1e-8)
-        _kpi_arr = (_kpi_arr * _KPI_WEIGHT).astype(np.float32)
-        X = np.hstack([X, _kpi_arr])                 # (N, 101 + n_stores + 4)
-        _log.info("  KPI features appended: %s (weight=%.1fx)", _kpi_cols, _KPI_WEIGHT)
-    else:
-        _log.warning("customer_kpis.parquet not found — KPI features skipped")
+        fit_indices = deterministic_sample_indices(row_count, fit_sample_size, cfg.random_seed)
+        if fit_indices.shape[0] >= row_count:
+            df = pl.read_parquet(feature_path).sort("cliente")
+            X = frame_to_numpy(df, feature_cols)
+            if standardize_input:
+                X = StandardScaler(copy=False).fit_transform(X).astype("float32", copy=False)
+            else:
+                X = X.astype("float32", copy=False)
 
-    N = len(X)
+            reducer = umap.UMAP(
+                n_components=min(n_components, X.shape[1], X.shape[0] - 1),
+                n_neighbors=min(n_neighbors, X.shape[0] - 1),
+                min_dist=min_dist,
+                metric=metric,
+                random_state=cfg.random_seed,
+                low_memory=bool(umap_cfg.get("low_memory", True)),
+                n_jobs=int(umap_cfg.get("n_jobs", 1)),
+            )
+            coords = reducer.fit_transform(X).astype("float32")
+            out = {"cliente": df["cliente"].to_list()}
+            for idx in range(coords.shape[1]):
+                out[f"umap_{idx:03d}"] = coords[:, idx]
+            output.parent.mkdir(parents=True, exist_ok=True)
+            pl.DataFrame(out).write_parquet(output)
+        else:
+            sample = _collect_feature_rows_by_index(feature_path, feature_cols, fit_indices)
+            X_fit = frame_to_numpy(sample, feature_cols)
+            scaler = None
+            if standardize_input:
+                scaler = StandardScaler(copy=False)
+                X_fit = scaler.fit_transform(X_fit).astype("float32", copy=False)
+            else:
+                X_fit = X_fit.astype("float32", copy=False)
 
-    # Sample for fit
-    rng = np.random.default_rng(RANDOM_SEED)
-    sample_idx = rng.choice(N, size=min(UMAP_FIT_SAMPLE, N), replace=False)
-    sample_idx.sort()
-    X_sample = X[sample_idx]
-
-    _log.info(
-        "UMAP cluster fit: %s sample, input_dims=%d, n_neighbors=%d, n_components=%d, metric=%s ...",
-        f"{len(X_sample):,}", X.shape[1], UMAP_N_NEIGHBORS, UMAP_CLUSTER_DIMS, UMAP_METRIC,
-    )
-    reducer = umap.UMAP(
-        n_components=UMAP_CLUSTER_DIMS,
-        n_neighbors=UMAP_N_NEIGHBORS,
-        min_dist=UMAP_MIN_DIST_CLUSTER,
-        metric=UMAP_METRIC,
-        random_state=RANDOM_SEED,
-        n_jobs=n_jobs,
-        low_memory=True,
-    )
-    reducer.fit(X_sample)
-    _log.info("UMAP fit complete. Transforming all %s customers ...", f"{N:,}")
-
-    embedding = reducer.transform(X).astype(np.float32)   # (N, 20)
-
-    # UMAP transform can produce NaN for outlier points far from the training sample.
-    nan_rows = np.isnan(embedding).any(axis=1)
-    if nan_rows.any():
-        col_means = np.nanmean(embedding, axis=0)
-        embedding[nan_rows] = col_means
-        _log.warning("  %d NaN embeddings replaced with column means", int(nan_rows.sum()))
-
-    df = _df_from_embedding(
-        customer_vectors["cliente"],
-        embedding,
-        customer_vectors["promo_rate"],
-        prefix="u",
-    )
-    _UMAP_CLUSTER_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_UMAP_CLUSTER_CACHE, compression="zstd")
-    _log.info(
-        "Saved %s UMAP cluster embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _UMAP_CLUSTER_CACHE.name,
-        _UMAP_CLUSTER_CACHE.stat().st_size / 1024 ** 2,
-    )
-    return df
+            reducer = umap.UMAP(
+                n_components=min(n_components, X_fit.shape[1], X_fit.shape[0] - 1),
+                n_neighbors=min(n_neighbors, X_fit.shape[0] - 1),
+                min_dist=min_dist,
+                metric=metric,
+                random_state=cfg.random_seed,
+                low_memory=bool(umap_cfg.get("low_memory", True)),
+                n_jobs=int(umap_cfg.get("n_jobs", 1)),
+            )
+            reducer.fit(X_fit)
+            _write_umap_transformed_batches(
+                feature_path,
+                feature_cols,
+                reducer,
+                output,
+                standardize_input=standardize_input,
+                scaler=scaler,
+                batch_size=transform_batch_size,
+                row_count=row_count,
+                cfg=cfg,
+            )
+        write_artifact_metadata(output, cache_metadata)
+        log_event(
+            "Stage 6 UMAP",
+            "wrote artifact",
+            cfg=cfg,
+            rows=row_count,
+            fit_sample_rows=int(fit_indices.shape[0]),
+            path=output,
+        )
+    return output
 
 
-# ─── UMAP viz embedding (2D) ──────────────────────────────────────────────────
+def _parquet_row_count(path: str | Path) -> int:
+    return int(collect_streaming(pl.scan_parquet(path).select(pl.len().alias("n_rows")))[0, "n_rows"])
 
-def reduce_umap_viz(
-    umap_cluster: pl.DataFrame | None = None,
-    *,
-    force: bool = False,
-    n_jobs: int = -1,
+
+def _umap_fit_sample_size(umap_cfg: dict[str, Any], row_count: int, cfg: PipelineConfig) -> int:
+    raw_value = umap_cfg.get("fit_sample_size", None)
+    if raw_value is None:
+        raw_value = cfg.get("modeling.fit_sample_size", None)
+    if raw_value is None:
+        return row_count
+    sample_size = int(raw_value)
+    if sample_size <= 0:
+        return row_count
+    return min(sample_size, row_count)
+
+
+def _collect_feature_rows_by_index(
+    feature_path: str | Path,
+    feature_cols: list[str],
+    indices: np.ndarray,
 ) -> pl.DataFrame:
-    """UMAP 20D → 2D embedding for visualisation.
-
-    Takes the 20D clustering embedding as input (not the raw 100D vectors) so
-    the visualisation is geometrically consistent with the clustering.
-    Cached to umap_viz_2d.parquet.
-    """
-    if _UMAP_VIZ_CACHE.exists() and not force:
-        n = pl.scan_parquet(_UMAP_VIZ_CACHE).select(pl.len()).collect().item()
-        _log.info("UMAP viz cache hit — %s customers", f"{n:,}")
-        return pl.read_parquet(_UMAP_VIZ_CACHE)
-
-    if umap_cluster is None:
-        _log.info("Loading umap_cluster_50d.parquet ...")
-        umap_cluster = pl.read_parquet(_UMAP_CLUSTER_CACHE)
-
-    dim_cols = [c for c in umap_cluster.columns if c.startswith("u")]
-    X = umap_cluster.select(dim_cols).to_numpy().astype(np.float32)
-    N = len(X)
-
-    # Guard against NaN inherited from the cluster embedding (e.g. from a prior cached run)
-    nan_rows = np.isnan(X).any(axis=1)
-    if nan_rows.any():
-        col_means = np.nanmean(X, axis=0)
-        X[nan_rows] = col_means
-        _log.warning("  %d NaN rows in input replaced with column means before viz fit", int(nan_rows.sum()))
-
-    rng = np.random.default_rng(RANDOM_SEED)
-    sample_idx = rng.choice(N, size=min(UMAP_FIT_SAMPLE, N), replace=False)
-    sample_idx.sort()
-
-    _log.info(
-        "UMAP viz fit: %s sample, n_components=2, min_dist=%.2f ...",
-        f"{len(sample_idx):,}", UMAP_MIN_DIST_VIZ,
+    return (
+        collect_streaming(
+            pl.scan_parquet(feature_path)
+            .with_row_index("_row_idx")
+            .filter(pl.col("_row_idx").is_in([int(value) for value in indices]))
+            .select(["_row_idx", "cliente", *feature_cols])
+            .sort("_row_idx")
+        )
+        .drop("_row_idx")
     )
-    reducer = umap.UMAP(
-        n_components=UMAP_VIZ_DIMS,
-        n_neighbors=UMAP_N_NEIGHBORS,
-        min_dist=UMAP_MIN_DIST_VIZ,
-        metric="euclidean",
-        random_state=RANDOM_SEED,
-        n_jobs=n_jobs,
-        low_memory=True,
-    )
-    reducer.fit(X[sample_idx])
-    _log.info("UMAP viz fit complete. Transforming all %s customers ...", f"{N:,}")
-
-    embedding = reducer.transform(X).astype(np.float32)   # (N, 2)
-
-    nan_rows = np.isnan(embedding).any(axis=1)
-    if nan_rows.any():
-        col_means = np.nanmean(embedding, axis=0)
-        embedding[nan_rows] = col_means
-        _log.warning("  %d NaN viz embeddings replaced with column means", int(nan_rows.sum()))
-
-    df = _df_from_embedding(
-        umap_cluster["cliente"],
-        embedding,
-        umap_cluster["promo_rate"],
-        prefix="viz_",
-    )
-    df = df.rename({"viz_0": "x", "viz_1": "y"})
-
-    df.write_parquet(_UMAP_VIZ_CACHE, compression="zstd")
-    _log.info(
-        "Saved %s UMAP viz embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _UMAP_VIZ_CACHE.name,
-        _UMAP_VIZ_CACHE.stat().st_size / 1024 ** 2,
-    )
-    return df
 
 
-# ─── PCA baseline (50D) ───────────────────────────────────────────────────────
-
-def reduce_pca(
-    customer_vectors: pl.DataFrame | None = None,
+def _write_umap_transformed_batches(
+    feature_path: str | Path,
+    feature_cols: list[str],
+    reducer: Any,
+    output: Path,
     *,
-    n_components: int = UMAP_CLUSTER_DIMS,
-    force: bool = False,
-) -> pl.DataFrame:
-    """PCA 100D → 20D baseline (linear, full population, no sampling needed).
+    standardize_input: bool,
+    scaler: Any,
+    batch_size: int,
+    row_count: int,
+    cfg: PipelineConfig,
+) -> None:
+    batch_size = max(int(batch_size), 1)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    parts_dir = output.parent / f".{output.stem}_umap_parts"
+    if parts_dir.exists():
+        shutil.rmtree(parts_dir)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        part_index = 0
+        for offset in range(0, row_count, batch_size):
+            batch = collect_streaming(
+                pl.scan_parquet(feature_path)
+                .slice(offset, batch_size)
+                .select(["cliente", *feature_cols])
+            )
+            if batch.is_empty():
+                continue
+            X_batch = frame_to_numpy(batch, feature_cols)
+            if standardize_input and scaler is not None:
+                X_batch = scaler.transform(X_batch).astype("float32")
+            else:
+                X_batch = X_batch.astype("float32", copy=False)
+            coords = reducer.transform(X_batch).astype("float32")
+            out = {"cliente": batch["cliente"].to_list()}
+            for idx in range(coords.shape[1]):
+                out[f"umap_{idx:03d}"] = coords[:, idx]
+            pl.DataFrame(out).write_parquet(parts_dir / f"part_{part_index:05d}.parquet")
+            part_index += 1
+            log_event(
+                "Stage 6 UMAP",
+                "transformed batch",
+                cfg=cfg,
+                rows=batch.height,
+                offset=offset,
+                total_rows=row_count,
+            )
+        pl.scan_parquet(str(parts_dir / "part_*.parquet")).sink_parquet(str(output))
+    finally:
+        shutil.rmtree(parts_dir, ignore_errors=True)
 
-    sklearn PCA on 1.48M × 100 with float32 uses ~2 GB RAM and finishes in ~30 s.
-    Cached to pca_cluster_20d.parquet.
-    """
-    if _PCA_CACHE.exists() and _PCA_MODEL_CACHE.exists() and not force:
-        n = pl.scan_parquet(_PCA_CACHE).select(pl.len()).collect().item()
-        _log.info("PCA cache hit — %s customers", f"{n:,}")
-        with open(_PCA_MODEL_CACHE, "rb") as fh:
-            pca = pickle.load(fh)
-        return pl.read_parquet(_PCA_CACHE), pca
 
-    if customer_vectors is None:
-        _log.info("Loading customer_vectors_weighted.parquet ...")
-        customer_vectors = pl.read_parquet(DATA_PROCESSED / "customer_vectors_weighted.parquet")
+def build_umap_visualization(
+    feature_path: str | Path,
+    output_path: str | Path | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    import umap
+    from sklearn.preprocessing import StandardScaler
 
-    X = _vectors_to_numpy(customer_vectors)
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    output = Path(output_path) if output_path else cfg.outputs / "features" / "umap_visualization.parquet"
+    cache_metadata = {
+        "stage": "umap_visualization",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "n_components": 2,
+        "random_seed": cfg.random_seed,
+        "n_jobs": 1,
+    }
+    if should_use_cache(output, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        return output
 
-    _log.info("PCA fit+transform on %s × %d ...", f"{len(X):,}", X.shape[1])
-    pca = PCA(n_components=n_components, random_state=RANDOM_SEED)
-    embedding = pca.fit_transform(X).astype(np.float32)
-
-    explained = pca.explained_variance_ratio_.sum()
-    _log.info(
-        "PCA complete — %d components explain %.1f%% of variance",
-        n_components, explained * 100,
-    )
-
-    df = _df_from_embedding(
-        customer_vectors["cliente"],
-        embedding,
-        customer_vectors["promo_rate"],
-        prefix="pc",
-    )
-    _PCA_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(_PCA_CACHE, compression="zstd")
-    with open(_PCA_MODEL_CACHE, "wb") as fh:
-        pickle.dump(pca, fh)
-    _log.info(
-        "Saved %s PCA embeddings → %s  (%.1f MB on disk)",
-        f"{len(df):,}", _PCA_CACHE.name,
-        _PCA_CACHE.stat().st_size / 1024 ** 2,
-    )
-    return df, pca
+    df = pl.read_parquet(feature_path).sort("cliente")
+    feature_cols = numeric_feature_columns(df)
+    X = StandardScaler().fit_transform(frame_to_numpy(df, feature_cols))
+    coords = umap.UMAP(n_components=2, random_state=cfg.random_seed, n_jobs=1).fit_transform(X)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "cliente": df["cliente"].to_list(),
+            "x": coords[:, 0].astype("float32"),
+            "y": coords[:, 1].astype("float32"),
+        }
+    ).write_parquet(output)
+    write_artifact_metadata(output, cache_metadata)
+    return output

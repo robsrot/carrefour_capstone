@@ -1,0 +1,46 @@
+# Production overrides for the committed pipeline settings selected in dev.
+# Keep the modeling recipe aligned with dev, but scale sample sizes and density
+# thresholds to the larger production population.
+
+word2vec:
+  workers: 5
+
+modeling:
+  evaluation_sample_size: 50000
+
+profiling:
+  min_term_customers: 100
+  min_term_population_customers: 250
+  min_subsegment_coverage: 0.005
+  noise_audit_min_customers: 250
+
+official_model_suite:
+  umap_hdbscan:
+    # Dev uses min_cluster_size=500 on the dev subset. Production fits HDBSCAN
+    # on a 300k customer sample, so this keeps a similar minimum density share
+    # while preserving the promoted PCA64/u20/n75/leaf/ms12 recipe.
+    trial_name: u20_n75_leaf_mcs5400_ms12_core
+    variant_prefix: u20_n75_leaf_mcs5400_ms12
+    umap:
+      # Fit the expensive manifold step on a deterministic customer sample,
+      # then transform the full production population in memory-bounded batches.
+      fit_sample_size: 300000
+      transform_batch_size: 50000
+    hdbscan:
+      min_cluster_size: 5000
+  two_stage_hdbscan:
+    trial_name: two_stage_u20_n75_leaf_mcs5400_ms12_lift_core
+    variant_prefix: two_stage_u20_n75_leaf_mcs5400_ms12
+    second_stage_hdbscan:
+      min_cluster_size: 3500
+    stage3_noise_probe:
+      min_noise_customers: 1000
+      hdbscan:
+        min_cluster_size: 1200
+
+hdbscan:
+  # Prod raw-HDBSCAN diagnostics, if enabled, use a scaled minimum density share.
+  min_cluster_size: 1000
+
+pca:
+  n_components: 24

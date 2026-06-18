@@ -1,107 +1,88 @@
 # Project Context: Carrefour Data Challenge
-**Discovering Organic Tribes from Massive Purchase Tickets**
-*Source: The Data Refinery — Analytical Manifesto v4.01*
 
----
+Discovering organic customer tribes from massive purchase-ticket data.
 
-## 1. The Core Objective
+Source: The Data Refinery analytical manifesto v4.01.
 
-Build an end-to-end machine learning pipeline that segments Carrefour customers into **behavioral clusters ("organic tribes")** derived purely from their purchase history — with no reliance on demographic attributes such as age, gender, or location.
+This document preserves the original project brief. It is not the current implementation status. For the current status, missing work, and roadmap, see [PROJECT_STATUS_AND_ROADMAP.md](PROJECT_STATUS_AND_ROADMAP.md).
 
-The goal is to move away from traditional demographic profiling (e.g., "Women 30–40") and toward behavior-driven segmentation (e.g., "Weekend shoppers focused on private label, organic fresh produce, and bulk products").
+## 1. Core Objective
 
----
+Build an end-to-end machine learning pipeline that segments Carrefour customers into behavioral clusters, or "organic tribes", derived from purchase history alone.
 
-## 2. The Dataset
+The project must move away from demographic profiling such as "women 30-40" and toward behavior-driven segmentation such as "weekly fresh-produce shoppers with high private-label dairy affinity".
 
-- **Scale:** Over 1 million unique customers (slide notes elsewhere reference 11 million — plan for that upper bound)
-- **Input:** Raw transactional history — customer IDs mapped directly to purchased product lines
-- **Format:** Pure checkout ticket records; no pre-processed features or pre-built algorithms
+## 2. Dataset
 
----
+- Scale: over 1 million unique customers in the provided extract.
+- Input: raw transactional history mapping anonymized customer IDs to purchased product lines.
+- Format: checkout ticket records, not pre-engineered customer features.
+- Exclusions: no age, gender, ZIP code, or other demographic attributes.
 
-## 3. The Required Pipeline — 4 Phases
+## 3. Required Four-Phase Pipeline
 
-### Phase 1 — Product Embedding: "The Language of Shopping"
+### Phase 1: Product Embedding
 
-**What to do:**
-Apply a **Word2Vec / Item2Vec** architecture trained on the full ticket history.
+Apply a Word2Vec / Item2Vec architecture trained on the ticket history.
 
-**How it works:**
-- Treat every shopping cart as a "sentence"
-- Treat every purchased product as a "word"
-- Train the model so that products frequently bought together are geometrically close in vector space
+- Treat each shopping basket as a sentence.
+- Treat every purchased product as a word.
+- Train embeddings so products frequently bought together are geometrically close.
 
-**Expected output:** A dense vector representation for every product in the catalogue, encoding its semantic purchase context (e.g., Beer and Chips will be close; Diapers will be far away).
+Expected output: one dense vector representation per product, encoding co-purchase context.
 
----
+### Phase 2: Customer Mathematization
 
-### Phase 2 — Customer Mathematization: "From Products to People"
+Aggregate each customer's purchase history into a behavioral vector.
 
-**What to do:**
-Aggregate each customer's full purchase history into a single behavioral vector.
+Critical constraints:
 
-**Critical constraints:**
-- **DO NOT use simple arithmetic mean** — averaging product vectors destroys signal and amplifies noise permanently
-- **Apply frequency-weighted aggregation** — habitual/recurring purchases must outweigh one-off anomalies
-- **Apply time-decay curves** — recent purchases must carry significantly more weight than older ones (a purchase from yesterday defines the customer better than one from two years ago)
+- Do not use simple arithmetic mean as the final method; it is only acceptable as a baseline.
+- Apply frequency weighting so habitual purchases outweigh one-off anomalies.
+- Apply time decay so recent purchases carry more weight than older purchases.
 
-**Expected output:** One high-dimensional behavioral vector per customer.
+Expected output: one high-dimensional behavioral vector per customer.
 
----
+### Phase 3: Dimensionality Reduction
 
-### Phase 3 — Dimensionality Reduction: "Taming the Vector Space"
+Compress customer vectors into a manageable latent space using non-linear techniques.
 
-**What to do:**
-Compress the high-dimensional customer vectors into a manageable latent space using non-linear techniques.
+Approved approaches:
 
-**Approved approaches:**
-- **Autoencoders / VAE (Variational Autoencoders):** Use deep learning to compress thousands of raw dimensions into a continuous, hyper-dense latent space of approximately 100 dimensions
-- **UMAP / t-SNE:** Advanced manifold learning techniques that preserve the global topological structure of organic groups when moving from ultra-high to low dimensionality
+- Autoencoders or variational autoencoders.
+- UMAP or t-SNE.
 
-**Explicitly forbidden:**
-- **PCA** — assumes linear dependencies, which is invalid for consumer behaviour data (e.g., the combination of buying soy milk AND baby diapers creates non-linear, folded geometries that PCA cannot capture)
+The original brief discourages PCA because PCA is linear. The current project still runs PCA as an empirical baseline so we can prove what structure is lost, rather than simply asserting it.
 
----
+### Phase 4: Customer Clustering
 
-### Phase 4 — Customer Clustering: "Finding Organic Shapes"
+Run density-based clustering on the reduced vector space to discover natural groups.
 
-**What to do:**
-Run density-based clustering on the reduced vector space to discover natural customer groupings.
+Primary algorithm: HDBSCAN.
 
-**Mandated algorithm: HDBSCAN**
+- Groups customers by topological density.
+- Finds irregular cluster shapes without requiring a predefined K.
+- Isolates outliers as noise.
 
-- Groups customers by topological density
-- Discovers irregular, organic cluster shapes without requiring a predefined number of clusters (K)
-- Naturally isolates outliers and anomalous transactions as mathematical "noise" — leaving them unassigned
+The original brief discourages K-Means because it imposes spherical clusters and a fixed K. The current project still runs K-Means as a business-readable baseline and compares it against HDBSCAN.
 
-**Explicitly forbidden:**
-- **K-Means** — assumes clusters are perfect spheres and forces the practitioner to artificially guess K (the number of tribes). Strictly prohibited.
-
----
-
-## 4. Infrastructure & Technical Directives
+## 4. Infrastructure Directives
 
 | Requirement | Detail |
 |---|---|
-| **Distributed Processing** | The full transactional history of millions of customers requires a robust distributed computing architecture (e.g., Spark, Dask, or equivalent) |
-| **GPU Acceleration** | HDBSCAN and UMAP spatial distance calculations across millions of dense vectors will collapse standard CPUs. Hardware acceleration (GPU) is **mandatory** |
-| **Centroid Profiling** | After clustering, cross the resulting mathematical clusters back against the product master catalogue to commercially "name" each tribe — this is the step that transforms math into actionable business intelligence |
-
----
+| Distributed processing | The full transaction history is large enough to require careful streaming or distributed processing. |
+| GPU acceleration | Production-scale UMAP/HDBSCAN may need GPU acceleration or stronger infrastructure. |
+| Centroid/profile interpretation | Mathematical clusters must be crossed back to product data so tribes can be named commercially. |
 
 ## 5. Final Deliverable
 
-An interpretable map of **named customer tribes**, each commercially described by their dominant purchase behaviors — ready to power targeting, personalisation, and retail strategy at scale.
+An interpretable map of named customer tribes, each described by distinctive product behaviors and commercial relevance.
 
----
+The final answer should not be "Cluster 4". It should be a product-led segment that Carrefour can understand and act on.
 
-## 6. What Is Explicitly Out of Scope
+## 6. Out of Scope
 
-- Demographic segmentation of any kind (age, gender, zip code)
-- Pre-chewed or pre-engineered feature sets — input must be raw ticket data
-- K-Means clustering
-- PCA for dimensionality reduction
-- Simple mean aggregation of product vectors
-
----
+- Demographic segmentation.
+- Pre-built demographic features.
+- Treating simple mean vectors as the final customer representation.
+- Selecting clusters from metrics alone without product-level interpretation.

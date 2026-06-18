@@ -1,47 +1,199 @@
 # Carrefour Data Challenge
-End-to-end behavioral customer segmentation pipeline — discovering organic tribes from raw purchase ticket data.
 
-## Prerequisites
+Product-first behavioral customer segmentation for Carrefour checkout data. The goal is to discover actionable customer tribes from what people buy, not from demographic attributes.
 
-Make sure you have **Conda** installed before starting.
-If not, install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) first.
+## Current Status
 
-## Getting Started
+As of 2026-06-15:
 
-### 1. Clone the repository
+- Production preprocessing and EDA are complete: raw CSVs have been converted, cleaned, joined, quality-checked, and summarized into `data/processed/`.
+- The ML pipeline is product-first: official customer vectors aggregate product embeddings using product quantities plus configured recency and product-frequency weighting, not spend. Spend remains available for profiling and business interpretation after clustering.
+- UMAP is used as a dimensionality-reduction aid and candidate clustering representation. It is not treated as an automatic winner.
+- Official Stage 6 compares committed model families without forcing a curated 10-15 cluster target. The client expectation is treated as a hypothesis checked after the model is evaluated.
+- Stage 6.4 validity/stability diagnostics and Stage 7 deep profiling are the official final evidence flow before handoff.
+- Stage 7 now writes a primary evidence storyline, with product-lift profiles, a dedicated noise-population audit, tribe dossiers, subsegment overlays, clustering atlas, and aggregate-only LLM interpretation prompt pack as supporting proof.
+- Visualization outputs now belong under `outputs/<mode>/figures/`, including `figures/model_selection/`, `figures/presentation/`, and `figures/tribe_lifts/`.
+- Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader UMAP-HDBSCAN sweeps belong there before any setting is promoted into YAML.
+- Local prod artifacts exist for embeddings/features/model-selection caches. If `outputs/prod/profiles/` is empty, prod Stage 7 is still a cold profile build and can take a long time on the 9.8 GB prepared transaction table.
 
-```bash
-git clone https://github.com/robsrot/carrefour_capstone.git
-cd carrefour_capstone
-```
+For the detailed status, gaps, and product-first improvement plan, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
-### 2. Create the environment
+## Quick Start
+
+### 1. Create the environment
 
 ```bash
 conda env create -f environment.yml
 conda activate carrefour
-```
-
-### 3. Register the Jupyter kernel
-
-```bash
 python -m ipykernel install --user --name=carrefour --display-name "Python (carrefour)"
 ```
 
-This only needs to be done once. It makes the `carrefour` environment available inside Jupyter and VS Code.
+Verify the HDBSCAN-compatible dependency set:
 
-### 4. Add your data files
-
-Raw data files are not included in this repository.
-Place the two raw CSV files in `data/raw/csv/`:
-
+```powershell
+python -c "import sklearn, hdbscan, polars; print('sklearn', sklearn.__version__); print('hdbscan ok'); print('polars', polars.__version__)"
 ```
+
+Expected: `sklearn 1.7.2`. If this prints `1.8.x`, recreate the environment or run:
+
+```powershell
+conda activate carrefour
+conda install -c conda-forge scikit-learn=1.7.2
+pip install --force-reinstall --no-deps hdbscan==0.8.40
+```
+
+### 2. Add the raw CSV files
+
+Raw data is not committed. Place the source files here:
+
+```text
 data/raw/csv/ie_maestra_articulos.csv
 data/raw/csv/ie_linea_ticket.csv
 ```
 
-### 5. Convert CSV to Parquet
+### 3. Convert raw CSVs to Parquet
 
-Open `notebooks/01_exploration.ipynb` and run the **one-time setup** cell.
-This converts the raw CSVs to Parquet for fast loading. Only needs to be done once.
-The `ie_linea_ticket.csv` file is ~26 GB — conversion takes 5–15 minutes depending on your disk.
+Run once from Python or from a notebook:
+
+```python
+from src.data_loader import verify_csv_checksums, convert_csv_to_parquet
+
+verify_csv_checksums()
+convert_csv_to_parquet()
+```
+
+Use `verify_csv_checksums(record=True)` only on the machine that establishes the canonical raw files.
+
+### 4. Run the notebooks in order
+
+```bash
+jupyter notebook notebooks/01_exploration.ipynb
+jupyter notebook notebooks/02_pre-analysis.ipynb
+```
+
+After `02_pre-analysis.ipynb` has created `data/processed/df_combined.parquet` and `data/processed/customer_kpis.parquet`, generate the dev subset:
+
+```powershell
+$env:CARREFOUR_MODE = "prod"
+python -m src.generate_dev_subset
+```
+
+Optionally run experiment sandboxes in dev mode before committing final hyperparameters:
+
+```powershell
+$env:CARREFOUR_MODE = "dev"
+jupyter notebook notebooks/04_experiment_sandbox.ipynb
+```
+
+Promote only the winning settings from the sandbox summaries into YAML. Then run the clean ML pipeline in dev mode:
+
+```powershell
+$env:CARREFOUR_MODE = "dev"
+jupyter notebook notebooks/03_ml_pipeline.ipynb
+```
+
+After pulling the current repo or changing vectorization/modeling code, rerun from Stage 4 onward before interpreting Stage 6+ results.
+
+Prod mode is the default when `CARREFOUR_MODE` is unset.
+
+## Colleague Handoff Checklist
+
+Before handing the repo to another teammate:
+
+```powershell
+python -c "import sklearn, hdbscan; print(sklearn.__version__); print('hdbscan ok')"
+pytest
+git status --short
+```
+
+The source handoff must include configs, notebooks, docs, and all `src/*.py` modules used by the official flow. In the current local tree, `src/cache_audit.py` is required by Stage 0. Generated data/model/output artifacts stay local and should not be committed.
+
+For experimentation:
+
+1. Work in `CARREFOUR_MODE=dev`.
+2. Use `notebooks/04_experiment_sandbox.ipynb`.
+3. Inspect each experiment's compact `*_summary.csv` or `*_summary.md`.
+4. Promote only evidence-backed settings into YAML.
+5. Rerun `notebooks/03_ml_pipeline.ipynb` cleanly from the affected upstream stage.
+
+## Repository Layout
+
+```text
+configs/          Hyperparameters and dev/prod overrides
+data/             Local raw, processed, and dev data artifacts; never committed
+  raw/csv/        Source CSVs supplied outside git
+  raw/parquet/    Raw Parquet conversions
+  processed/      Production prepared data from Notebook 02
+  dev/            Stratified dev subset
+docs/             Project context, current status, run contracts, and inventory
+notebooks/        Ordered analysis, official pipeline, and sandbox notebooks
+outputs/          Mode-scoped generated artifacts; never committed
+src/              Reusable pipeline modules
+tests/            Test package placeholder; add source tests here
+```
+
+Generated ML artifacts stay under `outputs/<mode>/`. Dev includes an experiment workbench; prod does not.
+
+```text
+outputs/dev/
+  .artifact_metadata.json  Central cache metadata manifest
+  embeddings/   Basket sentences and product embedding tables
+  features/     Customer vectors and model-ready feature sets
+  figures/      Client-facing plots and diagnostics
+    model_selection/
+    presentation/
+    tribe_lifts/
+  models/       Trained local model binaries and internal model-selection caches
+    model_selection/
+  profiles/     Tribe profile parquet outputs
+  reports/      Human-readable summaries, exports, and final selection evidence
+    evidence/
+    model_selection/
+    presentation/
+  experiments/  Optional sandbox runs, one flat folder per experiment
+
+outputs/prod/
+  .artifact_metadata.json  Central cache metadata manifest after prod stages run
+  embeddings/   Basket sentences and product embedding tables
+  features/     Customer vectors and model-ready feature sets
+  figures/      Client-facing plots and diagnostics
+    model_selection/
+    presentation/
+    tribe_lifts/
+  models/       Trained local model binaries and internal model-selection caches
+    model_selection/
+  profiles/     Tribe profile parquet outputs
+  reports/      Human-readable summaries, exports, and final selection evidence
+    evidence/
+    model_selection/
+    presentation/
+```
+
+## Operating Conventions
+
+- Keep reusable logic in `src/`; notebooks should orchestrate and explain, not duplicate pipeline code.
+- Put shared hyperparameters in `configs/base.yaml`, dev overrides in `configs/dev.yaml`, and production-scale overrides in `configs/prod.yaml`; expose new values through `src/config.py`.
+- Use `CARREFOUR_MODE=dev` for fast iteration and `CARREFOUR_MODE=prod` for full artifacts.
+- Use `notebooks/04_experiment_sandbox.ipynb` for hyperparameter experiments and `notebooks/03_ml_pipeline.ipynb` for the official YAML-driven run.
+- Do not commit raw data, Parquet caches, trained models, or output images.
+- Keep sandbox outputs in `outputs/dev/experiments/<experiment_name>/` with no nested subfolders; promote only the selected settings back into YAML.
+- Experiments are disabled in prod. Production should only run the official pipeline with the scale-aware settings in `configs/prod.yaml`.
+- Sandbox diagnostics keep Parquet as the canonical artifact and also write compact `*_summary.csv` / `*_summary.md` files so experiments can be inspected quickly.
+- Keep `reports/` for concise human-facing outputs. Official Stage 6 compares only the committed candidates from `official_model_suite`; broader sweeps belong in the sandbox notebook.
+- Official customer vectorization must not use `importe` or other spend fields. Use the shared quantity plus recency/frequency weighting recipe in the pipeline; test alternate vector recipes, including IDF, only in the sandbox.
+- Stage 6.4 writes cluster validity and perturbation-stability diagnostics after Stage 6, so selection is based on more than silhouette/noise alone.
+- Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`.
+- Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`; avoid per-file `.meta.json` sidecars.
+- Prod Stage 6 is intentionally sample-fit/full-assign: UMAP fits on the configured customer sample, transforms the full population in batches, and HDBSCAN fits on the same deterministic sample before assigning all customers.
+- Stage 7 profiling can be the slowest interpretation step in prod because it scans prepared transactions to compute product, sector, theme, term, noise-audit, subsegment, and customer-context evidence, then packages the result into a compact evidence storyline.
+- Stage 7 keeps HDBSCAN noise outside the official core-tribe story, but writes a noise-population audit with behavior contrasts, product/theme/term over-indexing, and a recommended action before any soft-assignment or second-pass-clustering decision.
+- Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
+
+## Documentation
+
+- [AGENTS.md](AGENTS.md) is the agent/operator guide for this repo.
+- [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md) is the current state, missing work, and next experiment plan.
+- [docs/PROJECT_FILE_INVENTORY.md](docs/PROJECT_FILE_INVENTORY.md) is the current source-file and artifact inventory.
+- [docs/notebook_contract.md](docs/notebook_contract.md) is the stage-by-stage notebook operating contract.
+- [docs/Carrefour_Data_Challenge_Project_Context.md](docs/Carrefour_Data_Challenge_Project_Context.md) preserves the original project brief and methodological constraints.
+

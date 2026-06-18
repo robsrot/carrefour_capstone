@@ -1,0 +1,25 @@
+experiments:
+  enabled: true
+
+word2vec:
+  workers: 5
+
+customer_embeddings:
+  variant_diagnostics:
+    enabled: true
+
+modeling:
+  evaluation_sample_size: 12000
+  fit_sample_size: null
+
+gmm:
+  max_iter: 200
+  n_init: 1
+
+autoencoder:
+  epochs: 12
+  batch_size: 512
+  patience: 3
+
+pca:
+  n_components: 24

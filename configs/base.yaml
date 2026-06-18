@@ -1,0 +1,480 @@
+run:
+  mode_env: CARREFOUR_MODE
+  default_mode: prod
+  random_seed: 42
+
+paths:
+  raw_csv: data/raw/csv
+  raw_parquet: data/raw/parquet
+  processed: data/processed
+  dev: data/dev
+  outputs: outputs
+
+data:
+  prepared_transactions: df_combined.parquet
+  product_master: maestra_articulos.parquet
+  customer_kpis: customer_kpis.parquet
+  min_tickets_per_customer: 3
+  required_columns:
+    - cliente
+    - ticket
+    - fecha
+    - idarticu
+    - importe
+    - unidades
+  optional_columns:
+    - idpromoc
+    - idtiprod
+    - desc_larga_articulo
+    - idsector
+    - desc_sector
+
+cache:
+  force: false
+  use_cached: true
+
+progress:
+  enabled: true
+
+experiments:
+  enabled: false
+
+baskets:
+  construction_strategy: common_downsampled
+  repeat_product_by_quantity: false
+  output: basket_sentences.parquet
+  diagnostics:
+    output_dir: stage1
+    product_ubiquity_output: product_ubiquity_diagnostics.parquet
+    basket_exposure_output: basket_common_product_exposure.parquet
+    common_products_csv: common_product_candidates.csv
+    downsampling_plan_output: common_product_downsampling_plan.parquet
+    downsampling_summary_output: basket_downsampling_summary.csv
+    summary_md: basket_common_product_diagnostics.md
+    write_markdown_report: false
+    top_n_common_products: 50
+    common_customer_penetration_threshold: 0.01
+    common_basket_penetration_threshold: 0.005
+    common_line_share_threshold: 0.005
+  downsampling:
+    manual_exclude_product_ids: []
+    auto_exclude:
+      enabled: true
+      customer_penetration_threshold: 0.50
+      basket_penetration_threshold: 0.10
+      line_share_threshold: null
+      max_products: 25
+    target_customer_penetration: 0.01
+    keep_probability_exponent: 0.5
+    min_keep_probability: 0.15
+
+word2vec:
+  vector_size: 128
+  window: 2
+  full_basket_context: true
+  min_tokens_per_basket: 2
+  max_tokens_per_basket: 20
+  min_count: 60
+  negative: 10
+  sample: 0.0001
+  epochs: 5
+  sg: 1
+  workers: 1
+  report_progress: true
+  compute_loss: false
+  model_name: word2vec_product.model
+  embeddings_output: product_embeddings.parquet
+  diagnostics:
+    output_dir: stage2
+    training_summary_csv: item2vec_training_corpus_diagnostics.csv
+
+embedding_validation:
+  output_dir: stage3
+  sample_size: 100
+  neighbors: 8
+  staple_sample_size: 20
+  niche_sample_size: 20
+  common_sample_size: 20
+  rare_sample_size: 20
+  niche_category_sample_size: 6
+  category_report_max_products: 4
+  niche_basket_penetration_max: 0.001
+  common_neighbor_basket_penetration_threshold: 0.005
+  generic_neighbor_warning_share_threshold: 0.50
+  write_extract_figures: false
+  guardrails:
+    max_generic_warning_product_share: 0.10
+    min_rare_same_sector_share: 0.35
+    max_common_rare_same_sector_gap: 0.35
+    max_top_hub_cross_sector_share: 0.80
+    max_hubness_lift: 10.0
+    min_cross_sector_hubness_lift: 3.0
+    min_cross_sector_source_sectors: 3
+  niche_categories: auto
+  auto_niche_categories:
+    min_matched_products: 10
+    max_matched_products: 5000
+    max_median_basket_penetration: 0.005
+    max_categories: 12
+  hubness_neighbors: 10
+  hubness_sample_size: null
+  hubness_chunk_size: 256
+  output_csv: embedding_validation.csv
+  hubness_output_csv: embedding_hubness.csv
+  output_md: embedding_validation.md
+  write_markdown_report: false
+
+customer_embeddings:
+  output: customer_embeddings.parquet
+  weight_strategy: quantity_idf
+  quantity_transform: log1p
+  max_customer_product_weight: null
+  normalize_vectors: true
+  recency_weighting:
+    enabled: true
+    date_column: fecha
+    reference_date: null
+    half_life_days: 180
+    min_multiplier: 0.35
+  frequency_weighting:
+    enabled: true
+    ticket_column: ticket
+    transform: log1p
+    exponent: 0.5
+    max_multiplier: 2.0
+  diagnostics:
+    enabled: true
+    output_dir: stage4
+    output_prefix: customer_embedding
+    write_top_products_csv: false
+    top_n_products: 15
+  variant_diagnostics:
+    enabled: false
+    output_dir: stage4
+    output_csv: customer_embedding_variant_diagnostics.csv
+    trials:
+      - name: quantity_log1p_legacy
+        weight_strategy: quantity
+        quantity_transform: log1p
+        max_customer_product_weight: null
+        normalize_vectors: true
+      - name: capped_quantity_log1p_10
+        weight_strategy: quantity
+        quantity_transform: log1p
+        max_customer_product_weight: 10
+        normalize_vectors: true
+      - name: official_quantity_idf_log1p
+        weight_strategy: quantity_idf
+        quantity_transform: log1p
+        max_customer_product_weight: null
+        normalize_vectors: true
+  gates:
+    enabled: true
+    fail_on_violation: true
+    apply_to_custom_outputs: false
+    # Higher word2vec min_count intentionally removes rare-SKU lines; keep
+    # customer coverage and dominance gates strict, but allow raw line/unit
+    # coverage to reflect that pruning.
+    min_line_coverage_pct: 85.0
+    min_unit_coverage_pct: 85.0
+    min_product_coverage_pct: null
+    min_customer_coverage_pct: 99.0
+    max_zero_embedded_customer_pct: 1.0
+    max_top_product_weight_share_pct: 5.0
+    max_top_10_product_weight_share_pct: 25.0
+    max_mean_customer_top_product_weight_share_pct: 65.0
+    max_p95_customer_top_product_weight_share_pct: 95.0
+    max_common_product_weight_share_pct: 60.0
+    max_mean_customer_common_product_weight_share_pct: 70.0
+    max_p95_customer_common_product_weight_share_pct: 90.0
+
+behavioral_features:
+  output: customer_behavior_features.parquet
+  reference_date: null
+
+product_exposure_features:
+  enabled: false
+  output: customer_product_exposure_features.parquet
+  catalog_output_dir: stage5
+  catalog_output_csv: product_exposure_feature_catalog.csv
+  ticket_column: ticket
+  metrics:
+    - basket_share
+    - distinct_product_share
+  dimensions:
+    themes: true
+    sectors: true
+    product_families: true
+  min_customers:
+    theme: 30
+    sector: 200
+    family: 120
+  max_features:
+    theme: 100
+    sector: 40
+    family: 120
+  family_ngram_sizes: [3, 2]
+  max_families_per_product: 6
+
+feature_sets:
+  default: embeddings_only
+  standardize_behavior: true
+  standardize_product_exposure: true
+  product_exposure_weight: 0.35
+  frequency_anchor_weight: 0.12
+  diagnostics:
+    output_dir: stage5
+    output_csv: feature_set_diagnostics.csv
+    neighbor_overlap_k: 10
+    neighbor_overlap_sample_size: 2000
+  outputs:
+    embeddings_only: feature_set_embeddings_only.parquet
+    embeddings_frequency: feature_set_embeddings_frequency.parquet
+    embeddings_product_exposure: feature_set_embeddings_product_exposure.parquet
+    embeddings_behavior: feature_set_embeddings_behavior.parquet
+
+model_selection:
+  write_summary_markdown: false
+
+autoencoder:
+  enabled: true
+  latent_sizes: [8, 16, 32]
+  hidden_multiplier: 2
+  epochs: 25
+  batch_size: 1024
+  learning_rate: 0.001
+  patience: 5
+  output_prefix: autoencoder_latent
+
+modeling:
+  # Official tribe discovery stays on customer embeddings only. Product-derived
+  # exposure features are built as profiling/challenger evidence, not as the
+  # default clustering driver.
+  feature_set_for_selection: embeddings_only
+  evaluation_sample_size: 25000
+  fit_sample_size: 300000
+  client_hypothesis_min: 10
+  client_hypothesis_max: 15
+
+official_model_suite:
+  include_gmm: false
+  include_raw_hdbscan: false
+  include_umap_hdbscan: true
+  include_autoencoder: false
+  include_pca_kmeans: false
+  gmm:
+    components_min: 10
+    components_max: 10
+  pca_kmeans:
+    pca:
+      n_components: 24
+    kmeans:
+      k_min: 10
+      k_max: 10
+  umap_hdbscan:
+    promoted_from_experiment: clustering_quality_improvement_pca64_leaf
+    trial_name: u20_n75_leaf_mcs500_ms12_core
+    model_name: model_b_umap_hdbscan_core
+    output_prefix: model_b_umap_hdbscan_core
+    algorithm_name: UMAP_HDBSCAN
+    feature_space: umap_customer_embeddings_pca64_u20_n75
+    variant_prefix: u20_n75_leaf_mcs500_ms12
+    pca_components: 64
+    umap:
+      output: feature_set_umap_pca64_u20_n75.parquet
+      n_components: 20
+      n_neighbors: 75
+      min_dist: 0.0
+      metric: cosine
+      fit_sample_size: null
+      transform_batch_size: 100000
+    hdbscan:
+      min_cluster_size: 500
+      min_samples: 12
+      cluster_selection_method: leaf
+      allow_noise_assignment: false
+  two_stage_hdbscan:
+    enabled: true
+    trial_name: two_stage_u20_n75_leaf_mcs500_ms12_lift_core
+    model_name: model_d_two_stage_hdbscan_lift_core
+    output_prefix: model_d_two_stage_hdbscan_lift_core
+    algorithm_name: UMAP_HDBSCAN_TwoStageLiftCore
+    feature_space: umap_customer_embeddings_pca64_u20_n75
+    variant_prefix: two_stage_u20_n75_leaf_mcs500_ms12
+    second_stage_hdbscan:
+      min_cluster_size: 350
+      min_samples: 12
+      cluster_selection_method: leaf
+      allow_noise_assignment: false
+    stage3_noise_probe:
+      enabled: true
+      # Visual review is required before running candidate-only HDBSCAN on remaining noise.
+      run_candidate_hdbscan_after_visual_review: false
+      output_prefix: model_d_stage3_remaining_noise_probe
+      pca_components: 48
+      min_noise_customers: 100
+      umap:
+        n_components: 10
+        n_neighbors: 50
+        min_dist: 0.0
+        metric: cosine
+        fit_sample_size: null
+        transform_batch_size: 100000
+      hdbscan:
+        min_cluster_size: 150
+        min_samples: 8
+        cluster_selection_method: leaf
+        allow_noise_assignment: false
+      lift_filter:
+        min_strong_product_lifts: 2
+        require_significant_product_lift: true
+    lift_filter:
+      min_strong_product_lifts: 2
+      require_significant_product_lift: true
+
+stability:
+  sample_size: 10000
+  repeats: 5
+  jitter_scale: 0.02
+
+quality_gates:
+  min_clusters: 2
+  min_silhouette: 0.0
+  max_noise_pct: 60.0
+  max_cluster_size_cv: 1.5
+  require_profile_lift: false
+  min_strong_product_lifts_per_cluster: 1.0
+
+stage6_quality:
+  sample_size: 5000
+  neighbor_k: 15
+  distance_sample_size: 1500
+  dbcv_sample_size: 3000
+
+gmm:
+  components_min: 6
+  components_max: 25
+  covariance_type: diag
+  max_iter: 300
+  n_init: 2
+
+hdbscan:
+  min_cluster_size: 500
+  min_samples: 12
+  cluster_selection_method: leaf
+  allow_noise_assignment: false
+
+umap:
+  enabled: true
+  output: feature_set_umap_cluster.parquet
+  n_components: 20
+  n_neighbors: 30
+  min_dist: 0.0
+  metric: cosine
+  standardize_input: false
+  low_memory: true
+  n_jobs: 1
+  fit_sample_size: null
+  transform_batch_size: 100000
+
+pca:
+  n_components: 32
+  random_state: 42
+
+kmeans:
+  k_min: 6
+  k_max: 25
+  batch_size: 4096
+  n_init: 10
+
+profiling:
+  top_n_products: 15
+  top_n_sectors: 10
+  top_n_themes: 8
+  top_n_terms: 10
+  min_product_customers: 10
+  min_term_customers: 20
+  min_term_population_customers: 30
+  min_subsegment_coverage: 0.01
+  max_terms_per_product: 18
+  strong_product_lift_threshold: 1.5
+  strong_sector_lift_threshold: 1.2
+  strong_theme_lift_threshold: 1.2
+  strong_term_lift_threshold: 1.25
+  significance_q_threshold: 0.05
+  noise_audit_top_n: 12
+  noise_audit_min_customers: 20
+  noise_audit_strong_lift_threshold: 1.25
+  noise_audit_high_noise_pct: 60.0
+  noise_audit_second_pass_signal_count: 5
+  min_ready_evidence_signals: 1
+  tribe_name_lookup: {}
+  # Stage 7 accepts Stage 6.6 readiness as final. These are Stage 6.6
+  # statuses, not a new Stage 7 promotion gate.
+  final_handoff_readiness_statuses:
+    - strong
+    - usable
+    - ready_strong
+    - ready
+    - pass
+  # Actionability proof is communication evidence only; it never gates whether
+  # a Stage 6.6-promoted tribe receives a Stage 7 profile.
+  final_actionability_allow_theme_proof: false
+  final_actionability_min_product_signals: 2
+  final_actionability_min_product_lift: 1.5
+  final_actionability_min_product_coverage: 0.005
+  final_actionability_min_product_customers: 25
+  final_actionability_min_term_signals: 1
+  final_actionability_min_term_lift: 1.5
+  final_actionability_min_term_coverage: 0.02
+  final_actionability_min_term_customers: 50
+  # Theme reads are a presentation layer, not a clustering input. They must
+  # clear lift, reach, and FDR gates before a broad product theme is promoted.
+  theme_label_min_lift: 1.5
+  theme_label_min_coverage: 0.15
+  theme_label_min_customers: 100
+  theme_label_min_tagged_products: 2
+  theme_product_example_count: 4
+  theme_label_q_threshold: 0.05
+  theme_label_require_significant: true
+  campaign_signal_themes: []
+  output_parquet: tribe_profiles.parquet
+  output_csv_template: tribe_profiles_{mode}.csv
+
+llm_analysis:
+  # Optional post-Stage-7 interpretation only. This must never feed clustering,
+  # cluster filtering, or final tribe promotion.
+  enabled: true
+  provider: gemini
+  api_key_env: GEMINI_API_KEY
+  model: gemini-3.5-flash
+  temperature: 0.2
+  top_p: 0.9
+  max_output_tokens: 1800
+  request_timeout_seconds: 90
+  max_evidence_rows_per_tribe: 24
+  write_prompt_audit: true
+  fail_on_missing_key: false
+  fail_on_error: false
+
+exports:
+  write_table_companions: false
+  cluster_summary_template: cluster_summary_{mode}.csv
+  tribe_comparison_template: tribe_side_by_side_{mode}.csv
+  clustering_atlas_template: clustering_atlas_{mode}.html
+  profile_report_template: tribe_profile_evidence_{mode}.md
+
+visualization:
+  max_scatter_points: 50000
+  noise_umap_probe_zoom_quantile: 0.995
+  random_state: 42
+  umap:
+    n_neighbors: 30
+    min_dist: 0.05
+    metric: cosine
+    standardize_input: false
+    n_jobs: 1
+  interactive:
+    max_points: 5000
+    projection_method: pca
+    include_plotlyjs: true
