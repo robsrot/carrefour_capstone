@@ -14,6 +14,13 @@ from src.config import CONFIG, PipelineConfig
 from src.progress import log_event, stage_timer
 from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns, scan_if_path, schema_names
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+except ImportError:
+    pass
+
 
 KING_BLUE = "#0050A4"
 

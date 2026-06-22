@@ -250,6 +250,49 @@ def test_stage6_hdbscan_diagnostics_pass_for_two_stage_hard_policy(tmp_path):
     assert checks["assignment_policy"] == "hard_two_stage_hdbscan_lift_core_noise_retained"
 
 
+def test_stage6_hdbscan_diagnostics_pass_for_three_stage_hard_policy(tmp_path):
+    cfg = _test_config(tmp_path)
+    cfg.ensure_directories()
+    _, umap_path = _write_feature_and_umap(tmp_path)
+    assignment_path = tmp_path / "assignments_three_stage.parquet"
+    result_path = tmp_path / "results_three_stage.parquet"
+
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3"],
+            "tribe_id": [0, 1, -1],
+            "assignment_source": [
+                "three_stage_hdbscan_stage1_core",
+                "three_stage_hdbscan_stage2_noise_core",
+                "three_stage_hdbscan_noise_unassigned",
+            ],
+        }
+    ).write_parquet(assignment_path)
+    pl.DataFrame(
+        [
+            {
+                "cluster_count": 2,
+                "noise_pct": 33.3333,
+                "core_coverage_pct": 66.6667,
+                "assignment_policy": "hard_three_stage_hdbscan_lift_core_noise_retained",
+                "soft_assignment_enabled": False,
+                "soft_assigned_pct": 0.0,
+                "passes_quality_gate": True,
+                "quality_gate_reason": "pass",
+            }
+        ]
+    ).write_parquet(result_path)
+
+    checks = pl.read_csv(build_stage6_hdbscan_diagnostics(umap_path, assignment_path, result_path, cfg=cfg)).row(
+        0,
+        named=True,
+    )
+
+    assert checks["check_status"] == "pass"
+    assert checks["blocking_check_status"] == "pass"
+    assert checks["assignment_policy"] == "hard_three_stage_hdbscan_lift_core_noise_retained"
+
+
 def test_stage6_hdbscan_diagnostics_quality_failure_does_not_block_evidence(tmp_path):
     cfg = _test_config(tmp_path)
     cfg.ensure_directories()

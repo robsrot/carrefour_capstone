@@ -68,9 +68,11 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     official = base["official_model_suite"]
     promoted = official["umap_hdbscan"]
     two_stage = official["two_stage_hdbscan"]
+    three_stage = official["three_stage_hdbscan"]
     hdbscan = promoted["hdbscan"]
     second_stage = two_stage["second_stage_hdbscan"]
     stage3_probe = two_stage["stage3_noise_probe"]
+    third_stage = three_stage["third_stage_hdbscan"]
 
     assert base["modeling"]["feature_set_for_selection"] == "embeddings_only"
     assert base["product_exposure_features"]["dimensions"] == {
@@ -88,6 +90,9 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert base["customer_embeddings"]["gates"]["min_line_coverage_pct"] == 85.0
     assert base["customer_embeddings"]["gates"]["min_unit_coverage_pct"] == 85.0
     assert base["profiling"]["final_handoff_readiness_statuses"] == ["strong", "usable", "ready_strong", "ready", "pass"]
+    assert base["profiling"]["stage7_delivery_readiness"]["enabled"] is True
+    assert base["profiling"]["stage7_delivery_readiness"]["fail_on_critical"] is True
+    assert base["profiling"]["stage7_delivery_readiness"]["activation_customer_export_required"] is True
     assert base["profiling"]["tribe_name_lookup"] == {}
     assert base["profiling"]["final_actionability_allow_theme_proof"] is False
     assert official["include_umap_hdbscan"] is True
@@ -120,6 +125,17 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert "leaf_mcs500_ms12" in two_stage["variant_prefix"]
     assert two_stage["lift_filter"]["min_strong_product_lifts"] >= 2
     assert two_stage["lift_filter"]["require_significant_product_lift"] is True
+    assert three_stage["enabled"] is True
+    assert three_stage["model_name"] == "model_e_three_stage_hdbscan_lift_core"
+    assert three_stage["output_prefix"] == "model_e_three_stage_hdbscan_lift_core"
+    assert three_stage["min_noise_customers"] == stage3_probe["min_noise_customers"]
+    assert "pca_components" not in three_stage
+    assert "umap" not in three_stage
+    assert third_stage["allow_noise_assignment"] is False
+    assert third_stage["min_cluster_size"] == stage3_probe["hdbscan"]["min_cluster_size"]
+    assert third_stage["min_cluster_size"] < second_stage["min_cluster_size"]
+    assert three_stage["lift_filter"]["min_strong_product_lifts"] >= 2
+    assert three_stage["lift_filter"]["require_significant_product_lift"] is True
     assert "soft" not in promoted["trial_name"].lower()
     assert "soft" not in promoted["model_name"].lower()
     assert "soft" not in promoted["output_prefix"].lower()
@@ -128,20 +144,36 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     assert "soft" not in two_stage["model_name"].lower()
     assert "soft" not in two_stage["output_prefix"].lower()
     assert "SoftNoiseAssignment" not in two_stage["algorithm_name"]
+    assert "soft" not in three_stage["trial_name"].lower()
+    assert "soft" not in three_stage["model_name"].lower()
+    assert "soft" not in three_stage["output_prefix"].lower()
+    assert "SoftNoiseAssignment" not in three_stage["algorithm_name"]
 
     prod_overrides = _read_yaml(CONFIG_DIR / "prod.yaml")
     prod = _deep_merge(base, prod_overrides)
     prod_promoted = prod["official_model_suite"]["umap_hdbscan"]
     prod_two_stage = prod["official_model_suite"]["two_stage_hdbscan"]
+    prod_three_stage = prod["official_model_suite"]["three_stage_hdbscan"]
     prod_two_stage_overrides = prod_overrides["official_model_suite"]["two_stage_hdbscan"]
-    assert "leaf_mcs5400_ms12" in prod_promoted["trial_name"]
-    assert "leaf_mcs5400_ms12" in prod_promoted["variant_prefix"]
-    assert "leaf_mcs5400_ms12" in prod_two_stage["trial_name"]
-    assert "leaf_mcs5400_ms12" in prod_two_stage["variant_prefix"]
-    assert prod_promoted["hdbscan"]["min_cluster_size"] == 5400
-    assert prod_two_stage["second_stage_hdbscan"]["min_cluster_size"] == 3800
-    assert prod_two_stage["stage3_noise_probe"]["hdbscan"]["min_cluster_size"] < 3800
-    assert prod_two_stage["second_stage_hdbscan"]["min_samples"] == 12
-    assert "min_samples" not in prod_two_stage_overrides["second_stage_hdbscan"]
+    prod_three_stage_overrides = prod_overrides["official_model_suite"]["three_stage_hdbscan"]
+    assert "leaf_mcs3000_ms6" in prod_promoted["trial_name"]
+    assert "leaf_mcs3000_ms6" in prod_promoted["variant_prefix"]
+    assert "leaf_mcs3000_ms6" in prod_two_stage["trial_name"]
+    assert "leaf_mcs3000_ms6" in prod_two_stage["variant_prefix"]
+    assert "leaf_mcs3000_ms6" in prod_three_stage["trial_name"]
+    assert "leaf_mcs3000_ms6" in prod_three_stage["variant_prefix"]
+    assert prod_promoted["hdbscan"]["min_cluster_size"] == 3000
+    assert prod_promoted["hdbscan"]["min_samples"] == 6
+    assert "balanced" in prod_two_stage["trial_name"]
+    assert "balanced" in prod_three_stage["trial_name"]
+    assert prod_two_stage["second_stage_hdbscan"]["min_cluster_size"] == 3000
+    assert prod_two_stage["second_stage_hdbscan"]["min_samples"] == 6
+    assert prod_two_stage["stage3_noise_probe"]["hdbscan"]["min_cluster_size"] < 3000
+    assert prod_three_stage["third_stage_hdbscan"]["min_cluster_size"] == 2000
+    assert prod_three_stage["third_stage_hdbscan"]["min_samples"] == 6
+    assert prod_two_stage_overrides["second_stage_hdbscan"]["min_samples"] == 6
+    assert prod_three_stage_overrides["third_stage_hdbscan"]["min_samples"] == 6
+    assert "umap" not in prod_three_stage_overrides
     assert "soft" not in prod_promoted["trial_name"].lower()
     assert "soft" not in prod_two_stage["trial_name"].lower()
+    assert "soft" not in prod_three_stage["trial_name"].lower()

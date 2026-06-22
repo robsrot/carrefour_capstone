@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import polars as pl
@@ -189,6 +189,232 @@ def build_cluster_validity_stability_report(
         if path is not None:
             write_artifact_metadata(path, cache_metadata)
     return {key: value for key, value in result.items() if value is not None}
+
+
+def build_cluster_promotion_audit(
+    unfiltered_assignment_path: str | Path,
+    lift_evidence_path: str | Path,
+    cluster_readiness_path: str | Path | None = None,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    """Write the Stage 6.6 cluster-level promotion and blocker audit."""
+
+    cfg.ensure_directories()
+    output = Path(output_csv) if output_csv else cfg.artifacts / "stage6" / f"stage6_6_cluster_promotion_audit_{cfg.mode}.csv"
+    markdown = Path(output_md) if output_md else output.with_suffix(".md")
+    assignments = pl.read_parquet(unfiltered_assignment_path).filter(pl.col("tribe_id") >= 0)
+    if assignments.is_empty():
+        audit = _empty_cluster_promotion_audit()
+    else:
+        total_customers = int(pl.read_parquet(unfiltered_assignment_path, columns=["cliente"])["cliente"].n_unique())
+        summary = (
+            assignments.group_by("tribe_id")
+            .agg(
+                pl.len().alias("candidate_customers"),
+                pl.col("assignment_confidence_score").mean().alias("mean_assignment_confidence"),
+                pl.col("assignment_confidence_score").quantile(0.10).alias("p10_assignment_confidence"),
+                pl.col("assignment_source").mode().first().alias("source_pass"),
+            )
+            .sort("tribe_id")
+        )
+        lift = pl.read_parquet(lift_evidence_path) if Path(lift_evidence_path).suffix == ".parquet" else pl.read_csv(lift_evidence_path)
+        if lift.is_empty():
+            lift = pl.DataFrame(schema={"tribe_id": pl.Int64, "passes_lift_filter": pl.Boolean})
+        kept_ids = (
+            sorted(int(item) for item in lift.filter(pl.col("passes_lift_filter"))["tribe_id"].to_list())
+            if "passes_lift_filter" in lift.columns
+            else []
+        )
+        mapping = (
+            pl.DataFrame({"tribe_id": kept_ids, "final_tribe_id": list(range(len(kept_ids)))})
+            if kept_ids
+            else pl.DataFrame(schema={"tribe_id": pl.Int64, "final_tribe_id": pl.Int64})
+        )
+        readiness = _read_cluster_readiness_for_audit(cluster_readiness_path)
+        rows: list[dict[str, Any]] = []
+        allowed_statuses = {str(item) for item in cfg.get("profiling.final_handoff_readiness_statuses", []) or []}
+        joined = summary.join(lift, on="tribe_id", how="left").join(mapping, on="tribe_id", how="left")
+        for row in joined.iter_rows(named=True):
+            final_tribe_id = _int_or_none(row.get("final_tribe_id"))
+            readiness_row = _audit_row_by_tribe(readiness, final_tribe_id) if final_tribe_id is not None else {}
+            readiness_status = str(readiness_row.get("profile_readiness") or "not_checked")
+            readiness_issues = str(readiness_row.get("readiness_issues") or "not_checked")
+            passes_lift = bool(row.get("passes_lift_filter")) if row.get("passes_lift_filter") is not None else False
+            if not passes_lift:
+                promotion_status = "rejected_lift_filter"
+                blocker = _lift_filter_blocker(row)
+            elif readiness_status in allowed_statuses:
+                promotion_status = "promoted_to_stage7"
+                blocker = "pass"
+            else:
+                promotion_status = "review_not_promoted"
+                blocker = readiness_issues if readiness_issues and readiness_issues != "pass" else f"profile_readiness={readiness_status}"
+            candidate_customers = int(row.get("candidate_customers") or 0)
+            rows.append(
+                {
+                    "candidate_tribe_id": int(row["tribe_id"]),
+                    "final_tribe_id": final_tribe_id,
+                    "source_pass": row.get("source_pass"),
+                    "candidate_customers": candidate_customers,
+                    "candidate_population_share_pct": candidate_customers / max(total_customers, 1) * 100.0,
+                    "mean_assignment_confidence": row.get("mean_assignment_confidence"),
+                    "p10_assignment_confidence": row.get("p10_assignment_confidence"),
+                    "jitter_label_recovery_accuracy_mean": readiness_row.get("jitter_label_recovery_accuracy_mean"),
+                    "strong_product_lift_count": _int_or_none(row.get("strong_product_lift_count")),
+                    "significant_strong_product_lift_count": _int_or_none(row.get("significant_strong_product_lift_count")),
+                    "passes_lift_filter": passes_lift,
+                    "profile_readiness": readiness_status,
+                    "readiness_issues": readiness_issues,
+                    "promotion_status": promotion_status,
+                    "blocker_reason": blocker,
+                }
+            )
+        audit = pl.from_dicts(rows, infer_schema_length=None) if rows else _empty_cluster_promotion_audit()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_csv(output)
+    markdown.write_text(_promotion_audit_markdown(audit), encoding="utf-8")
+    metadata = {
+        "stage": "stage6_6_cluster_promotion_audit",
+        "mode": cfg.mode,
+        "unfiltered_assignment": file_fingerprint(unfiltered_assignment_path),
+        "lift_evidence": file_fingerprint(lift_evidence_path),
+        "cluster_readiness": file_fingerprint(cluster_readiness_path) if cluster_readiness_path else None,
+    }
+    write_artifact_metadata(output, metadata)
+    write_artifact_metadata(markdown, metadata)
+    return {"csv": output, "markdown": markdown}
+
+
+def _empty_cluster_promotion_audit() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "candidate_tribe_id": pl.Int64,
+            "final_tribe_id": pl.Int64,
+            "source_pass": pl.Utf8,
+            "candidate_customers": pl.Int64,
+            "candidate_population_share_pct": pl.Float64,
+            "mean_assignment_confidence": pl.Float64,
+            "p10_assignment_confidence": pl.Float64,
+            "jitter_label_recovery_accuracy_mean": pl.Float64,
+            "strong_product_lift_count": pl.Int64,
+            "significant_strong_product_lift_count": pl.Int64,
+            "passes_lift_filter": pl.Boolean,
+            "profile_readiness": pl.Utf8,
+            "readiness_issues": pl.Utf8,
+            "promotion_status": pl.Utf8,
+            "blocker_reason": pl.Utf8,
+        }
+    )
+
+
+def _read_cluster_readiness_for_audit(cluster_readiness_path: str | Path | None) -> pl.DataFrame:
+    if not cluster_readiness_path or not Path(cluster_readiness_path).exists():
+        return pl.DataFrame(schema={"tribe_id": pl.Int64})
+    path = Path(cluster_readiness_path)
+    readiness = pl.read_parquet(path) if path.suffix == ".parquet" else pl.read_csv(path)
+    if readiness.is_empty():
+        return pl.DataFrame(schema={"tribe_id": pl.Int64})
+    if "tribe_id" not in readiness.columns and "final_tribe_id" in readiness.columns:
+        readiness = readiness.rename({"final_tribe_id": "tribe_id"})
+    if "tribe_id" not in readiness.columns:
+        return pl.DataFrame(schema={"tribe_id": pl.Int64})
+    return readiness.with_columns(pl.col("tribe_id").cast(pl.Int64, strict=False))
+
+
+def _audit_row_by_tribe(readiness: pl.DataFrame, tribe_id: int) -> dict[str, Any]:
+    if readiness.is_empty() or "tribe_id" not in readiness.columns:
+        return {}
+    matched = readiness.filter(pl.col("tribe_id") == int(tribe_id))
+    return matched.row(0, named=True) if not matched.is_empty() else {}
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(number):
+        return None
+    return int(number)
+
+
+def _lift_filter_blocker(row: Mapping[str, Any]) -> str:
+    explicit_reason = row.get("lift_filter_reason") or row.get("product_lift_filter_reason")
+    if explicit_reason:
+        return str(explicit_reason)
+    strong = _int_or_none(row.get("strong_product_lift_count"))
+    significant = _int_or_none(row.get("significant_strong_product_lift_count"))
+    if significant is not None:
+        return f"insufficient significant product-lift evidence ({significant} significant strong lifts)"
+    if strong is not None:
+        return f"insufficient product-lift evidence ({strong} strong lifts)"
+    return "missing product-lift evidence"
+
+
+def _promotion_audit_markdown(audit: pl.DataFrame) -> str:
+    title = "# Stage 6.6 Cluster Promotion Audit"
+    if audit.is_empty():
+        return f"{title}\n\nNo candidate clusters were available for promotion audit.\n"
+    ordered = audit.select(
+        [
+            "candidate_tribe_id",
+            "final_tribe_id",
+            "source_pass",
+            "candidate_customers",
+            "candidate_population_share_pct",
+            "mean_assignment_confidence",
+            "jitter_label_recovery_accuracy_mean",
+            "strong_product_lift_count",
+            "significant_strong_product_lift_count",
+            "profile_readiness",
+            "promotion_status",
+            "blocker_reason",
+        ]
+    ).sort("candidate_tribe_id")
+    promoted = int(ordered.filter(pl.col("promotion_status") == "promoted_to_stage7").height)
+    review = int(ordered.filter(pl.col("promotion_status") == "review_not_promoted").height)
+    rejected = int(ordered.filter(pl.col("promotion_status").str.starts_with("rejected")).height)
+    summary = (
+        f"{title}\n\n"
+        f"Promoted clusters: {promoted}. Review-only clusters: {review}. "
+        f"Rejected candidate clusters: {rejected}.\n\n"
+        "Clusters marked `review_not_promoted` have enough product evidence for retention but fail readiness "
+        "requirements such as jitter recovery or assignment-confidence checks. They are analyzed in Stage 7, "
+        "but they are not stakeholder-ready promoted tribes.\n\n"
+    )
+    return summary + _markdown_table(ordered)
+
+
+def _markdown_table(frame: pl.DataFrame, max_rows: int = 200) -> str:
+    if frame.is_empty():
+        return "_No rows._\n"
+    display = frame.head(max_rows)
+    columns = display.columns
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] * len(columns)) + " |",
+    ]
+    for row in display.iter_rows(named=True):
+        cells = [_format_markdown_cell(row.get(column)) for column in columns]
+        lines.append("| " + " | ".join(cells) + " |")
+    if frame.height > max_rows:
+        lines.append(f"\n_Showing {max_rows} of {frame.height} rows._")
+    return "\n".join(lines) + "\n"
+
+
+def _format_markdown_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return ""
+        return f"{value:.4f}"
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def _cluster_stability_artifact_paths(output: Path, cfg: PipelineConfig) -> dict[str, Path]:
