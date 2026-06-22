@@ -67,7 +67,7 @@ After changing vectorization, feature construction, UMAP, clustering, evidence a
 - Stage 6.6 checks cluster stability, confidence, and profile readiness. `strong` requires no blockers and jitter recovery >= 0.80; `usable` has no blockers but is below the strong target; `review` is used for blockers such as jitter recovery < 0.60, missing recovery, low assignment confidence, or undersized clusters.
 - Stage 6.7 probes remaining noise for visual review only; candidate-only HDBSCAN there does not alter the official assignment.
 - Stage 6.8 writes the raw-data evidence bundle that Stage 7 consumes.
-- Stage 7 is read-only: it accepts Stage 6.6 readiness carried through Stage 6.8 and writes the final handoff pack without reopening global transactions or applying new promotion gates.
+- Stage 7 is read-only: it accepts Stage 6.6 readiness carried through Stage 6.8 and writes the final handoff pack without reopening global transactions or applying new promotion gates. Stage 7.2 separates final promoted tribes from potential review tribes; Stage 7.3 onward presents all retained tribes with `final_strong`, `final_usable`, or `potential_review` status labels.
 
 ## Artifact Rules
 

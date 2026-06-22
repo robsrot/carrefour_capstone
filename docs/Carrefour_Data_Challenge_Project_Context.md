@@ -16,7 +16,7 @@ As of 2026-06-22, the active repository implements the original brief through a 
 - Official clustering uses `embeddings_only`; spend and KPIs are reserved for post-clustering profiling.
 - Stage 6 uses hard three-stage UMAP-HDBSCAN with product-lift filtering and honest noise retention.
 - Stage 6.6 marks tribes `strong` when they have no blockers and jitter recovery >= 0.80; `usable` means no blockers but below the strong target; `review` means a stability, confidence, or size blocker remains.
-- Stage 6.8 assembles raw-data evidence once, and Stage 7 reads that evidence to produce the final business-facing handoff pack.
+- Stage 6.8 assembles raw-data evidence once, and Stage 7 reads that evidence to produce a stakeholder-ready segmentation architecture. Stage 7 preserves Stage 6.6 promoted/review membership by default, then writes seven explicit artifacts: tribe promotion, identity dossiers, handbook naming, customer coverage, action playbook, segmentation framework, and executive synthesis.
 
 ## 1. Core Objective
 

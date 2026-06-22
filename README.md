@@ -13,7 +13,7 @@ As of 2026-06-22:
 - Stage 6 is now a hard three-stage UMAP-HDBSCAN flow: PCA pre-reduction, UMAP representation, first HDBSCAN pass, stricter second pass over first-pass noise, third pass over remaining noise, three-pass merge, product-lift filtering, density evidence, readiness checks, remaining-customer evidence, and Stage 6.8 evidence assembly.
 - Stage 6.6 readiness uses jitter recovery as the stability gate: `strong` requires no blockers and jitter recovery >= 0.80; `usable` has no blockers but is below the strong target; `review` is used for blockers such as jitter recovery < 0.60 or assignment-confidence issues.
 - HDBSCAN noise stays honest as `tribe_id = -1`. Stage 6.7 can inspect remaining noise and optionally run candidate-only HDBSCAN after visual review, but it does not alter the official assignment.
-- Stage 7 is a read-only communication layer. It consumes the Stage 6.8 evidence bundle and writes the final story, final index, manifest, tribe cards, product summaries, comparison tables, customer-metric context, and aggregate-only LLM evidence.
+- Stage 7 is a read-only stakeholder segmentation architecture. It consumes the Stage 6.8 evidence bundle, preserves Stage 6.6 promoted/review membership by default, exposes advisory business gates for reach, distinctiveness, product hooks, naming quality, and coverage, and writes the Stage 7.1-7.7 promotion, identity, handbook, coverage, action, architecture, and executive synthesis artifacts.
 - UMAP is a clustering representation aid, not automatic proof. The 10-15 tribe range is a client hypothesis, not a hard clustering constraint.
 - Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`. Existing artifacts are reused when caching is enabled and `force=False`; metadata status is diagnostic, so use `force=True`, disable cache, or delete targeted generated files when rebuilding after logic/config changes.
 - Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader sweeps belong there before any setting is promoted into YAML.
@@ -168,7 +168,7 @@ outputs/<mode>/
 - Official clustering should remain on `embeddings_only`. Behavior/spend-derived columns are allowed for profiling and business interpretation after clustering.
 - Stage 6 working files such as assignments and per-family result caches live under `outputs/<mode>/models/model_selection/`; diagnostics live under `outputs/<mode>/artifacts/stage6/`.
 - Stage 6.8 is the raw-evidence boundary. After it runs, Stage 7 should read the saved evidence bundle and per-tribe exports rather than reopening global transactions or assignments.
-- Stage 7 accepts Stage 6.6 readiness as final and does not apply extra promotion gates.
+- Stage 7 preserves Stage 6.6 promotion/review membership by default for compatibility, but Stage 7.1 now reports advisory gates for reach, behavioral distinctiveness, business relevance, and naming quality. The redesigned outputs are Stage 7.1 Tribe Promotion Report, Stage 7.2 Tribe Identity Dossier, Stage 7.3 Tribe Handbook, Stage 7.4 Customer Coverage Report, Stage 7.5 Segment Action Playbook, Stage 7.6 Customer Segmentation Framework, and Stage 7.7 Final Segmentation Report.
 - Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
 
 ## Documentation
