@@ -715,7 +715,7 @@ def _profile_readiness(
     if p10_confidence is not None and p10_confidence < 0.05:
         issues.append("p10_assignment_confidence<0.05")
 
-    if not issues and recovery is not None and recovery >= 0.85 and (confidence is None or confidence >= 0.30):
+    if not issues and recovery is not None and recovery >= 0.80 and (confidence is None or confidence >= 0.30):
         return "strong", issues
     if not issues:
         return "usable", issues

@@ -1320,18 +1320,47 @@ def plot_stage6_cluster_readiness(
         "usable": "#F2A900",
         "review": "#C2410C",
     }
-    pdf["profile_readiness"] = pdf["profile_readiness"].fillna("review").astype(str)
-    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].fillna(0.0).astype(float)
-    pdf["customers"] = pdf["customers"].fillna(0).astype(float)
-    pdf["core_customer_share_pct"] = pdf["core_customer_share_pct"].fillna(0.0).astype(float)
-    min_cluster_size = float(pdf["min_cluster_size_reference"].dropna().iloc[0]) if "min_cluster_size_reference" in pdf else 0.0
+    from src.cluster_validation import _profile_readiness
 
-    fig, ax = plt.subplots(figsize=(10.8, 6.6))
-    for readiness_label, group in pdf.groupby("profile_readiness"):
-        sizes = 70.0 + group["core_customer_share_pct"].clip(lower=0, upper=35) * 24.0
+    pdf["profile_readiness"] = pdf["profile_readiness"].fillna("review").astype(str)
+    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].astype(float)
+    pdf["jitter_label_recovery_accuracy_mean"] = pdf["jitter_label_recovery_accuracy_mean"].astype(float)
+    if "p10_assignment_confidence" in pdf:
+        pdf["p10_assignment_confidence"] = pdf["p10_assignment_confidence"].astype(float)
+    else:
+        pdf["p10_assignment_confidence"] = np.nan
+    if "min_cluster_size_reference" not in pdf:
+        pdf["min_cluster_size_reference"] = 0
+    pdf["customers"] = pdf["customers"].fillna(0).astype(float)
+    pdf["plot_readiness"] = pdf.apply(
+        lambda row: _profile_readiness(
+            customers=int(row["customers"]),
+            min_cluster_size=int(_as_float_for_plot(row.get("min_cluster_size_reference")) or 0),
+            recovery=_as_float_for_plot(row.get("jitter_label_recovery_accuracy_mean")),
+            confidence=_as_float_for_plot(row.get("mean_assignment_confidence")),
+            p10_confidence=_as_float_for_plot(row.get("p10_assignment_confidence")),
+        )[0],
+        axis=1,
+    )
+    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].fillna(0.0)
+    pdf["jitter_label_recovery_accuracy_mean"] = pdf["jitter_label_recovery_accuracy_mean"].fillna(0.0)
+    max_customers = max(float(pdf["customers"].max()), 1.0)
+
+    fig, ax = plt.subplots(figsize=(11.8, 6.6))
+    readiness_order = ["review", "usable", "strong"]
+    grouped_readiness = {
+        readiness_label: group for readiness_label, group in pdf.groupby("plot_readiness")
+    }
+    ordered_readiness = [
+        *[label for label in readiness_order if label in grouped_readiness],
+        *[label for label in sorted(grouped_readiness) if label not in readiness_order],
+    ]
+    for readiness_label in ordered_readiness:
+        group = grouped_readiness[readiness_label]
+        sizes = 80.0 + group["customers"].clip(lower=0) / max_customers * 860.0
         ax.scatter(
-            group["customers"],
             group["mean_assignment_confidence"],
+            group["jitter_label_recovery_accuracy_mean"],
             s=sizes,
             color=readiness_colors.get(readiness_label, _color("neutral")),
             alpha=0.82,
@@ -1340,28 +1369,59 @@ def plot_stage6_cluster_readiness(
             label=readiness_label,
         )
         for _, row in group.iterrows():
+            label_on_left = float(row["mean_assignment_confidence"]) > 0.96
             ax.annotate(
                 str(int(row["tribe_id"])),
-                (row["customers"], row["mean_assignment_confidence"]),
-                xytext=(4, 4),
+                (row["mean_assignment_confidence"], row["jitter_label_recovery_accuracy_mean"]),
+                xytext=(-5, 4) if label_on_left else (4, 4),
                 textcoords="offset points",
                 fontsize=8,
+                ha="right" if label_on_left else "left",
                 color=_color("text"),
             )
 
-    if min_cluster_size > 0:
-        ax.axvline(min_cluster_size, color="#475467", linestyle="--", linewidth=1.0, alpha=0.8)
-        ax.text(min_cluster_size, ax.get_ylim()[1] * 0.96, "min cluster size", rotation=90, va="top", ha="right", fontsize=8)
-    ax.axhline(0.30, color="#475467", linestyle=":", linewidth=1.0, alpha=0.8)
-    ax.text(ax.get_xlim()[1] * 0.99, 0.305, "confidence review line", ha="right", va="bottom", fontsize=8)
-    ax.set_xlabel("Customers in core tribe")
-    ax.set_ylabel("Mean assignment confidence")
+    confidence_baseline = 0.50
+    ax.axvline(confidence_baseline, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.axhline(0.60, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.axhline(0.80, color="#475467", linestyle=":", linewidth=1.0, alpha=0.75)
+    ax.set_xlim(confidence_baseline, min(1.02, max(1.0, float(pdf["mean_assignment_confidence"].max()) * 1.03)))
+    ax.set_ylim(0.0, min(1.02, max(1.0, float(pdf["jitter_label_recovery_accuracy_mean"].max()) * 1.08)))
+    ax.text(confidence_baseline + 0.006, 0.98, "confidence baseline", rotation=90, va="top", ha="left", fontsize=8)
+    ax.text(confidence_baseline + 0.01, 0.605, "jitter minimum", ha="left", va="bottom", fontsize=8)
+    ax.text(confidence_baseline + 0.01, 0.805, "strong jitter target", ha="left", va="bottom", fontsize=8)
+    ax.set_xlabel("Mean assignment confidence")
+    ax.set_ylabel("Jitter label recovery accuracy")
     ax.set_title(title or "Stage 6.6 Cluster Readiness Before Profiling")
     ax.grid(alpha=0.22)
-    ax.legend(title="Profile readiness", frameon=False, loc="best")
+    readiness_legend = ax.legend(title="Profile readiness", frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    ax.add_artist(readiness_legend)
+    if max_customers > 0:
+        customer_levels = sorted({int(round(value)) for value in np.linspace(max_customers * 0.25, max_customers, 3)})
+        size_handles = [
+            ax.scatter(
+                [],
+                [],
+                s=80.0 + level / max_customers * 860.0,
+                color=_color("neutral"),
+                alpha=0.35,
+                edgecolor="white",
+                linewidth=0.8,
+            )
+            for level in customer_levels
+        ]
+        ax.legend(
+            size_handles,
+            [f"{level:,}" for level in customer_levels],
+            title="Customers",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 0.58),
+            scatterpoints=1,
+            labelspacing=1.2,
+        )
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=170)
+    fig.savefig(output, dpi=170, bbox_inches="tight")
     plt.close(fig)
     log_event("Stage 6.6 diagnostics", "wrote cluster readiness plot", cfg=cfg, path=output)
     return output
