@@ -114,6 +114,19 @@ def stage8_artifact_paths(*, cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
         "rel_fact_embedding_3d_pca": root / f"rel_fact_embedding_3d_pca_{cfg.mode}.parquet",
         "rel_fact_embedding_3d_pca_sample": root / f"rel_fact_embedding_3d_pca_sample_{cfg.mode}.parquet",
         "rel_fact_embedding_centroid": root / f"rel_fact_embedding_centroid_{cfg.mode}.parquet",
+        "rel_mart_dashboard_story_page": root / f"rel_mart_dashboard_story_page_{cfg.mode}.parquet",
+        "rel_mart_executive_kpi": root / f"rel_mart_executive_kpi_{cfg.mode}.parquet",
+        "rel_mart_tribe_scorecard": root / f"rel_mart_tribe_scorecard_{cfg.mode}.parquet",
+        "rel_mart_tribe_product_evidence": root / f"rel_mart_tribe_product_evidence_{cfg.mode}.parquet",
+        "rel_mart_customer_coverage_hierarchy": root / f"rel_mart_customer_coverage_hierarchy_{cfg.mode}.parquet",
+        "rel_mart_opportunity_prioritization": root / f"rel_mart_opportunity_prioritization_{cfg.mode}.parquet",
+        "rel_mart_activation_channel": root / f"rel_mart_activation_channel_{cfg.mode}.parquet",
+        "rel_mart_customer_landscape_sample": root / f"rel_mart_customer_landscape_sample_{cfg.mode}.parquet",
+        "rel_mart_appendix_evidence": root / f"rel_mart_appendix_evidence_{cfg.mode}.parquet",
+        "rel_mart_data_dictionary": root / f"rel_mart_data_dictionary_{cfg.mode}.parquet",
+        "rel_mart_validation_report": root / f"rel_mart_validation_report_{cfg.mode}.parquet",
+        "presentation_mart_data_dictionary_md": root / f"rel_mart_data_dictionary_{cfg.mode}.md",
+        "presentation_mart_validation_report_md": root / f"rel_mart_validation_report_{cfg.mode}.md",
         "artifact_manifest": root / f"artifact_manifest_{cfg.mode}.parquet",
         "dashboard_page_contracts": root / f"dashboard_page_contracts_{cfg.mode}.parquet",
         "missing_file_register": root / f"missing_file_register_{cfg.mode}.parquet",
@@ -404,6 +417,42 @@ def write_stage8_dashboard_pack(
         missing_file_register = _missing_file_register()
         missing_file_register.write_parquet(paths["missing_file_register"])
         missing_file_register.write_parquet(paths["rel_dim_optional_gap"])
+
+        presentation_source_tables = {
+            **relational_tables,
+            "rel_fact_executive_metric": executive_metrics_table,
+            "rel_dim_story_chapter": presentation_storyline_table,
+            "rel_dim_executive_insight": executive_insights,
+            "rel_dim_model_card": model_cards,
+            "rel_dim_pipeline_stage": pipeline_stages,
+            "rel_dim_feature_group": feature_catalog,
+            "rel_fact_validation_metric": validation_metrics,
+            "rel_fact_data_quality_metric": data_quality_metrics,
+            "rel_dim_visualization": visualization_specs,
+            "rel_dim_dashboard_page": dashboard_page_contracts,
+            "rel_dim_optional_gap": missing_file_register,
+        }
+        presentation_marts = _build_presentation_mart_tables(presentation_source_tables)
+        for table_name, table in presentation_marts.items():
+            table.write_parquet(paths[table_name])
+
+        presentation_dictionary = _presentation_mart_data_dictionary(presentation_marts)
+        presentation_dictionary.write_parquet(paths["rel_mart_data_dictionary"])
+        paths["presentation_mart_data_dictionary_md"].write_text(
+            _presentation_mart_dictionary_markdown(presentation_dictionary),
+            encoding="utf-8",
+        )
+
+        presentation_validation = _presentation_mart_validation_report(
+            presentation_marts,
+            presentation_dictionary,
+            presentation_source_tables,
+        )
+        presentation_validation.write_parquet(paths["rel_mart_validation_report"])
+        paths["presentation_mart_validation_report_md"].write_text(
+            _presentation_mart_validation_markdown(presentation_validation),
+            encoding="utf-8",
+        )
 
         artifact_manifest = _artifact_manifest(paths)
         artifact_manifest.write_parquet(paths["artifact_manifest"])
@@ -3029,7 +3078,7 @@ def _visualization_specs() -> pl.DataFrame:
     specs = [
         ("2d_umap", "Customer Landscape", "rel_fact_embedding_2d; rel_fact_customer_assignment; rel_dim_tribe; rel_dim_coverage_group", "cliente,x,y plus assignment/dimension joins", "ready", "Join coordinates to assignment and dimension tables for labels/filters"),
         ("3d_umap", "Customer Landscape", "rel_fact_embedding_3d_sample; rel_fact_customer_assignment; rel_dim_tribe; rel_dim_coverage_group; rel_dim_remaining_segment", "cliente,x,y,z plus assignment/dimension joins", "ready", "Use sampled coordinates for live demo"),
-        ("3d_pca", "Customer Landscape", "rel_fact_embedding_3d_pca_sample; rel_fact_customer_assignment; rel_dim_tribe; rel_dim_coverage_group", "cliente,x,y,z plus assignment/dimension joins", "ready_if_file_nonempty", "PCA is supporting/technical, not the default customer landscape"),
+        ("3d_pca", "Customer Landscape", "rel_fact_embedding_3d_pca_sample; rel_fact_customer_assignment; rel_dim_tribe; rel_dim_coverage_group", "cliente,x,y,z plus assignment/dimension joins", "ready_if_file_nonempty", "Default live presentation view unless a corrected UMAP projection is explicitly approved"),
         ("tribe_centroids", "Customer Landscape", "rel_fact_embedding_centroid; rel_dim_tribe; rel_dim_coverage_group; rel_dim_remaining_segment", "coverage_group,tribe_id,remaining_segment_id,x,y,z,customers", "ready", "Join centroid IDs to dimensions for labels"),
         ("cluster_boundaries", "Customer Landscape", "", "", "optional_gap", "Hull/density surfaces are not required for MVP and remain optional"),
         ("product_affinity_network", "Product Affinity Explorer", "rel_fact_tribe_product_affinity; rel_dim_product; rel_dim_tribe", "tribe_id,product_id,lift_vs_rest,reach_pct,q_value,rank", "ready", "Build network edges from normalized tribe-product facts"),
@@ -3198,6 +3247,8 @@ def _is_public_stage8_artifact(name: str) -> bool:
         "readiness_md",
         "completeness_audit",
         "completeness_audit_json",
+        "presentation_mart_data_dictionary_md",
+        "presentation_mart_validation_report_md",
     }
 
 
@@ -3532,6 +3583,1122 @@ CREATE TABLE rel_fact_customer_nearest_tribe (
 """
 
 
+PRESENTATION_MART_NAMES = [
+    "rel_mart_dashboard_story_page",
+    "rel_mart_executive_kpi",
+    "rel_mart_tribe_scorecard",
+    "rel_mart_tribe_product_evidence",
+    "rel_mart_customer_coverage_hierarchy",
+    "rel_mart_opportunity_prioritization",
+    "rel_mart_activation_channel",
+    "rel_mart_customer_landscape_sample",
+    "rel_mart_appendix_evidence",
+]
+
+
+PRESENTATION_MART_COLUMNS: dict[str, list[str]] = {
+    "rel_mart_dashboard_story_page": [
+        "page_id",
+        "dashboard_route",
+        "page_order",
+        "page_title",
+        "executive_question",
+        "key_takeaway",
+        "primary_visual",
+        "secondary_modules",
+        "required_marts",
+        "source_rel_tables",
+        "audience",
+        "story_role",
+    ],
+    "rel_mart_executive_kpi": [
+        "kpi_id",
+        "kpi_group",
+        "display_label",
+        "metric_value",
+        "metric_unit",
+        "display_value",
+        "context_text",
+        "source_table",
+        "display_flag",
+        "sort_order",
+    ],
+    "rel_mart_tribe_scorecard": [
+        "tribe_id",
+        "tribe_display_name",
+        "tribe_status",
+        "tribe_status_label",
+        "coverage_group",
+        "customer_count",
+        "customer_share_pct",
+        "revenue",
+        "revenue_share_pct",
+        "avg_basket_value",
+        "avg_frequency_per_30d",
+        "avg_recency_days",
+        "retention_rate",
+        "churn_risk",
+        "top_product",
+        "top_category",
+        "top_brand",
+        "why_clustered_together",
+        "commercial_opportunity",
+        "recommended_action",
+        "priority_tier",
+        "confidence_label",
+    ],
+    "rel_mart_tribe_product_evidence": [
+        "tribe_id",
+        "tribe_display_name",
+        "tribe_status_label",
+        "product_id",
+        "product_name_original",
+        "category_name_original",
+        "brand_name_original",
+        "rank_by_lift",
+        "rank_by_reach",
+        "rank_by_revenue",
+        "product_rank",
+        "lift_vs_rest",
+        "lift_vs_population",
+        "pct_tribe_customers_buying_product",
+        "pct_total_customers_buying_product",
+        "tribe_product_customers",
+        "product_revenue",
+        "product_revenue_share_pct",
+        "q_value",
+        "is_actionable",
+        "evidence_role",
+        "revenue_data_status",
+        "recommended_use",
+    ],
+    "rel_mart_customer_coverage_hierarchy": [
+        "node_id",
+        "parent_node_id",
+        "node_depth",
+        "node_label",
+        "segment_type",
+        "coverage_group",
+        "tribe_id",
+        "remaining_segment_id",
+        "customer_count",
+        "customer_share_pct",
+        "revenue",
+        "revenue_share_pct",
+        "recommended_treatment",
+        "sort_order",
+    ],
+    "rel_mart_opportunity_prioritization": [
+        "opportunity_id",
+        "target_id",
+        "target_type",
+        "target_label",
+        "coverage_group",
+        "tribe_id",
+        "remaining_segment_id",
+        "priority",
+        "priority_score",
+        "opportunity_rank",
+        "opportunity_size_customers",
+        "opportunity_size_revenue",
+        "action_type",
+        "recommended_action",
+        "primary_kpi",
+        "expected_impact",
+        "expected_impact_low",
+        "expected_impact_mid",
+        "expected_impact_high",
+        "confidence_level",
+        "effort_level",
+        "urgency",
+        "evidence_basis",
+        "impact_measurement_note",
+    ],
+    "rel_mart_activation_channel": [
+        "activation_id",
+        "opportunity_id",
+        "target_id",
+        "target_label",
+        "target_type",
+        "channel",
+        "channel_role",
+        "activation_message",
+        "primary_kpi",
+        "priority",
+        "expected_impact",
+        "evidence_basis",
+        "sort_order",
+    ],
+    "rel_mart_customer_landscape_sample": [
+        "visualization_type",
+        "cliente",
+        "cliente_short",
+        "x",
+        "y",
+        "z",
+        "embedding_scope",
+        "tribe_id",
+        "tribe_display_name",
+        "tribe_status",
+        "tribe_status_label",
+        "coverage_group",
+        "coverage_group_label",
+        "remaining_segment_id",
+        "remaining_segment_name",
+        "assignment_status",
+        "assignment_confidence_score",
+        "color_group",
+        "hover_label",
+        "is_default_view",
+    ],
+    "rel_mart_appendix_evidence": [
+        "evidence_id",
+        "evidence_section",
+        "evidence_type",
+        "title",
+        "metric_name",
+        "metric_value",
+        "status",
+        "source_stage",
+        "source_table",
+        "source_path",
+        "executive_relevance",
+        "sort_order",
+    ],
+}
+
+
+PRESENTATION_MART_DESCRIPTIONS: dict[str, str] = {
+    "rel_mart_dashboard_story_page": "One row per presentation page with one executive question, one takeaway, and the main visual contract.",
+    "rel_mart_executive_kpi": "Executive KPI strip and supporting KPI rows, derived from coverage, tribe, and assignment facts.",
+    "rel_mart_tribe_scorecard": "One row per retained tribe with executive-ready labels, metrics, product/category anchors, caveats, and action summary.",
+    "rel_mart_tribe_product_evidence": "Tribe-product evidence table joining affinity facts to product and tribe labels; SKU revenue fields remain null when no SKU-revenue grain exists.",
+    "rel_mart_customer_coverage_hierarchy": "Tree-ready customer accounting layer from total population to coverage groups to tribes and remaining segments.",
+    "rel_mart_opportunity_prioritization": "Ranked activation opportunities for tribes and remaining segments using published action rows and transparent sizing.",
+    "rel_mart_activation_channel": "Channel-level activation rows derived from action text and target metadata.",
+    "rel_mart_customer_landscape_sample": "Visualization-ready PCA/UMAP sample with final, review, and remaining/noise customer labels already joined.",
+    "rel_mart_appendix_evidence": "Appendix evidence rows for validation, data quality, model cards, lineage, and optional gaps.",
+}
+
+
+def _build_presentation_mart_tables(tables: Mapping[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
+    """Build additive, presentation-ready marts from the published relational model."""
+
+    product_evidence = _mart_tribe_product_evidence(tables)
+    return {
+        "rel_mart_dashboard_story_page": _mart_dashboard_story_page(tables),
+        "rel_mart_executive_kpi": _mart_executive_kpi(tables),
+        "rel_mart_tribe_scorecard": _mart_tribe_scorecard(tables, product_evidence),
+        "rel_mart_tribe_product_evidence": product_evidence,
+        "rel_mart_customer_coverage_hierarchy": _mart_customer_coverage_hierarchy(tables),
+        "rel_mart_opportunity_prioritization": _mart_opportunity_prioritization(tables),
+        "rel_mart_activation_channel": _mart_activation_channel(tables),
+        "rel_mart_customer_landscape_sample": _mart_customer_landscape_sample(tables),
+        "rel_mart_appendix_evidence": _mart_appendix_evidence(tables),
+    }
+
+
+def _mart_table(tables: Mapping[str, pl.DataFrame], name: str) -> pl.DataFrame:
+    return tables.get(name, pl.DataFrame())
+
+
+def _mart_records(frame: pl.DataFrame) -> list[dict[str, Any]]:
+    return [] if frame.is_empty() else frame.to_dicts()
+
+
+def _mart_index(frame: pl.DataFrame, key: str) -> dict[Any, dict[str, Any]]:
+    if frame.is_empty() or key not in frame.columns:
+        return {}
+    return {row.get(key): row for row in frame.to_dicts()}
+
+
+def _mart_rows_by(frame: pl.DataFrame, key: str) -> dict[Any, list[dict[str, Any]]]:
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    if frame.is_empty() or key not in frame.columns:
+        return grouped
+    for row in frame.to_dicts():
+        grouped.setdefault(row.get(key), []).append(row)
+    return grouped
+
+
+def _mart_frame(rows: list[dict[str, Any]], name: str) -> pl.DataFrame:
+    if rows:
+        return pl.DataFrame(rows, infer_schema_length=None).select(PRESENTATION_MART_COLUMNS[name])
+    return pl.DataFrame(schema={column: pl.Utf8 for column in PRESENTATION_MART_COLUMNS[name]})
+
+
+def _mart_dashboard_story_page(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    contracts = _mart_index(_mart_table(tables, "rel_dim_dashboard_page"), "page_id")
+    chapters = {
+        _as_text(row.get("page_name")).lower(): row
+        for row in _mart_records(_mart_table(tables, "rel_dim_story_chapter"))
+    }
+    rows = []
+    page_specs = [
+        (
+            "executive_overview",
+            "executive",
+            1,
+            "Executive Overview",
+            "Where is the value, and what should Carrefour do first?",
+            "Show total coverage, final/review boundaries, and the first action queue.",
+            "KPI strip plus customer coverage module",
+            "rel_mart_executive_kpi; rel_mart_customer_coverage_hierarchy; rel_mart_opportunity_prioritization",
+        ),
+        (
+            "customer_landscape",
+            "landscape",
+            2,
+            "Customer Landscape",
+            "Do the final tribes and remaining customers separate in the customer universe?",
+            "Use the PCA 3D view by default, with UMAP retained as supporting evidence.",
+            "Interactive PCA 3D customer map",
+            "rel_mart_customer_landscape_sample",
+        ),
+        (
+            "tribe_explorer",
+            "tribes",
+            3,
+            "Tribe Explorer",
+            "Which tribes are ready for business use, and what defines them?",
+            "Final tribes are activation-ready; review tribes stay visible with caveats.",
+            "Tribe scorecard",
+            "rel_mart_tribe_scorecard; rel_mart_tribe_product_evidence",
+        ),
+        (
+            "product_affinity_explorer",
+            "products",
+            4,
+            "Product Evidence",
+            "Which products prove each tribe is real?",
+            "Product lift and reach define the tribe identity; SKU revenue is not inferred.",
+            "Product evidence table and lift heatmap",
+            "rel_mart_tribe_product_evidence",
+        ),
+        (
+            "customer_coverage_remaining",
+            "coverage",
+            5,
+            "Coverage & Remaining Customers",
+            "Are all customers accounted for without forcing weak assignments?",
+            "Remaining customers are deliberately described, not pushed into final tribes.",
+            "Coverage hierarchy",
+            "rel_mart_customer_coverage_hierarchy",
+        ),
+        (
+            "segment_activation_center",
+            "activation",
+            6,
+            "Activation Plan",
+            "Which opportunities are worth testing first?",
+            "Actions are prioritized with transparent sizing and holdout measurement language.",
+            "Opportunity prioritization table",
+            "rel_mart_opportunity_prioritization; rel_mart_activation_channel",
+        ),
+        (
+            "customer_lookup",
+            "lookup",
+            7,
+            "Customer Lookup",
+            "What does the segmentation say about one concrete customer?",
+            "A customer can be traced from assignment to value behavior to nearest-tribe context.",
+            "Customer-level lookup panel",
+            "rel_mart_customer_landscape_sample; rel_fact_customer_value_behavior; rel_fact_customer_nearest_tribe",
+        ),
+        (
+            "project_data_foundation",
+            "foundation",
+            8,
+            "Data Foundation",
+            "Can the audience trust the pipeline and data lineage?",
+            "Stage 8 renders published evidence only; it does not recompute model decisions.",
+            "Lineage and quality summary",
+            "rel_mart_appendix_evidence; rel_mart_validation_report",
+        ),
+        (
+            "executive_final_recommendation",
+            "insights",
+            9,
+            "Final Recommendations",
+            "What is the board-ready answer?",
+            "The system is demo-ready with honest uncertainty boundaries and operational next steps.",
+            "Executive insight list",
+            "rel_mart_executive_kpi; rel_mart_opportunity_prioritization; rel_mart_appendix_evidence",
+        ),
+        (
+            "appendix_lineage_artifacts",
+            "appendix",
+            10,
+            "Appendix",
+            "Where can reviewers inspect every assumption and table?",
+            "The appendix exposes dictionary, validation, lineage, and known non-blocking gaps.",
+            "Evidence and data dictionary tabs",
+            "rel_mart_data_dictionary; rel_mart_validation_report; rel_mart_appendix_evidence",
+        ),
+    ]
+    for page_id, route, order, title, question, takeaway, visual, marts in page_specs:
+        contract = contracts.get(page_id, {})
+        chapter = chapters.get(title.lower(), {})
+        rows.append(
+            {
+                "page_id": page_id,
+                "dashboard_route": route,
+                "page_order": order,
+                "page_title": title,
+                "executive_question": question,
+                "key_takeaway": _as_text(chapter.get("key_message") or takeaway),
+                "primary_visual": visual,
+                "secondary_modules": _as_text(contract.get("required_fields") or chapter.get("interactions_required") or ""),
+                "required_marts": marts,
+                "source_rel_tables": _as_text(contract.get("required_data_products") or chapter.get("data_required") or ""),
+                "audience": "executive" if order <= 7 else "technical_appendix",
+                "story_role": "main_story" if order <= 7 else "supporting_evidence",
+            }
+        )
+    return _mart_frame(rows, "rel_mart_dashboard_story_page")
+
+
+def _mart_executive_kpi(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    coverage = _mart_records(_mart_table(tables, "rel_fact_coverage_group_metrics"))
+    tribes = _mart_records(_mart_table(tables, "rel_dim_tribe"))
+    assignments = _mart_table(tables, "rel_fact_customer_assignment")
+    total_customers = sum(_to_int(row.get("customers")) or 0 for row in coverage) or assignments.height
+    total_revenue = sum(_to_float(row.get("revenue")) or 0.0 for row in coverage)
+    final_tribes = sum(1 for row in tribes if row.get("is_final_tribe"))
+    review_tribes = sum(1 for row in tribes if row.get("is_review_tribe"))
+
+    def cov_sum(fragment: str, column: str = "customers") -> float:
+        return sum(
+            _to_float(row.get(column)) or 0.0
+            for row in coverage
+            if fragment in _as_text(row.get("coverage_group"))
+        )
+
+    final_customers = cov_sum("core_promoted")
+    review_customers = cov_sum("review")
+    remaining_customers = max(0.0, float(total_customers) - final_customers - review_customers)
+    rows = [
+        _kpi_row("total_customers", "Coverage", "Customers Accounted For", total_customers, "customers", "Full population reconciled through Stage 8 assignment facts.", "rel_fact_coverage_group_metrics", True, 1),
+        _kpi_row("final_tribes", "Coverage", "Final Tribes", final_tribes, "tribes", "Promoted tribes ready for campaign planning with holdouts.", "rel_dim_tribe", True, 2),
+        _kpi_row("review_tribes", "Coverage", "Review Tribes", review_tribes, "tribes", "Retained hard tribes requiring business validation before activation.", "rel_dim_tribe", True, 3),
+        _kpi_row("final_tribe_customers", "Coverage", "Final-Tribe Customers", final_customers, "customers", "Customers in promoted hard tribes.", "rel_fact_coverage_group_metrics", True, 4),
+        _kpi_row("remaining_customers", "Coverage", "Remaining Customers", remaining_customers, "customers", "Customers intentionally handled outside hard tribe membership.", "rel_fact_coverage_group_metrics", True, 5),
+        _kpi_row("total_revenue", "Value", "Revenue Accounted For", total_revenue, "currency", "Revenue available at customer/coverage/tribe level.", "rel_fact_coverage_group_metrics", True, 6),
+    ]
+    return _mart_frame(rows, "rel_mart_executive_kpi")
+
+
+def _kpi_row(
+    kpi_id: str,
+    group: str,
+    label: str,
+    value: Any,
+    unit: str,
+    context: str,
+    source: str,
+    display: bool,
+    order: int,
+) -> dict[str, Any]:
+    return {
+        "kpi_id": kpi_id,
+        "kpi_group": group,
+        "display_label": label,
+        "metric_value": _to_float(value),
+        "metric_unit": unit,
+        "display_value": _display_metric_value(value, unit),
+        "context_text": context,
+        "source_table": source,
+        "display_flag": display,
+        "sort_order": order,
+    }
+
+
+def _display_metric_value(value: Any, unit: str) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    if unit == "currency":
+        return f"EUR{number:,.0f}"
+    if unit == "pct":
+        return f"{number:.1f}%"
+    return f"{number:,.0f}"
+
+
+def _mart_tribe_scorecard(tables: Mapping[str, pl.DataFrame], product_evidence: pl.DataFrame) -> pl.DataFrame:
+    dim = _mart_table(tables, "rel_dim_tribe")
+    metrics = _mart_index(_mart_table(tables, "rel_fact_tribe_metrics"), "tribe_id")
+    text = _mart_index(_mart_table(tables, "rel_fact_tribe_profile_text"), "tribe_id")
+    categories = _mart_rows_by(_mart_table(tables, "rel_fact_tribe_category_affinity"), "tribe_id")
+    actions = _mart_rows_by(_mart_table(tables, "rel_fact_segment_action"), "target_id")
+    products_by_tribe = _mart_rows_by(product_evidence, "tribe_id")
+    rows = []
+    for tribe in _mart_records(dim):
+        tribe_id = tribe.get("tribe_id")
+        metric = metrics.get(tribe_id, {})
+        profile = text.get(tribe_id, {})
+        top_product = (products_by_tribe.get(tribe_id) or [{}])[0]
+        top_category = sorted(categories.get(tribe_id) or [], key=lambda row: _to_int(row.get("rank")) or 999)
+        action = (actions.get(f"tribe_{int(tribe_id):02d}") if tribe_id is not None else None) or []
+        first_action = action[0] if action else {}
+        why = (
+            _as_text(profile.get("who_is_the_tribe"))
+            or _as_text(profile.get("defining_behavior"))
+            or _as_text(profile.get("top_products_display"))
+        )
+        rows.append(
+            {
+                "tribe_id": tribe_id,
+                "tribe_display_name": tribe.get("display_name"),
+                "tribe_status": tribe.get("tribe_status"),
+                "tribe_status_label": tribe.get("tribe_status_label"),
+                "coverage_group": tribe.get("coverage_group"),
+                "customer_count": _to_int(metric.get("assigned_customers") or metric.get("hard_assigned_customers")),
+                "customer_share_pct": _to_float(metric.get("share_of_total_customers_pct") or metric.get("population_share_pct")),
+                "revenue": _to_float(metric.get("total_revenue")),
+                "revenue_share_pct": _to_float(metric.get("revenue_share_pct")),
+                "avg_basket_value": _to_float(metric.get("avg_basket_value")),
+                "avg_frequency_per_30d": _to_float(metric.get("avg_frequency_per_30d")),
+                "avg_recency_days": _to_float(metric.get("avg_recency_days")),
+                "retention_rate": None,
+                "churn_risk": _recency_risk(metric.get("avg_recency_days")),
+                "top_product": top_product.get("product_name_original"),
+                "top_category": (top_category[0] if top_category else {}).get("category"),
+                "top_brand": None,
+                "why_clustered_together": why,
+                "commercial_opportunity": _as_text(profile.get("revenue_lever") or first_action.get("marketing_actions") or tribe.get("recommended_use")),
+                "recommended_action": _as_text(first_action.get("marketing_actions") or tribe.get("recommended_use")),
+                "priority_tier": _tribe_priority_tier(tribe, metric),
+                "confidence_label": _as_text(tribe.get("business_confidence") or profile.get("confidence_level")),
+            }
+        )
+    return _mart_frame(rows, "rel_mart_tribe_scorecard")
+
+
+def _recency_risk(value: Any) -> str:
+    recency = _to_float(value)
+    if recency is None:
+        return "not_scored"
+    if recency <= 21:
+        return "low_recency_risk"
+    if recency <= 60:
+        return "medium_recency_risk"
+    return "high_recency_risk"
+
+
+def _tribe_priority_tier(tribe: Mapping[str, Any], metric: Mapping[str, Any]) -> str:
+    if tribe.get("is_final_tribe") and (_to_float(metric.get("revenue_share_pct")) or 0.0) >= 2.0:
+        return "high"
+    if tribe.get("is_final_tribe"):
+        return "medium"
+    return "review"
+
+
+def _mart_tribe_product_evidence(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    affinity = _mart_records(_mart_table(tables, "rel_fact_tribe_product_affinity"))
+    products = _mart_index(_mart_table(tables, "rel_dim_product"), "product_id")
+    tribes = _mart_index(_mart_table(tables, "rel_dim_tribe"), "tribe_id")
+    by_tribe: dict[Any, list[dict[str, Any]]] = {}
+    for row in affinity:
+        by_tribe.setdefault(row.get("tribe_id"), []).append(row)
+    lift_ranks = _rank_lookup(by_tribe, "lift_vs_rest", "product_id")
+    reach_ranks = _rank_lookup(by_tribe, "reach_pct", "product_id")
+    rows = []
+    for row in sorted(affinity, key=lambda item: ((_to_int(item.get("tribe_id")) or 0), _to_int(item.get("rank")) or 999)):
+        tribe = tribes.get(row.get("tribe_id"), {})
+        product = products.get(row.get("product_id"), {})
+        reach_pct = _to_float(row.get("reach_pct"))
+        lift_population = _to_float(row.get("lift_vs_population"))
+        rows.append(
+            {
+                "tribe_id": row.get("tribe_id"),
+                "tribe_display_name": tribe.get("display_name"),
+                "tribe_status_label": tribe.get("tribe_status_label"),
+                "product_id": row.get("product_id"),
+                "product_name_original": product.get("product_description"),
+                "category_name_original": product.get("category"),
+                "brand_name_original": None,
+                "rank_by_lift": lift_ranks.get((row.get("tribe_id"), row.get("product_id"))),
+                "rank_by_reach": reach_ranks.get((row.get("tribe_id"), row.get("product_id"))),
+                "rank_by_revenue": None,
+                "product_rank": _to_int(row.get("rank")),
+                "lift_vs_rest": _to_float(row.get("lift_vs_rest")),
+                "lift_vs_population": lift_population,
+                "pct_tribe_customers_buying_product": reach_pct,
+                "pct_total_customers_buying_product": (reach_pct / lift_population) if reach_pct is not None and lift_population and lift_population > 0 else None,
+                "tribe_product_customers": _to_int(row.get("customers")),
+                "product_revenue": None,
+                "product_revenue_share_pct": None,
+                "q_value": _to_float(row.get("q_value")),
+                "is_actionable": bool(row.get("is_actionable")),
+                "evidence_role": _product_evidence_role(row),
+                "revenue_data_status": "not_available_in_stage8_product_grain",
+                "recommended_use": "Use for product identity and targeting hypotheses; do not describe as SKU revenue without a SKU-revenue mart.",
+            }
+        )
+    return _mart_frame(rows, "rel_mart_tribe_product_evidence")
+
+
+def _rank_lookup(groups: Mapping[Any, list[dict[str, Any]]], metric: str, item_key: str) -> dict[tuple[Any, Any], int]:
+    ranks: dict[tuple[Any, Any], int] = {}
+    for group, rows in groups.items():
+        ordered = sorted(rows, key=lambda row: _to_float(row.get(metric)) or -1.0, reverse=True)
+        for index, row in enumerate(ordered, start=1):
+            ranks[(group, row.get(item_key))] = index
+    return ranks
+
+
+def _product_evidence_role(row: Mapping[str, Any]) -> str:
+    lift = _to_float(row.get("lift_vs_rest")) or 0.0
+    reach = _to_float(row.get("reach_pct")) or 0.0
+    actionable = bool(row.get("is_actionable"))
+    if actionable and lift >= 2.0 and reach >= 5.0:
+        return "activation_anchor"
+    if lift >= 2.0:
+        return "identity_marker"
+    if reach >= 10.0:
+        return "reach_builder"
+    return "niche_signal"
+
+
+def _mart_customer_coverage_hierarchy(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    coverage_dim = _mart_index(_mart_table(tables, "rel_dim_coverage_group"), "coverage_group")
+    coverage_metrics = _mart_records(_mart_table(tables, "rel_fact_coverage_group_metrics"))
+    tribes = _mart_records(_mart_table(tables, "rel_dim_tribe"))
+    tribe_metrics = _mart_index(_mart_table(tables, "rel_fact_tribe_metrics"), "tribe_id")
+    remaining = _mart_records(_mart_table(tables, "rel_dim_remaining_segment"))
+    remaining_metrics = _mart_index(_mart_table(tables, "rel_fact_remaining_segment_metrics"), "segment_id")
+    total_customers = sum(_to_int(row.get("customers")) or 0 for row in coverage_metrics)
+    total_revenue = sum(_to_float(row.get("revenue")) or 0.0 for row in coverage_metrics)
+    rows = [
+        {
+            "node_id": "total_population",
+            "parent_node_id": None,
+            "node_depth": 0,
+            "node_label": "Total Customer Population",
+            "segment_type": "population",
+            "coverage_group": None,
+            "tribe_id": None,
+            "remaining_segment_id": None,
+            "customer_count": total_customers,
+            "customer_share_pct": 100.0 if total_customers else 0.0,
+            "revenue": total_revenue,
+            "revenue_share_pct": 100.0 if total_revenue else 0.0,
+            "recommended_treatment": "Use as the reconciliation root for every customer shown in the dashboard.",
+            "sort_order": 0,
+        }
+    ]
+    for cov in sorted(coverage_metrics, key=lambda row: _coverage_group_sort_order(row.get("coverage_group"))):
+        group = cov.get("coverage_group")
+        dim = coverage_dim.get(group, {})
+        rows.append(
+            {
+                "node_id": f"coverage::{group}",
+                "parent_node_id": "total_population",
+                "node_depth": 1,
+                "node_label": dim.get("coverage_group_label") or _coverage_group_label(group),
+                "segment_type": "coverage_group",
+                "coverage_group": group,
+                "tribe_id": None,
+                "remaining_segment_id": None,
+                "customer_count": _to_int(cov.get("customers")),
+                "customer_share_pct": _to_float(cov.get("customer_share_pct")),
+                "revenue": _to_float(cov.get("revenue")),
+                "revenue_share_pct": _to_float(cov.get("revenue_share_pct")),
+                "recommended_treatment": dim.get("recommended_treatment"),
+                "sort_order": _coverage_group_sort_order(group),
+            }
+        )
+    for tribe in tribes:
+        tribe_id = tribe.get("tribe_id")
+        metric = tribe_metrics.get(tribe_id, {})
+        group = tribe.get("coverage_group")
+        rows.append(
+            {
+                "node_id": f"tribe::{tribe_id}",
+                "parent_node_id": f"coverage::{group}",
+                "node_depth": 2,
+                "node_label": tribe.get("display_name"),
+                "segment_type": "final_tribe" if tribe.get("is_final_tribe") else "review_tribe",
+                "coverage_group": group,
+                "tribe_id": tribe_id,
+                "remaining_segment_id": None,
+                "customer_count": _to_int(metric.get("assigned_customers") or metric.get("hard_assigned_customers")),
+                "customer_share_pct": _to_float(metric.get("share_of_total_customers_pct") or metric.get("population_share_pct")),
+                "revenue": _to_float(metric.get("total_revenue")),
+                "revenue_share_pct": _to_float(metric.get("revenue_share_pct")),
+                "recommended_treatment": tribe.get("recommended_use"),
+                "sort_order": 100 + (_to_int(tribe_id) or 0),
+            }
+        )
+    for seg in remaining:
+        segment_id = seg.get("segment_id")
+        metric = remaining_metrics.get(segment_id, {})
+        group = seg.get("coverage_group")
+        rows.append(
+            {
+                "node_id": f"remaining::{segment_id}",
+                "parent_node_id": f"coverage::{group}",
+                "node_depth": 2,
+                "node_label": seg.get("segment_name"),
+                "segment_type": "remaining_segment",
+                "coverage_group": group,
+                "tribe_id": None,
+                "remaining_segment_id": segment_id,
+                "customer_count": _to_int(metric.get("customer_count")),
+                "customer_share_pct": _to_float(metric.get("share_of_total_pct")),
+                "revenue": None,
+                "revenue_share_pct": None,
+                "recommended_treatment": seg.get("recommended_action"),
+                "sort_order": 200 + _coverage_group_sort_order(group),
+            }
+        )
+    return _mart_frame(rows, "rel_mart_customer_coverage_hierarchy")
+
+
+def _mart_opportunity_prioritization(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    actions = _mart_records(_mart_table(tables, "rel_fact_segment_action"))
+    targets = _mart_index(_mart_table(tables, "rel_dim_action_target"), "target_id")
+    tribes = _mart_index(_mart_table(tables, "rel_dim_tribe"), "tribe_id")
+    remaining = _mart_index(_mart_table(tables, "rel_dim_remaining_segment"), "segment_id")
+    tribe_metrics = _mart_index(_mart_table(tables, "rel_fact_tribe_metrics"), "tribe_id")
+    remaining_metrics = _mart_index(_mart_table(tables, "rel_fact_remaining_segment_metrics"), "segment_id")
+    rows = []
+    for action in actions:
+        target_id = action.get("target_id")
+        target = targets.get(target_id, {})
+        tribe_id = target.get("tribe_id")
+        remaining_segment_id = target.get("remaining_segment_id")
+        is_tribe = _as_text(action.get("target_type")) == "tribe"
+        metric = tribe_metrics.get(tribe_id, {}) if is_tribe else remaining_metrics.get(remaining_segment_id, {})
+        label = (
+            tribes.get(tribe_id, {}).get("display_name")
+            if is_tribe
+            else remaining.get(remaining_segment_id, {}).get("segment_name")
+        ) or _as_text(target_id)
+        rows.append(
+            {
+                "opportunity_id": f"opp::{target_id}",
+                "target_id": target_id,
+                "target_type": action.get("target_type"),
+                "target_label": label,
+                "coverage_group": target.get("coverage_group"),
+                "tribe_id": tribe_id,
+                "remaining_segment_id": remaining_segment_id,
+                "priority": action.get("priority"),
+                "priority_score": _priority_score(action.get("priority")),
+                "opportunity_rank": None,
+                "opportunity_size_customers": _to_int(metric.get("assigned_customers") or metric.get("hard_assigned_customers") or metric.get("customer_count")),
+                "opportunity_size_revenue": _to_float(metric.get("total_revenue")),
+                "action_type": _action_type(action),
+                "recommended_action": _first_text(action, ["marketing_actions", "merchandising_actions", "cross_sell_opportunities", "retention_actions"]),
+                "primary_kpi": action.get("primary_kpi"),
+                "expected_impact": action.get("expected_impact"),
+                "expected_impact_low": None,
+                "expected_impact_mid": None,
+                "expected_impact_high": None,
+                "confidence_level": target.get("business_confidence") or target.get("validation_tier"),
+                "effort_level": _effort_level(action),
+                "urgency": "now" if _priority_score(action.get("priority")) >= 3 else "next_wave",
+                "evidence_basis": action.get("evidence_basis"),
+                "impact_measurement_note": "Quantify with campaign holdouts; Stage 8 does not estimate causal lift.",
+            }
+        )
+    rows = sorted(rows, key=lambda row: (-(_to_int(row.get("priority_score")) or 0), -(_to_float(row.get("opportunity_size_revenue")) or 0.0), -(_to_int(row.get("opportunity_size_customers")) or 0)))
+    for index, row in enumerate(rows, start=1):
+        row["opportunity_rank"] = index
+    return _mart_frame(rows, "rel_mart_opportunity_prioritization")
+
+
+def _priority_score(value: Any) -> int:
+    text = _as_text(value).lower()
+    if text == "high":
+        return 3
+    if text == "medium":
+        return 2
+    if text == "low":
+        return 1
+    return 0
+
+
+def _first_text(row: Mapping[str, Any], columns: list[str]) -> str:
+    for column in columns:
+        text = _as_text(row.get(column)).strip()
+        if text:
+            return text
+    return ""
+
+
+def _action_type(row: Mapping[str, Any]) -> str:
+    text = " ".join(_as_text(row.get(column)).lower() for column in ["marketing_actions", "merchandising_actions", "cross_sell_opportunities", "retention_actions", "suppression_rules", "primary_kpi"])
+    if "retention" in text or "churn" in text:
+        return "retention"
+    if "cross" in text or "bundle" in text:
+        return "cross_sell"
+    if "suppress" in text or "exclude" in text:
+        return "suppression"
+    if "merch" in text or "shelf" in text or "assort" in text:
+        return "merchandising"
+    return "activation"
+
+
+def _effort_level(row: Mapping[str, Any]) -> str:
+    text = " ".join(_as_text(row.get(column)).lower() for column in ["marketing_actions", "merchandising_actions", "cross_sell_opportunities"])
+    if "test" in text or "pilot" in text:
+        return "medium"
+    if "merch" in text or "assort" in text:
+        return "high"
+    return "low"
+
+
+def _mart_activation_channel(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    opportunities = _mart_records(_mart_opportunity_prioritization(tables))
+    rows = []
+    for opp in opportunities:
+        channels = _channels_for_opportunity(opp)
+        for order, channel in enumerate(channels, start=1):
+            rows.append(
+                {
+                    "activation_id": f"{opp.get('opportunity_id')}::{channel}",
+                    "opportunity_id": opp.get("opportunity_id"),
+                    "target_id": opp.get("target_id"),
+                    "target_label": opp.get("target_label"),
+                    "target_type": opp.get("target_type"),
+                    "channel": channel,
+                    "channel_role": _channel_role(channel),
+                    "activation_message": opp.get("recommended_action"),
+                    "primary_kpi": opp.get("primary_kpi"),
+                    "priority": opp.get("priority"),
+                    "expected_impact": opp.get("expected_impact"),
+                    "evidence_basis": opp.get("evidence_basis"),
+                    "sort_order": (_to_int(opp.get("opportunity_rank")) or 0) * 10 + order,
+                }
+            )
+    return _mart_frame(rows, "rel_mart_activation_channel")
+
+
+def _channels_for_opportunity(opp: Mapping[str, Any]) -> list[str]:
+    text = " ".join(_as_text(opp.get(column)).lower() for column in ["recommended_action", "primary_kpi", "evidence_basis", "target_label"])
+    channels = []
+    if any(token in text for token in ["app", "push", "loyalty", "coupon", "crm", "campaign"]):
+        channels.append("loyalty_app_crm")
+    if any(token in text for token in ["email", "newsletter"]):
+        channels.append("email")
+    if any(token in text for token in ["merch", "shelf", "assort", "store", "bundle"]):
+        channels.append("in_store_merchandising")
+    if any(token in text for token in ["price", "promo", "discount", "offer"]):
+        channels.append("promo_pricing")
+    if not channels:
+        channels.append("test_and_learn_audience")
+    return list(dict.fromkeys(channels))
+
+
+def _channel_role(channel: str) -> str:
+    return {
+        "loyalty_app_crm": "owned_customer_activation",
+        "email": "owned_customer_activation",
+        "in_store_merchandising": "category_merchandising",
+        "promo_pricing": "commercial_offer",
+        "test_and_learn_audience": "measurement_audience",
+    }.get(channel, "activation")
+
+
+def _mart_customer_landscape_sample(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    assignments = _mart_table(tables, "rel_fact_customer_assignment")
+    tribes = _mart_table(tables, "rel_dim_tribe")
+    coverage = _mart_table(tables, "rel_dim_coverage_group")
+    remaining = _mart_table(tables, "rel_dim_remaining_segment")
+    frames = []
+
+    def joined(frame: pl.DataFrame, view: str, is_default: bool) -> pl.DataFrame:
+        if frame.is_empty():
+            return pl.DataFrame()
+        enriched = (
+            frame.join(assignments, on="cliente", how="left")
+            .join(tribes.select([col for col in ["tribe_id", "display_name", "tribe_status", "tribe_status_label"] if col in tribes.columns]), on="tribe_id", how="left")
+            .join(coverage.select([col for col in ["coverage_group", "coverage_group_label"] if col in coverage.columns]), on="coverage_group", how="left")
+            .join(remaining.select([col for col in ["segment_id", "segment_name"] if col in remaining.columns]), left_on="remaining_segment_id", right_on="segment_id", how="left")
+        )
+        if "z" not in enriched.columns:
+            enriched = enriched.with_columns(pl.lit(None, dtype=pl.Float32).alias("z"))
+        return enriched.select(
+            [
+                pl.lit(view).alias("visualization_type"),
+                _rel_col(enriched, "cliente", pl.Utf8),
+                pl.col("cliente").cast(pl.Utf8).str.slice(0, 12).alias("cliente_short"),
+                _rel_col(enriched, "x", pl.Float32),
+                _rel_col(enriched, "y", pl.Float32),
+                _rel_col(enriched, "z", pl.Float32),
+                _rel_col(enriched, "embedding_scope", pl.Utf8),
+                _rel_nullable_tribe_id(enriched, "tribe_id", "tribe_id"),
+                _rel_col(enriched, "display_name", pl.Utf8).alias("tribe_display_name"),
+                _rel_col(enriched, "tribe_status", pl.Utf8),
+                _rel_col(enriched, "tribe_status_label", pl.Utf8),
+                _rel_col(enriched, "coverage_group", pl.Utf8),
+                _rel_col(enriched, "coverage_group_label", pl.Utf8),
+                _rel_col(enriched, "remaining_segment_id", pl.Utf8),
+                _rel_col(enriched, "segment_name", pl.Utf8).alias("remaining_segment_name"),
+                _rel_col(enriched, "assignment_status", pl.Utf8),
+                _rel_col(enriched, "assignment_confidence_score", pl.Float64),
+                pl.coalesce(["display_name", "coverage_group_label", "segment_name", "coverage_group"]).alias("color_group"),
+                pl.concat_str(
+                    [
+                        pl.lit("Customer "),
+                        pl.col("cliente").cast(pl.Utf8).str.slice(0, 12),
+                        pl.lit(" | "),
+                        pl.coalesce(["display_name", "segment_name", "coverage_group_label", "coverage_group"]).cast(pl.Utf8),
+                    ]
+                ).alias("hover_label"),
+                pl.lit(is_default).alias("is_default_view"),
+            ]
+        )
+
+    pca = _mart_table(tables, "rel_fact_embedding_3d_pca_sample")
+    umap3d = _mart_table(tables, "rel_fact_embedding_3d_sample")
+    umap2d = _mart_table(tables, "rel_fact_embedding_2d")
+    if not umap3d.is_empty() and not umap2d.is_empty():
+        umap2d = umap3d.select("cliente").join(umap2d, on="cliente", how="inner")
+    pca_is_default = not pca.is_empty()
+    for frame, view, is_default in [
+        (pca, "pca_3d", pca_is_default),
+        (umap3d, "umap_3d", not pca_is_default),
+        (umap2d, "umap_2d", False),
+    ]:
+        built = joined(frame, view, is_default)
+        if not built.is_empty():
+            frames.append(built)
+    if not frames:
+        return _mart_frame([], "rel_mart_customer_landscape_sample")
+    return pl.concat(frames, how="vertical_relaxed").select(PRESENTATION_MART_COLUMNS["rel_mart_customer_landscape_sample"])
+
+
+def _mart_appendix_evidence(tables: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    rows = []
+    sort_order = 1
+    for source_name, section, evidence_type, title_col, metric_col, value_col, status_col in [
+        ("rel_fact_validation_metric", "Validation", "metric", "metric", "metric", "value", "status"),
+        ("rel_fact_data_quality_metric", "Data Quality", "quality_check", "artifact", "artifact", "exists", "status"),
+        ("rel_dim_model_card", "Model Cards", "model", "model_name", "model_name", "status", "status"),
+        ("rel_dim_optional_gap", "Optional Gaps", "gap", "proposed_file_name", "proposed_file_name", "current_status", "priority"),
+    ]:
+        for row in _mart_records(_mart_table(tables, source_name)):
+            rows.append(
+                {
+                    "evidence_id": f"{source_name}::{sort_order}",
+                    "evidence_section": section,
+                    "evidence_type": evidence_type,
+                    "title": _as_text(row.get(title_col)),
+                    "metric_name": _as_text(row.get(metric_col)),
+                    "metric_value": _as_text(row.get(value_col)),
+                    "status": _as_text(row.get(status_col)),
+                    "source_stage": _as_text(row.get("source_stage") or row.get("stage_id") or "stage8"),
+                    "source_table": source_name,
+                    "source_path": _as_text(row.get("source_path") or row.get("path") or row.get("source_file")),
+                    "executive_relevance": _appendix_relevance(source_name),
+                    "sort_order": sort_order,
+                }
+            )
+            sort_order += 1
+    return _mart_frame(rows, "rel_mart_appendix_evidence")
+
+
+def _appendix_relevance(source_name: str) -> str:
+    return {
+        "rel_fact_validation_metric": "Supports model defensibility and technical review.",
+        "rel_fact_data_quality_metric": "Shows whether required source artifacts were present and readable.",
+        "rel_dim_model_card": "Documents algorithms, inputs, outputs, and status.",
+        "rel_dim_optional_gap": "Separates optional polish from blocking dashboard requirements.",
+    }.get(source_name, "Appendix support.")
+
+
+def _presentation_mart_data_dictionary(marts: Mapping[str, pl.DataFrame]) -> pl.DataFrame:
+    rows = []
+    for mart_name in PRESENTATION_MART_NAMES:
+        columns = PRESENTATION_MART_COLUMNS[mart_name]
+        for index, column in enumerate(columns, start=1):
+            rows.append(
+                {
+                    "mart_name": mart_name,
+                    "mart_description": PRESENTATION_MART_DESCRIPTIONS[mart_name],
+                    "column_name": column,
+                    "column_order": index,
+                    "data_type": _mart_column_dtype(marts.get(mart_name, pl.DataFrame()), column),
+                    "is_required": column in _mart_required_columns(mart_name),
+                    "semantic_role": _mart_column_role(column),
+                    "description": _mart_column_description(mart_name, column),
+                }
+            )
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _mart_column_dtype(frame: pl.DataFrame, column: str) -> str:
+    if frame.is_empty() or column not in frame.columns:
+        return "unknown"
+    return str(frame.schema[column])
+
+
+def _mart_required_columns(mart_name: str) -> set[str]:
+    required = {
+        "rel_mart_dashboard_story_page": {"page_id", "dashboard_route", "page_order", "page_title", "executive_question", "key_takeaway"},
+        "rel_mart_executive_kpi": {"kpi_id", "display_label", "metric_value", "metric_unit", "sort_order"},
+        "rel_mart_tribe_scorecard": {"tribe_id", "tribe_display_name", "coverage_group", "customer_count", "priority_tier"},
+        "rel_mart_tribe_product_evidence": {"tribe_id", "product_id", "product_name_original", "lift_vs_rest", "pct_tribe_customers_buying_product", "evidence_role"},
+        "rel_mart_customer_coverage_hierarchy": {"node_id", "node_label", "segment_type", "customer_count"},
+        "rel_mart_opportunity_prioritization": {"opportunity_id", "target_id", "target_label", "priority", "recommended_action"},
+        "rel_mart_activation_channel": {"activation_id", "opportunity_id", "channel", "activation_message"},
+        "rel_mart_customer_landscape_sample": {"visualization_type", "cliente", "x", "y", "coverage_group", "is_default_view"},
+        "rel_mart_appendix_evidence": {"evidence_id", "evidence_section", "source_table", "title"},
+    }
+    return required.get(mart_name, set())
+
+
+def _mart_column_role(column: str) -> str:
+    if column.endswith("_id") or column in {"cliente", "node_id", "parent_node_id"}:
+        return "key"
+    if any(token in column for token in ["count", "share", "revenue", "pct", "value", "score", "rank", "x", "y", "z"]):
+        return "measure"
+    if any(token in column for token in ["label", "name", "title", "question", "takeaway", "action", "message", "description"]):
+        return "display_text"
+    return "attribute"
+
+
+def _mart_column_description(mart_name: str, column: str) -> str:
+    special = {
+        ("rel_mart_tribe_product_evidence", "product_revenue"): "Null unless a future product-level revenue fact is published.",
+        ("rel_mart_tribe_product_evidence", "evidence_role"): "Evidence role based on lift, reach, and actionability; never treated as revenue proof without product revenue.",
+        ("rel_mart_customer_landscape_sample", "visualization_type"): "pca_3d is the default presentation view; umap_3d and umap_2d remain supporting views.",
+        ("rel_mart_customer_landscape_sample", "coverage_group"): "Final, review, or remaining/noise customer coverage group joined from customer assignment facts.",
+        ("rel_mart_opportunity_prioritization", "impact_measurement_note"): "Explicit reminder that causal impact must be measured with campaign holdouts.",
+    }
+    return special.get((mart_name, column), _title_from_id(column))
+
+
+def _presentation_mart_validation_report(
+    marts: Mapping[str, pl.DataFrame],
+    dictionary: pl.DataFrame,
+    source_tables: Mapping[str, pl.DataFrame],
+) -> pl.DataFrame:
+    rows = []
+
+    def add(check_id: str, mart_name: str, area: str, severity: str, passed: bool, details: str) -> None:
+        row = _check(check_id, area, severity, passed, details)
+        row["mart_name"] = mart_name
+        rows.append(row)
+
+    for mart_name in PRESENTATION_MART_NAMES:
+        frame = marts.get(mart_name, pl.DataFrame())
+        required = _mart_required_columns(mart_name)
+        missing = sorted(required - set(frame.columns))
+        add(f"{mart_name}_exists", mart_name, "mart_presence", "critical", not frame.is_empty(), f"rows={frame.height}")
+        add(f"{mart_name}_required_columns", mart_name, "schema", "critical", not missing, f"missing={missing}")
+        for column in sorted(required & set(frame.columns)):
+            nulls = frame.select(pl.col(column).is_null().sum()).item() if not frame.is_empty() else 0
+            add(
+                f"{mart_name}_{column}_populated",
+                mart_name,
+                "null_check",
+                "warning",
+                nulls == 0,
+                f"nulls={nulls}; rows={frame.height}",
+            )
+
+    hierarchy = marts.get("rel_mart_customer_coverage_hierarchy", pl.DataFrame())
+    assignments = source_tables.get("rel_fact_customer_assignment", pl.DataFrame())
+    if not hierarchy.is_empty() and "node_id" in hierarchy.columns:
+        root = hierarchy.filter(pl.col("node_id") == "total_population")
+        root_count = _to_int(root["customer_count"][0]) if not root.is_empty() and "customer_count" in root.columns else None
+        add(
+            "coverage_hierarchy_reconciles_to_assignment",
+            "rel_mart_customer_coverage_hierarchy",
+            "reconciliation",
+            "critical",
+            root_count == assignments.height,
+            f"root_customers={root_count}; assignment_rows={assignments.height}",
+        )
+
+    product = marts.get("rel_mart_tribe_product_evidence", pl.DataFrame())
+    if not product.is_empty() and {"evidence_role", "product_revenue"}.issubset(product.columns):
+        bad_revenue_role = product.filter(
+            pl.col("product_revenue").is_null() & pl.col("evidence_role").cast(pl.Utf8).str.contains("revenue")
+        ).height
+        add(
+            "product_evidence_does_not_imply_missing_revenue",
+            "rel_mart_tribe_product_evidence",
+            "semantic_guardrail",
+            "critical",
+            bad_revenue_role == 0,
+            f"revenue_role_rows_with_null_revenue={bad_revenue_role}",
+        )
+
+    landscape = marts.get("rel_mart_customer_landscape_sample", pl.DataFrame())
+    if not landscape.is_empty() and "visualization_type" in landscape.columns:
+        default_rows = landscape.filter(pl.col("is_default_view") == True).height
+        pca_rows = landscape.filter(pl.col("visualization_type") == "pca_3d").height
+        pca_source_rows = source_tables.get("rel_fact_embedding_3d_pca_sample", pl.DataFrame()).height
+        default_ok = (default_rows == pca_rows and pca_rows > 0) if pca_source_rows > 0 else default_rows > 0
+        add(
+            "landscape_default_is_pca_3d",
+            "rel_mart_customer_landscape_sample",
+            "presentation_contract",
+            "critical",
+            default_ok,
+            f"default_rows={default_rows}; pca_rows={pca_rows}; pca_source_rows={pca_source_rows}",
+        )
+
+    kpis = marts.get("rel_mart_executive_kpi", pl.DataFrame())
+    if not kpis.is_empty() and "display_flag" in kpis.columns:
+        display_count = kpis.filter(pl.col("display_flag") == True).height
+        add(
+            "executive_kpi_strip_six_or_fewer",
+            "rel_mart_executive_kpi",
+            "presentation_contract",
+            "warning",
+            display_count <= 6,
+            f"display_flag_rows={display_count}",
+        )
+
+    add(
+        "data_dictionary_covers_every_mart_column",
+        "rel_mart_data_dictionary",
+        "documentation",
+        "critical",
+        _dictionary_covers_marts(dictionary, marts),
+        f"dictionary_rows={dictionary.height}",
+    )
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _dictionary_covers_marts(dictionary: pl.DataFrame, marts: Mapping[str, pl.DataFrame]) -> bool:
+    if dictionary.is_empty() or not {"mart_name", "column_name"}.issubset(dictionary.columns):
+        return False
+    covered = set(tuple(row) for row in dictionary.select(["mart_name", "column_name"]).iter_rows())
+    expected = {
+        (mart_name, column)
+        for mart_name in PRESENTATION_MART_NAMES
+        for column in marts.get(mart_name, pl.DataFrame()).columns
+    }
+    return expected.issubset(covered)
+
+
+def _presentation_mart_dictionary_markdown(dictionary: pl.DataFrame) -> str:
+    lines = ["# Stage 8 Presentation Mart Data Dictionary", "", "| Mart | Column | Type | Required | Description |", "|---|---|---|---|---|"]
+    for row in dictionary.iter_rows(named=True):
+        lines.append(
+            f"| {_md(row.get('mart_name'))} | {_md(row.get('column_name'))} | {_md(row.get('data_type'))} | {_md(row.get('is_required'))} | {_md(row.get('description'))} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _presentation_mart_validation_markdown(validation: pl.DataFrame) -> str:
+    lines = ["# Stage 8 Presentation Mart Validation Report", "", "| Mart | Check | Area | Severity | Status | Details |", "|---|---|---|---|---|---|"]
+    for row in validation.iter_rows(named=True):
+        lines.append(
+            f"| {_md(row.get('mart_name'))} | {_md(row.get('check_id'))} | {_md(row.get('check_area'))} | {_md(row.get('severity'))} | {_md(row.get('status'))} | {_md(row.get('details'))} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _key_set(frame: pl.DataFrame, column: str) -> set[Any]:
     if frame.is_empty() or column not in frame.columns:
         return set()
@@ -3605,6 +4772,17 @@ def _relational_primary_key(name: str) -> str:
         "rel_fact_embedding_3d_sample": "cliente",
         "rel_fact_embedding_3d_pca": "cliente",
         "rel_fact_embedding_3d_pca_sample": "cliente",
+        "rel_mart_dashboard_story_page": "page_id",
+        "rel_mart_executive_kpi": "kpi_id",
+        "rel_mart_tribe_scorecard": "tribe_id",
+        "rel_mart_tribe_product_evidence": "tribe_id, product_id",
+        "rel_mart_customer_coverage_hierarchy": "node_id",
+        "rel_mart_opportunity_prioritization": "opportunity_id",
+        "rel_mart_activation_channel": "activation_id",
+        "rel_mart_customer_landscape_sample": "visualization_type, cliente",
+        "rel_mart_appendix_evidence": "evidence_id",
+        "rel_mart_data_dictionary": "mart_name, column_name",
+        "rel_mart_validation_report": "mart_name, check_id",
     }
     if name == "rel_fact_tribe_product_affinity":
         return "tribe_id, product_id"
@@ -3639,11 +4817,24 @@ def _relational_foreign_keys(name: str) -> str:
         "rel_fact_embedding_3d_pca": "cliente -> rel_fact_customer_assignment.cliente",
         "rel_fact_embedding_3d_pca_sample": "cliente -> rel_fact_customer_assignment.cliente",
         "rel_fact_embedding_centroid": "coverage_group -> rel_dim_coverage_group.coverage_group; tribe_id -> rel_dim_tribe.tribe_id; remaining_segment_id -> rel_dim_remaining_segment.segment_id",
+        "rel_mart_dashboard_story_page": "source_rel_tables documents source dependencies",
+        "rel_mart_executive_kpi": "source_table documents source dependency",
+        "rel_mart_tribe_scorecard": "tribe_id -> rel_dim_tribe.tribe_id",
+        "rel_mart_tribe_product_evidence": "tribe_id -> rel_dim_tribe.tribe_id; product_id -> rel_dim_product.product_id",
+        "rel_mart_customer_coverage_hierarchy": "coverage_group -> rel_dim_coverage_group.coverage_group; tribe_id -> rel_dim_tribe.tribe_id; remaining_segment_id -> rel_dim_remaining_segment.segment_id",
+        "rel_mart_opportunity_prioritization": "target_id -> rel_dim_action_target.target_id",
+        "rel_mart_activation_channel": "opportunity_id -> rel_mart_opportunity_prioritization.opportunity_id",
+        "rel_mart_customer_landscape_sample": "cliente -> rel_fact_customer_assignment.cliente; tribe_id -> rel_dim_tribe.tribe_id; coverage_group -> rel_dim_coverage_group.coverage_group",
+        "rel_mart_appendix_evidence": "source_table documents source dependency",
+        "rel_mart_data_dictionary": "mart_name -> presentation mart artifact name",
+        "rel_mart_validation_report": "mart_name -> presentation mart artifact name",
     }
     return mapping.get(name, "")
 
 
 def _relational_canonical_owner(name: str) -> str:
+    if name.startswith("rel_mart_"):
+        return "presentation-ready mart derived from normalized rel_* tables"
     if name.startswith("rel_dim_"):
         return "canonical descriptor table"
     if name.startswith("rel_fact_"):
@@ -3654,6 +4845,8 @@ def _relational_canonical_owner(name: str) -> str:
 
 
 def _relational_dashboard_use(name: str) -> str:
+    if name.startswith("rel_mart_"):
+        return "Presentation-ready dashboard mart; may repeat labels/text for executive rendering while preserving source rel_* lineage."
     if name == "rel_dim_tribe":
         return "Join for canonical tribe display names, statuses, and caveats."
     if name == "rel_fact_customer_assignment":
@@ -3892,7 +5085,9 @@ Stage 8 publishes a normalized relational semantic model. It does not train mode
 3. `relational_schema_{cfg.mode}.sql` - SQL DDL blueprint for loading the parquet tables into a relational database.
 4. `relational_integrity_report_{cfg.mode}.parquet` - primary-key, foreign-key, coordinate, and separation-of-concerns checks.
 5. `artifact_manifest_{cfg.mode}.parquet` - one-row-per-public-artifact inventory.
-6. `stage8_readiness_report_{cfg.mode}.csv` - machine-readable readiness gate.
+6. `rel_mart_dashboard_story_page_{cfg.mode}.parquet` - presentation-page contract for the standalone executive dashboard.
+7. `rel_mart_validation_report_{cfg.mode}.parquet` - presentation-mart schema, reconciliation, and semantic guardrail checks.
+8. `stage8_readiness_report_{cfg.mode}.csv` - machine-readable readiness gate.
 
 ## Current Production Facts
 
@@ -3910,7 +5105,12 @@ Stage 8 publishes a normalized relational semantic model. It does not train mode
 
 ## Source-Of-Truth Rule
 
-Use only `rel_*` tables plus the manifest/readiness/schema files in this folder. Older wide tables are intentionally not part of the published contract.
+Use only the published `rel_*` tables plus the manifest/readiness/schema files in this folder. Older wide non-relational tables are intentionally not part of the published contract.
+
+There are two intentional layers:
+
+- `rel_dim_*`, `rel_fact_*`, and `rel_bridge_*` are the normalized source-of-truth model.
+- `rel_mart_*` tables are additive presentation-ready marts derived from the normalized model. They may repeat labels, page text, and display fields so the dashboard can render cleanly, but they should not be used to override the normalized facts.
 
 Names and labels must come from dimensions:
 
@@ -3922,6 +5122,22 @@ Names and labels must come from dimensions:
 - Activation target descriptors: `rel_dim_action_target_{cfg.mode}.parquet`
 
 Facts and bridges should carry IDs and measures, not repeated labels.
+
+## Presentation Marts
+
+| Table | Primary Key / Grain | Purpose |
+|---|---|---|
+| `rel_mart_dashboard_story_page_{cfg.mode}.parquet` | `page_id` | One-question-per-page executive story contract. |
+| `rel_mart_executive_kpi_{cfg.mode}.parquet` | `kpi_id` | KPI strip and supporting executive metrics. |
+| `rel_mart_tribe_scorecard_{cfg.mode}.parquet` | `tribe_id` | Presentation-ready tribe scorecards with labels, metrics, evidence, and action text. |
+| `rel_mart_tribe_product_evidence_{cfg.mode}.parquet` | `tribe_id, product_id` | Product lift/reach evidence joined to product and tribe labels. Product revenue fields stay null unless a SKU-revenue source is published. |
+| `rel_mart_customer_coverage_hierarchy_{cfg.mode}.parquet` | `node_id` | Total population -> coverage group -> tribe/remaining segment hierarchy. |
+| `rel_mart_opportunity_prioritization_{cfg.mode}.parquet` | `opportunity_id` | Ranked activation opportunities with sizing, action type, KPI, and holdout-measurement note. |
+| `rel_mart_activation_channel_{cfg.mode}.parquet` | `activation_id` | Channel-level activation recommendations derived from action rows. |
+| `rel_mart_customer_landscape_sample_{cfg.mode}.parquet` | `visualization_type, cliente` | PCA/UMAP sample with assignments and labels pre-joined for visualization. PCA 3D is the default presentation view. |
+| `rel_mart_appendix_evidence_{cfg.mode}.parquet` | `evidence_id` | Validation, data quality, model-card, and optional-gap evidence for appendix tabs. |
+| `rel_mart_data_dictionary_{cfg.mode}.parquet` | `mart_name, column_name` | Column-level dictionary for every mart. |
+| `rel_mart_validation_report_{cfg.mode}.parquet` | `mart_name, check_id` | Mart presence, schema, reconciliation, and semantic guardrail checks. |
 
 ## Core Dimensions
 
@@ -3973,7 +5189,8 @@ Facts and bridges should carry IDs and measures, not repeated labels.
 - Tribe deep dive: `rel_dim_tribe` -> `rel_fact_tribe_metrics` -> `rel_fact_tribe_profile_text` -> product/category/action facts.
 - Product affinity: `rel_fact_tribe_product_affinity` joins to `rel_dim_tribe` on `tribe_id` and `rel_dim_product` on `product_id`.
 - Customer lookup: `rel_fact_customer_assignment` joins to `rel_fact_customer_value_behavior`, `rel_fact_customer_nearest_tribe`, `rel_dim_tribe`, `rel_dim_coverage_group`, and `rel_dim_remaining_segment`.
-- 3D landscape: `rel_fact_embedding_3d_sample` joins to `rel_fact_customer_assignment`, then to `rel_dim_tribe` and coverage/remaining dimensions.
+- 3D landscape source-of-truth join: `rel_fact_embedding_3d_sample` joins to `rel_fact_customer_assignment`, then to `rel_dim_tribe` and coverage/remaining dimensions.
+- 3D landscape presentation input: `rel_mart_customer_landscape_sample` already contains PCA 3D, UMAP 3D, and UMAP 2D rows with final tribes, review tribes, and remaining/noise customers labeled.
 - Remaining-customer explanation: `rel_fact_customer_assignment` where `tribe_id` is null, joined to `rel_dim_remaining_segment` and `rel_fact_customer_nearest_tribe`.
 - Activation center: `rel_dim_action_target` joins to `rel_fact_segment_action`, then to tribe or remaining-segment dimensions.
 
@@ -4738,6 +5955,8 @@ def _business_name_readiness(confidence_label: str, has_proposal: bool) -> str:
 
 
 def _source_stages_for_product(name: str) -> list[str]:
+    if name.startswith("rel_mart_") or name.startswith("presentation_mart_"):
+        return ["stage6_8", "stage7", "stage8"]
     if name.startswith("rel_") or name in {"relational_manifest", "relational_schema", "relational_integrity_report"}:
         return ["stage6_8", "stage7", "stage8"]
     if name.startswith("embedding") or name.startswith("customer_"):
@@ -4760,6 +5979,23 @@ def _source_stages_for_product(name: str) -> list[str]:
 
 
 def _pages_for_product(name: str) -> list[str]:
+    mart_pages = {
+        "rel_mart_dashboard_story_page": ["all"],
+        "rel_mart_executive_kpi": ["Executive Overview", "Executive Insights & Final Recommendation"],
+        "rel_mart_tribe_scorecard": ["Tribe Explorer", "Executive Overview"],
+        "rel_mart_tribe_product_evidence": ["Product Affinity Explorer", "Tribe Explorer"],
+        "rel_mart_customer_coverage_hierarchy": ["Executive Overview", "Customer Coverage & Remaining Customers"],
+        "rel_mart_opportunity_prioritization": ["Executive Overview", "Segment Activation Center", "Executive Insights & Final Recommendation"],
+        "rel_mart_activation_channel": ["Segment Activation Center"],
+        "rel_mart_customer_landscape_sample": ["Interactive Customer Landscape", "Customer Lookup"],
+        "rel_mart_appendix_evidence": ["Technical Appendix", "Backend & Modeling Pipeline"],
+        "rel_mart_data_dictionary": ["Technical Appendix", "all"],
+        "rel_mart_validation_report": ["Technical Appendix", "Backend & Modeling Pipeline"],
+        "presentation_mart_data_dictionary_md": ["Technical Appendix"],
+        "presentation_mart_validation_report_md": ["Technical Appendix"],
+    }
+    if name in mart_pages:
+        return mart_pages[name]
     if name.startswith("rel_") or name in {"relational_manifest", "relational_schema", "relational_integrity_report"}:
         return ["Technical Appendix", "all"]
     mapping = {
@@ -4817,6 +6053,23 @@ def _pages_for_product(name: str) -> list[str]:
 
 
 def _artifact_grain(name: str) -> str:
+    mart_grains = {
+        "rel_mart_dashboard_story_page": "one row per presentation page",
+        "rel_mart_executive_kpi": "one row per executive KPI",
+        "rel_mart_tribe_scorecard": "one row per retained tribe",
+        "rel_mart_tribe_product_evidence": "one row per tribe-product evidence relationship",
+        "rel_mart_customer_coverage_hierarchy": "one row per hierarchy node",
+        "rel_mart_opportunity_prioritization": "one row per activation opportunity",
+        "rel_mart_activation_channel": "one row per opportunity-channel recommendation",
+        "rel_mart_customer_landscape_sample": "one row per sampled customer per visualization type",
+        "rel_mart_appendix_evidence": "one row per appendix evidence item",
+        "rel_mart_data_dictionary": "one row per presentation mart column",
+        "rel_mart_validation_report": "one row per presentation mart validation check",
+        "presentation_mart_data_dictionary_md": "Markdown data dictionary for presentation marts",
+        "presentation_mart_validation_report_md": "Markdown validation report for presentation marts",
+    }
+    if name in mart_grains:
+        return mart_grains[name]
     if name == "relational_manifest":
         return "JSON relational table catalog"
     if name == "relational_schema":
@@ -4954,6 +6207,11 @@ def _artifact_foreign_keys(name: str) -> str:
 
 def _artifact_purpose(name: str) -> str:
     purpose = {
+        **PRESENTATION_MART_DESCRIPTIONS,
+        "rel_mart_data_dictionary": "Column-level data dictionary for every Stage 8 presentation mart.",
+        "rel_mart_validation_report": "Validation checks for presentation mart presence, schema, reconciliation, and semantic guardrails.",
+        "presentation_mart_data_dictionary_md": "Human-readable Markdown version of the presentation mart data dictionary.",
+        "presentation_mart_validation_report_md": "Human-readable Markdown version of the presentation mart validation report.",
         "relational_manifest": "Normalized relational table catalog for dashboard joins and canonical source-of-truth rules.",
         "relational_schema": "SQL DDL for loading the normalized Stage 8 model into a relational database.",
         "relational_integrity_report": "Primary-key, foreign-key, coordinate, and separation-of-concerns checks for the normalized model.",
@@ -4970,6 +6228,10 @@ def _artifact_purpose(name: str) -> str:
 
 
 def _artifact_audience(name: str) -> str:
+    if name.startswith("rel_mart_"):
+        return "business-facing" if name not in {"rel_mart_data_dictionary", "rel_mart_validation_report", "rel_mart_appendix_evidence"} else "both"
+    if name.startswith("presentation_mart_"):
+        return "both"
     if name.startswith("rel_") or name in {"relational_manifest", "relational_schema", "relational_integrity_report"}:
         return "both"
     if name in {"model_metadata", "model_cards", "pipeline_lineage", "pipeline_stages", "feature_catalog", "validation_metrics", "data_quality_metrics"}:
@@ -4980,6 +6242,10 @@ def _artifact_audience(name: str) -> str:
 
 
 def _artifact_classification(name: str) -> str:
+    if name.startswith("rel_mart_"):
+        return "presentation_ready_mart"
+    if name.startswith("presentation_mart_"):
+        return "optional_human_reference"
     if name.startswith("rel_") or name in {"relational_manifest", "relational_schema", "relational_integrity_report"}:
         return "normalized_source_of_truth"
     if name in {"completeness_audit", "completeness_audit_json", "readiness_md", "readme"}:

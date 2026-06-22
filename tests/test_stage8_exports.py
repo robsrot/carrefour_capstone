@@ -106,6 +106,14 @@ def _write_fixture(cfg):
     pl.DataFrame(
         {
             "cliente": ["c1", "c2", "c3", "c4", "c5", "c6"],
+            "pc0": [0.0, 0.2, 1.0, 1.2, 2.0, 2.2],
+            "pc1": [0.0, 0.1, 1.0, 1.1, 2.0, 2.1],
+            "pc2": [0.0, 0.4, 1.0, 1.4, 2.0, 2.4],
+        }
+    ).write_parquet(feature_dir / "feature_set_pca_for_umap.parquet")
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "c5", "c6"],
             "ticket_count": [8, 7, 4, 9, 1, 3],
             "total_spend": [100.0, 120.0, 60.0, 200.0, 5.0, 30.0],
             "avg_basket_value": [20.0, 22.0, 15.0, 40.0, 5.0, 10.0],
@@ -272,6 +280,12 @@ def test_stage8_pack_writes_manifest_and_reconciles_customer_coverage(tmp_path):
     assert pl.read_parquet(paths["rel_fact_coverage_group_metrics"]).height > 0
     assert pl.read_parquet(paths["rel_dim_dashboard_page"]).height == 9
     assert pl.read_parquet(paths["rel_dim_visualization"]).height > 0
+    assert pl.read_parquet(paths["rel_mart_dashboard_story_page"]).height == 10
+    assert pl.read_parquet(paths["rel_mart_executive_kpi"]).height >= 6
+    assert pl.read_parquet(paths["rel_mart_tribe_scorecard"]).height == 2
+    assert pl.read_parquet(paths["rel_mart_tribe_product_evidence"]).height == 2
+    assert pl.read_parquet(paths["rel_mart_customer_landscape_sample"]).filter(pl.col("visualization_type") == "pca_3d").height == 6
+    assert pl.read_parquet(paths["rel_mart_validation_report"]).filter((pl.col("severity") == "critical") & (pl.col("status") == "fail")).is_empty()
     rel_product_fact = pl.read_parquet(paths["rel_fact_tribe_product_affinity"])
     assert "tribe_name" not in rel_product_fact.columns
     assert "product_description" not in rel_product_fact.columns
@@ -302,6 +316,13 @@ def test_stage8_manifest_has_no_markdown_inputs_and_expected_dashboard_products(
     assert "rel_fact_executive_metric" in product_names
     assert "rel_fact_customer_assignment" in product_names
     assert "rel_fact_tribe_product_affinity" in product_names
+    assert "rel_mart_dashboard_story_page" in product_names
+    assert "rel_mart_executive_kpi" in product_names
+    assert "rel_mart_tribe_scorecard" in product_names
+    assert "rel_mart_tribe_product_evidence" in product_names
+    assert "rel_mart_customer_landscape_sample" in product_names
+    assert "rel_mart_data_dictionary" in product_names
+    assert "rel_mart_validation_report" in product_names
     assert "tribe_deep_dive" not in product_names
     assert "customer_coverage" not in product_names
     assert "embedding_3d_sample" not in product_names
