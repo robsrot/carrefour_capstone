@@ -8,9 +8,11 @@ import re
 import shutil
 import warnings
 from html import escape
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import polars as pl
 from dotenv import load_dotenv
 
@@ -1170,6 +1172,1864 @@ def write_tribe_comparison_artifacts(
     return {"csv": csv_path, "markdown": md_path, "html": html_path}
 
 
+def remaining_customer_affinity_table(
+    assignments_path: str | Path,
+    behavior_path: str | Path | None = None,
+    *,
+    output_parquet: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Score still-unassigned customers against hard-tribe behavior centroids.
+
+    This is evidence for segmentation and campaign opportunity sizing only; it never mutates
+    the official hard assignment parquet.
+    """
+
+    if behavior_path is None or not Path(behavior_path).exists():
+        result = _empty_remaining_customer_affinity()
+        if output_parquet is not None:
+            _write_parquet(result, output_parquet)
+        return result
+
+    assignments = _assignment_membership_frame(assignments_path)
+    if assignments.is_empty() or assignments.filter(pl.col("tribe_id") < 0).is_empty():
+        result = _empty_remaining_customer_affinity()
+        if output_parquet is not None:
+            _write_parquet(result, output_parquet)
+        return result
+
+    behavior_scan = pl.scan_parquet(behavior_path)
+    behavior_schema = behavior_scan.collect_schema()
+    feature_cols = _remaining_affinity_feature_columns(behavior_schema, cfg=cfg)
+    if not feature_cols:
+        result = _empty_remaining_customer_affinity()
+        if output_parquet is not None:
+            _write_parquet(result, output_parquet)
+        return result
+
+    joined = collect_streaming(
+        assignments.lazy()
+        .join(behavior_scan.select(["cliente", *feature_cols]), on="cliente", how="inner")
+        .select(["cliente", "tribe_id", "assignment_confidence_score", *feature_cols])
+    )
+    core = joined.filter(pl.col("tribe_id") >= 0)
+    remaining = joined.filter(pl.col("tribe_id") < 0)
+    if core.is_empty() or remaining.is_empty():
+        result = _empty_remaining_customer_affinity()
+        if output_parquet is not None:
+            _write_parquet(result, output_parquet)
+        return result
+
+    all_features = _numeric_matrix(joined, feature_cols)
+    means = all_features.mean(axis=0, keepdims=True)
+    std = np.maximum(all_features.std(axis=0, keepdims=True), 1e-6)
+    tribe_ids = sorted(int(item) for item in core["tribe_id"].unique().to_list())
+    centroids = []
+    core_x = _standardized_matrix(core, feature_cols, means, std)
+    core_labels = core["tribe_id"].to_numpy()
+    for tribe_id in tribe_ids:
+        mask = core_labels == tribe_id
+        if np.any(mask):
+            centroids.append(core_x[mask].mean(axis=0))
+    if not centroids:
+        result = _empty_remaining_customer_affinity()
+        if output_parquet is not None:
+            _write_parquet(result, output_parquet)
+        return result
+
+    centroid_matrix = _l2_normalize(np.vstack(centroids).astype(np.float32))
+    remaining_x = _l2_normalize(_standardized_matrix(remaining, feature_cols, means, std))
+    cliente_values = remaining["cliente"].to_list()
+    chunk_size = max(int(cfg.get("profiling.remaining_affinity_chunk_size", 100000)), 1)
+    frames: list[pl.DataFrame] = []
+    for start in range(0, remaining_x.shape[0], chunk_size):
+        end = min(start + chunk_size, remaining_x.shape[0])
+        scores = remaining_x[start:end] @ centroid_matrix.T
+        order = np.argsort(scores, axis=1)[:, ::-1]
+        top_idx = order[:, 0]
+        second_idx = order[:, 1] if scores.shape[1] > 1 else order[:, 0]
+        top_scores = scores[np.arange(scores.shape[0]), top_idx]
+        second_scores = scores[np.arange(scores.shape[0]), second_idx] if scores.shape[1] > 1 else np.zeros_like(top_scores)
+        margins = top_scores - second_scores
+        bands = [_affinity_confidence_band(float(top), float(margin), cfg=cfg) for top, margin in zip(top_scores, margins)]
+        frames.append(
+            pl.DataFrame(
+                {
+                    "cliente": cliente_values[start:end],
+                    "official_tribe_id": [-1] * (end - start),
+                    "top_tribe_id": [tribe_ids[int(idx)] for idx in top_idx],
+                    "top_affinity_score": top_scores.astype(float),
+                    "second_tribe_id": [tribe_ids[int(idx)] for idx in second_idx],
+                    "second_affinity_score": second_scores.astype(float),
+                    "affinity_margin": margins.astype(float),
+                    "affinity_confidence_band": bands,
+                    "recommended_use": [
+                        "soft audience opportunity" if band == "high" else "diagnostic only" for band in bands
+                    ],
+                    "official_assignment_policy": ["does_not_change_hard_assignment"] * (end - start),
+                }
+            )
+        )
+    result = pl.concat(frames, how="vertical") if frames else _empty_remaining_customer_affinity()
+    if output_parquet is not None:
+        _write_parquet(result, output_parquet)
+    return result
+
+
+def remaining_customer_segments_table(
+    assignments_path: str | Path,
+    behavior_path: str | Path | None = None,
+    *,
+    affinity_path: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Summarize unassigned customers into business-readable remaining-customer segments."""
+
+    assignments = _assignment_membership_frame(assignments_path)
+    total_customers = int(assignments["cliente"].n_unique()) if not assignments.is_empty() else 0
+    remaining = assignments.filter(pl.col("tribe_id") < 0)
+    remaining_customers = int(remaining["cliente"].n_unique()) if not remaining.is_empty() else 0
+    if remaining.is_empty():
+        result = _empty_remaining_customer_segments()
+        if output_csv is not None:
+            _write_csv(result, output_csv)
+        return result
+
+    frame = remaining.select(["cliente", "tribe_id", "assignment_confidence_score"])
+    if behavior_path is not None and Path(behavior_path).exists():
+        behavior_scan = pl.scan_parquet(behavior_path)
+        metric_cols = _remaining_behavior_metric_columns(behavior_scan.collect_schema())
+        if metric_cols:
+            frame = collect_streaming(frame.lazy().join(behavior_scan.select(["cliente", *metric_cols]), on="cliente", how="left"))
+        else:
+            frame = collect_streaming(frame.lazy())
+    else:
+        frame = collect_streaming(frame.lazy())
+
+    affinity = _read_optional_table(affinity_path)
+    if not affinity.is_empty() and "cliente" in affinity.columns:
+        affinity_cols = [
+            column
+            for column in ["cliente", "top_tribe_id", "top_affinity_score", "second_tribe_id", "second_affinity_score", "affinity_margin"]
+            if column in affinity.columns
+        ]
+        frame = frame.join(affinity.select(affinity_cols), on="cliente", how="left")
+
+    classified = _classify_remaining_customer_segments(frame, cfg=cfg)
+    rows = _remaining_segment_summary_rows(
+        classified,
+        total_customers=total_customers,
+        remaining_customers=remaining_customers,
+    )
+    result = pl.from_dicts(rows, infer_schema_length=None) if rows else _empty_remaining_customer_segments()
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_remaining_customer_segment_artifacts(
+    assignments_path: str | Path,
+    behavior_path: str | Path | None = None,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    affinity_output_parquet: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    affinity_path = (
+        Path(affinity_output_parquet)
+        if affinity_output_parquet
+        else cfg.artifacts / "stage6" / f"stage6_7_remaining_customer_affinity_{cfg.mode}.parquet"
+    )
+    affinity = remaining_customer_affinity_table(
+        assignments_path,
+        behavior_path=behavior_path,
+        output_parquet=affinity_path,
+        cfg=cfg,
+    )
+    del affinity
+    csv_path = (
+        Path(output_csv)
+        if output_csv
+        else cfg.artifacts / "stage6" / f"stage6_7_remaining_customer_segments_{cfg.mode}.csv"
+    )
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = remaining_customer_segments_table(
+        assignments_path,
+        behavior_path=behavior_path,
+        affinity_path=affinity_path,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    md_path.write_text(_remaining_customer_segments_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 6.7 Remaining Customer Segments"), encoding="utf-8")
+    metadata = {
+        "stage": "stage6_7_remaining_customer_segments",
+        "mode": cfg.mode,
+        "assignments": file_fingerprint(assignments_path),
+        "behavior": file_fingerprint(behavior_path) if behavior_path else None,
+        "affinity": file_fingerprint(affinity_path),
+        "official_assignment_policy": "hard assignments unchanged; affinities are diagnostic/campaign-use only",
+    }
+    for path in [csv_path, md_path, html_path, affinity_path]:
+        write_artifact_metadata(path, metadata)
+    return {"csv": csv_path, "markdown": md_path, "html": html_path, "affinity_parquet": affinity_path}
+
+
+def stage7_all_tribe_profiles_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    rows: list[dict[str, Any]] = []
+    profile_rows = list(profiles.iter_rows(named=True))
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    for row in profile_rows:
+        status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(status, allowed_statuses)
+        promoted = _stage7_status_is_final(tribe_status)
+        name_info = name_fields_by_id.get(int(row["tribe_id"])) or _stage7_name_fields(row, cfg=cfg)
+        actionability = _actionability_proof(row, cfg=cfg)
+        validation = _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_info, cfg=cfg)
+        rows.append(
+            {
+                "tribe_id": int(row["tribe_id"]),
+                "tribe_name": name_info["business_name"],
+                "promotion_status": "promoted" if promoted else "not_promoted_review",
+                "promotion_decision": _stage7_promotion_decision(status, tribe_status, row),
+                "validation_tier": _stage7_validation_tier(status, tribe_status),
+                "technical_name": name_info["technical_name"],
+                "business_name": name_info["business_name"],
+                "legacy_tribe_name": name_info["legacy_tribe_name"],
+                "business_confidence": _stage7_business_confidence(status, tribe_status, validation["validation_blockers"]),
+                "validation_blockers": validation["validation_blockers"],
+                "coverage_group": "core_promoted_tribe" if promoted else "review_tribe",
+                "membership_policy": (
+                    "official hard-assigned promoted tribe"
+                    if promoted
+                    else "hard-assigned tribe held outside the core promoted set"
+                ),
+                "tribe_status": tribe_status,
+                "tribe_status_label": _stage7_status_label(tribe_status),
+                "stage6_profile_readiness": status,
+                "promotion_blocker": "pass" if promoted else f"stage6_profile_readiness={status}",
+                "readiness_caveat": _stage7_readiness_caveat(status, tribe_status),
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "customers": int(row.get("n_customers") or 0),
+                "population_share_pct": round(100.0 * float(row.get("population_share") or 0.0), 3),
+                "mean_assignment_confidence": _safe_float(row.get("mean_assignment_confidence")),
+                "p10_assignment_confidence": _safe_float(row.get("p10_assignment_confidence")),
+                "jitter_label_recovery_accuracy": _safe_float(row.get("jitter_label_recovery_accuracy")),
+                "who_is_the_tribe": _business_persona_summary(row, cfg=cfg),
+                "defining_behavior": _spend_and_visit_context(row),
+                "distinctive_products": _product_evidence_text(row),
+                "broad_reach_products": _broad_reach_products_text(row),
+                "sector_theme_evidence": _sector_theme_evidence(row, cfg=cfg),
+                "shopping_mission": row.get("llm_shopping_mission") or _copurchase_text(row),
+                "promo_loyalty_recency": _promo_loyalty_recency_text(row),
+                "targeting_idea": _targeting_idea(row, cfg=cfg),
+                "revenue_lever": _revenue_lever(row),
+                "confidence_level": _evidence_confidence(status),
+                "evidence_caveat": row.get("llm_confidence_note") or "Purchase behavior only; not a demographic claim.",
+                "actionability_proof": actionability.get("actionability_proof"),
+            }
+        )
+    result = pl.from_dicts(rows, infer_schema_length=None) if rows else _empty_stage7_all_tribe_profiles()
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def stage7_promoted_tribe_validation_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+    result = (
+        profiles.filter(pl.col("tribe_status").is_in(["final_strong", "final_usable"]))
+        if not profiles.is_empty() and "tribe_status" in profiles.columns
+        else _empty_stage7_all_tribe_profiles()
+    )
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_promoted_tribe_validation_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_promoted_tribe_validation_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_promoted_tribe_validation_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_promoted_validation_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.2A Promoted Tribe Validation"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def write_stage7_all_tribe_profile_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_all_tribe_profiles_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_all_tribe_profiles_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_all_tribe_profiles_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.1 All-Tribe Evidence Profiles"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_review_tribe_audit_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+    result = profiles.filter(pl.col("promotion_status") != "promoted") if not profiles.is_empty() else _empty_stage7_all_tribe_profiles()
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_review_tribe_validation_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_review_tribe_validation_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_review_tribe_audit_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_review_validation_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.2B Review Tribe Validation"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def write_stage7_review_tribe_audit_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_review_tribe_audit_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_review_tribe_audit_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_review_audit_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.1 Review Tribe Audit"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_all_tribe_product_identity_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+    columns = [
+        "tribe_id",
+        "tribe_name",
+        "promotion_decision",
+        "validation_tier",
+        "technical_name",
+        "business_name",
+        "legacy_tribe_name",
+        "business_confidence",
+        "validation_blockers",
+        "coverage_group",
+        "membership_policy",
+        "tribe_status",
+        "tribe_status_label",
+        "customers",
+        "population_share_pct",
+        "distinctive_products",
+        "broad_reach_products",
+        "sector_theme_evidence",
+        "shopping_mission",
+        "readiness_caveat",
+        "recommended_use",
+    ]
+    result = profiles.select([column for column in columns if column in profiles.columns]) if not profiles.is_empty() else profiles
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_all_tribe_product_identity_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_all_tribe_product_identity_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_all_tribe_product_identity_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_all_tribe_product_identity_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.3 All-Tribe Product Identity"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_all_tribe_behavior_differentiation_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    rows: list[dict[str, Any]] = []
+    profile_rows = list(profiles.iter_rows(named=True))
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    for row in profile_rows:
+        status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(status, allowed_statuses)
+        name_info = name_fields_by_id.get(int(row["tribe_id"])) or _stage7_name_fields(row, cfg=cfg)
+        ratios = _fixed_behavior_ratios(row)
+        rows.append(
+            {
+                "tribe_id": int(row["tribe_id"]),
+                "tribe_name": name_info["business_name"],
+                "tribe_status": tribe_status,
+                "tribe_status_label": _stage7_status_label(tribe_status),
+                "customers": int(row.get("n_customers") or 0),
+                "population_share_pct": round(100.0 * float(row.get("population_share") or 0.0), 3),
+                "total_spend_ratio_vs_rest": ratios.get("avg_total_spend"),
+                "visit_frequency_ratio_vs_rest": ratios.get("avg_frequency_per_30d"),
+                "basket_value_ratio_vs_rest": ratios.get("avg_basket_value"),
+                "promo_sensitivity_ratio_vs_rest": ratios.get("avg_promo_share"),
+                "behavioral_signature": _spend_and_visit_context(row),
+                "promo_loyalty_recency": _promo_loyalty_recency_text(row),
+                "readiness_caveat": _stage7_readiness_caveat(status, tribe_status),
+                "recommended_use": _stage7_recommended_use(tribe_status),
+            }
+        )
+    result = pl.from_dicts(rows, infer_schema_length=None) if rows else _empty_stage7_behavior_differentiation()
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_all_tribe_behavior_differentiation_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_all_tribe_behavior_differentiation_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_all_tribe_behavior_differentiation_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_all_tribe_behavior_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.4 All-Tribe Behavioral Differentiation"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_persona_deep_dive_table(
+    profile_path: str | Path,
+    *,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+    if profiles.is_empty():
+        return profiles
+    nearest = _stage7_nearest_relationship_map(stage7_tribe_relationship_atlas_table(profile_path, cfg=cfg))
+    records: list[dict[str, Any]] = []
+    for row in profiles.iter_rows(named=True):
+        enriched = dict(row)
+        enriched.update(
+            nearest.get(
+                int(row["tribe_id"]),
+                {
+                    "nearest_related_tribe": None,
+                    "nearest_relationship_type": None,
+                    "nearest_relationship_score": None,
+                    "clearest_differentiator": None,
+                },
+            )
+        )
+        records.append(enriched)
+    profiles = pl.from_dicts(records, infer_schema_length=None)
+    return profiles.select(
+        [
+            "tribe_id",
+            "tribe_name",
+            "promotion_status",
+            "tribe_status",
+            "tribe_status_label",
+            "who_is_the_tribe",
+            "defining_behavior",
+            "distinctive_products",
+            "broad_reach_products",
+            "shopping_mission",
+            "targeting_idea",
+            "revenue_lever",
+            "nearest_related_tribe",
+            "nearest_relationship_type",
+            "nearest_relationship_score",
+            "clearest_differentiator",
+            "confidence_level",
+            "promotion_blocker",
+            "readiness_caveat",
+            "recommended_use",
+            "evidence_caveat",
+        ]
+    )
+
+
+def write_stage7_persona_deep_dive_artifacts(
+    profile_path: str | Path,
+    *,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    md_path = Path(output_md) if output_md else cfg.artifacts / "stage7" / f"stage7_persona_deep_dives_{cfg.mode}.md"
+    html_path = Path(output_html) if output_html else md_path.with_suffix(".html")
+    table = stage7_persona_deep_dive_table(profile_path, cfg=cfg)
+    markdown = _stage7_persona_deep_dives_markdown(table)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.5 All-Tribe Dossiers", markdown), encoding="utf-8")
+    return {"markdown": md_path, "html": html_path}
+
+
+def stage7_remaining_customer_analysis_table(
+    assignments_path: str | Path | None = None,
+    behavior_path: str | Path | None = None,
+    *,
+    segment_path: str | Path | None = None,
+    affinity_path: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    if segment_path and Path(segment_path).exists():
+        result = _read_optional_table(segment_path)
+    elif assignments_path is not None:
+        result = remaining_customer_segments_table(
+            assignments_path,
+            behavior_path=behavior_path,
+            affinity_path=affinity_path,
+            cfg=cfg,
+        )
+    else:
+        result = _empty_remaining_customer_segments()
+    if not result.is_empty():
+        result = result.with_columns(
+            pl.lit("remaining customer analysis").alias("stage7_substage"),
+            pl.lit("descriptive segment; not hard tribe membership").alias("membership_policy"),
+        )
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_remaining_customer_analysis_artifacts(
+    assignments_path: str | Path | None = None,
+    behavior_path: str | Path | None = None,
+    *,
+    segment_path: str | Path | None = None,
+    affinity_path: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_remaining_customer_analysis_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_remaining_customer_analysis_table(
+        assignments_path,
+        behavior_path,
+        segment_path=segment_path,
+        affinity_path=affinity_path,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    md_path.write_text(_remaining_customer_segments_markdown(table, title="# Stage 7.3 Remaining Customer Analysis"), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.3 Remaining Customer Analysis"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_soft_audience_opportunities_table(
+    assignments_path: str | Path | None = None,
+    behavior_path: str | Path | None = None,
+    *,
+    affinity_path: str | Path | None = None,
+    profile_path: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    if affinity_path and Path(affinity_path).exists():
+        affinity = pl.read_parquet(affinity_path)
+    elif assignments_path is not None:
+        affinity = remaining_customer_affinity_table(assignments_path, behavior_path=behavior_path, cfg=cfg)
+    else:
+        affinity = _empty_remaining_customer_affinity()
+    if affinity.is_empty():
+        result = _empty_stage7_soft_audience_opportunities()
+    else:
+        min_affinity = float(cfg.get("profiling.soft_audience_min_affinity", 0.70))
+        min_margin = float(cfg.get("profiling.soft_audience_min_margin", 0.10))
+        eligible = affinity.filter(
+            (pl.col("top_affinity_score") >= min_affinity)
+            & (pl.col("affinity_margin") >= min_margin)
+            & (pl.col("official_tribe_id") < 0)
+        )
+        if eligible.is_empty():
+            result = _empty_stage7_soft_audience_opportunities()
+        else:
+            total_remaining = max(int(affinity["cliente"].n_unique()), 1)
+            result = (
+                eligible.group_by("top_tribe_id")
+                .agg(
+                    pl.col("cliente").n_unique().alias("customer_count"),
+                    pl.col("top_affinity_score").mean().alias("mean_top_affinity"),
+                    pl.col("top_affinity_score").quantile(0.10).alias("p10_top_affinity"),
+                    pl.col("affinity_margin").mean().alias("mean_affinity_margin"),
+                    pl.col("second_tribe_id").mode().first().alias("most_common_second_tribe_id"),
+                )
+                .with_columns(
+                    (pl.col("customer_count") / pl.lit(total_remaining) * 100.0).alias("remaining_customer_share_pct"),
+                    pl.lit("soft audience opportunity").alias("audience_label"),
+                    pl.lit("campaign-use only; does not change official hard assignment").alias("assignment_policy"),
+                    pl.lit("Test as targeted activation or lookalike expansion, with holdout measurement.").alias("recommended_use"),
+                )
+                .rename({"top_tribe_id": "target_tribe_id"})
+                .sort(["customer_count", "target_tribe_id"], descending=[True, False])
+            )
+    if not result.is_empty() and profile_path is not None:
+        status_lookup = (
+            stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+            .select(["tribe_id", "tribe_name", "tribe_status", "tribe_status_label"])
+            .rename(
+                {
+                    "tribe_id": "target_tribe_id",
+                    "tribe_name": "target_tribe_name",
+                    "tribe_status": "target_tribe_status",
+                    "tribe_status_label": "target_tribe_status_label",
+                }
+            )
+        )
+        result = result.join(status_lookup, on="target_tribe_id", how="left")
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_soft_audience_opportunity_artifacts(
+    assignments_path: str | Path | None = None,
+    behavior_path: str | Path | None = None,
+    *,
+    affinity_path: str | Path | None = None,
+    profile_path: str | Path | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_soft_audience_opportunities_{cfg.mode}.csv"
+    stage7_soft_audience_opportunities_table(
+        assignments_path,
+        behavior_path,
+        affinity_path=affinity_path,
+        profile_path=profile_path,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    return {"csv": csv_path}
+
+
+def stage7_soft_audience_activation_customer_table(
+    affinity_path: str | Path | None = None,
+    *,
+    soft_audience_path: str | Path | None = None,
+    final_index: str | Path | pl.DataFrame | None = None,
+    output_csv: str | Path | None = None,
+    output_parquet: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Return customer-level campaign-use soft audience rows without changing hard assignment."""
+
+    affinity = pl.read_parquet(affinity_path) if affinity_path and Path(affinity_path).exists() else _empty_remaining_customer_affinity()
+    soft = _read_optional_table(soft_audience_path)
+    if affinity.is_empty() or soft.is_empty():
+        result = _empty_stage7_soft_audience_activation_customers()
+    else:
+        target_ids = soft["target_tribe_id"].to_list() if "target_tribe_id" in soft.columns else []
+        final_index_frame = _coerce_table(final_index)
+        if not final_index_frame.is_empty() and {"tribe_id", "tribe_name"}.issubset(set(final_index_frame.columns)):
+            optional_columns = [column for column in ["tribe_status", "tribe_status_label"] if column in final_index_frame.columns]
+            rename_map = {"tribe_id": "target_tribe_id"}
+            if "tribe_status" in optional_columns:
+                rename_map["tribe_status"] = "target_tribe_status"
+            if "tribe_status_label" in optional_columns:
+                rename_map["tribe_status_label"] = "target_tribe_status_label"
+            names = final_index_frame.select(["tribe_id", "tribe_name", *optional_columns]).rename(rename_map)
+        else:
+            names = pl.DataFrame(
+                schema={
+                    "target_tribe_id": pl.Int64,
+                    "tribe_name": pl.Utf8,
+                    "target_tribe_status": pl.Utf8,
+                    "target_tribe_status_label": pl.Utf8,
+                }
+            )
+        if "target_tribe_status" not in names.columns:
+            names = names.with_columns(pl.lit(None).cast(pl.Utf8).alias("target_tribe_status"))
+        if "target_tribe_status_label" not in names.columns:
+            names = names.with_columns(pl.lit(None).cast(pl.Utf8).alias("target_tribe_status_label"))
+        min_affinity = float(cfg.get("profiling.soft_audience_min_affinity", 0.70))
+        min_margin = float(cfg.get("profiling.soft_audience_min_margin", 0.10))
+        result = (
+            affinity.filter(
+                (pl.col("official_tribe_id") < 0)
+                & (pl.col("top_tribe_id").is_in(target_ids))
+                & (pl.col("top_affinity_score") >= min_affinity)
+                & (pl.col("affinity_margin") >= min_margin)
+            )
+            .rename({"top_tribe_id": "target_tribe_id"})
+            .join(names, on="target_tribe_id", how="left")
+            .with_columns(
+                pl.col("tribe_name").alias("target_tribe_name"),
+                pl.col("target_tribe_status").fill_null("unknown"),
+                pl.col("target_tribe_status_label").fill_null("Unknown"),
+                pl.lit("soft audience opportunity").alias("audience_label"),
+                pl.lit("campaign-use only; official tribe_id remains -1").alias("assignment_policy"),
+                pl.lit("Use only with holdout/control measurement; do not report as core tribe membership.").alias(
+                    "recommended_use"
+                ),
+            )
+            .select(
+                [
+                    "cliente",
+                    "official_tribe_id",
+                    "target_tribe_id",
+                    "target_tribe_name",
+                    "target_tribe_status",
+                    "target_tribe_status_label",
+                    "top_affinity_score",
+                    "second_tribe_id",
+                    "second_affinity_score",
+                    "affinity_margin",
+                    "affinity_confidence_band",
+                    "audience_label",
+                    "assignment_policy",
+                    "recommended_use",
+                ]
+            )
+            .sort(["target_tribe_id", "top_affinity_score"], descending=[False, True])
+        )
+    result = _stage7_soft_audience_activation_frame(result)
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    if output_parquet is not None:
+        output = Path(output_parquet)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result.write_parquet(output)
+    return result
+
+
+def stage7_campaign_playbook_table(
+    final_index: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Build one campaign-ready recommendation row per promoted tribe."""
+
+    index = _coerce_table(final_index)
+    rows: list[dict[str, Any]] = []
+    for row in index.iter_rows(named=True):
+        tribe_id = int(row.get("tribe_id") or 0)
+        hook = row.get("actionability_proof") or row.get("top_product") or row.get("primary_theme") or "basket mission"
+        offer = _campaign_offer_idea(row)
+        expected_lever = _campaign_expected_lever(row)
+        rows.append(
+            {
+                "tribe_id": tribe_id,
+                "tribe_name": row.get("tribe_name"),
+                "audience_definition": (
+                    f"Official hard-assigned promoted tribe T{tribe_id}; "
+                    f"{int(row.get('customers') or row.get('customers_count') or 0):,} customers."
+                ),
+                "targeting_hook": hook,
+                "offer_idea": offer,
+                "recommended_channel": _campaign_channel(row),
+                "suppression_rules": _campaign_suppression_rules(row),
+                "holdout_control_design": "Hold out 10-15% of eligible customers, stratified by spend band and recency.",
+                "primary_kpi": _campaign_primary_kpi(row),
+                "secondary_kpis": "Incremental revenue, basket size, visit frequency, margin proxy, unsubscribe/opt-out rate.",
+                "expected_commercial_lever": expected_lever,
+                "risk_caveat": row.get("caveat") or "Purchase-behavior segment only; avoid demographic claims.",
+                "evidence_basis": _campaign_evidence_basis(row),
+            }
+        )
+    result = _stage7_campaign_playbook_frame(rows)
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_campaign_playbook_artifacts(
+    final_index: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_campaign_playbook_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_campaign_playbook_table(final_index, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_campaign_playbook_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.9 Final-Only Campaign Playbook"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_stakeholder_readiness_table(
+    final_index: str | Path | pl.DataFrame,
+    all_tribe_profiles: str | Path | pl.DataFrame,
+    remaining_customer_analysis: str | Path | pl.DataFrame,
+    soft_audience_opportunities: str | Path | pl.DataFrame,
+    activation_customers: str | Path | pl.DataFrame,
+    campaign_playbook: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Audit whether Stage 7 is ready for stakeholder delivery and campaign planning."""
+
+    index = _coerce_table(final_index)
+    profiles = _coerce_table(all_tribe_profiles)
+    remaining = _coerce_table(remaining_customer_analysis)
+    soft = _coerce_table(soft_audience_opportunities)
+    activation = _coerce_table(activation_customers)
+    playbook = _coerce_table(campaign_playbook)
+    rows = [
+        _readiness_name_quality_row(index),
+        _readiness_product_evidence_row(index, cfg=cfg),
+        _readiness_persona_specificity_row(profiles, cfg=cfg),
+        _readiness_remaining_customer_row(remaining, cfg=cfg),
+        _readiness_soft_audience_activation_row(soft, activation, cfg=cfg),
+        _readiness_campaign_playbook_row(index, playbook),
+    ]
+    critical_count = sum(1 for row in rows if row["status"] == "fail" and row["severity"] == "critical")
+    warning_count = sum(1 for row in rows if row["status"] == "warn")
+    overall = {
+        "check_id": "overall_delivery_readiness",
+        "check_area": "overall",
+        "severity": "critical",
+        "status": "fail" if critical_count else "warn" if warning_count else "pass",
+        "issue_count": critical_count + warning_count,
+        "affected_items": "stage7",
+        "details": f"{critical_count} critical issue(s); {warning_count} warning(s).",
+        "recommended_action": (
+            "Resolve critical findings before stakeholder submission."
+            if critical_count
+            else "Review warnings before final presentation."
+            if warning_count
+            else "Stage 7 package is ready for stakeholder review."
+        ),
+    }
+    result = _stage7_readiness_frame([overall, *rows])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_stakeholder_readiness_artifacts(
+    final_index: str | Path | pl.DataFrame,
+    all_tribe_profiles: str | Path | pl.DataFrame,
+    remaining_customer_analysis: str | Path | pl.DataFrame,
+    soft_audience_opportunities: str | Path | pl.DataFrame,
+    activation_customers: str | Path | pl.DataFrame,
+    campaign_playbook: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_stakeholder_readiness_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_stakeholder_readiness_table(
+        final_index,
+        all_tribe_profiles,
+        remaining_customer_analysis,
+        soft_audience_opportunities,
+        activation_customers,
+        campaign_playbook,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    md_path.write_text(_stage7_stakeholder_readiness_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.9 Stakeholder Delivery Readiness"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_tribe_relationship_atlas_table(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    rows: list[dict[str, Any]] = []
+    profile_rows = list(profiles.iter_rows(named=True))
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    for left, right in combinations(profile_rows, 2):
+        left_name = (name_fields_by_id.get(int(left["tribe_id"])) or _stage7_name_fields(left, cfg=cfg))["business_name"]
+        right_name = (name_fields_by_id.get(int(right["tribe_id"])) or _stage7_name_fields(right, cfg=cfg))["business_name"]
+        left_status = _stage7_tribe_status(left.get("stage6_profile_readiness"), allowed_statuses)
+        right_status = _stage7_tribe_status(right.get("stage6_profile_readiness"), allowed_statuses)
+        product_overlap = _product_overlap_score(left, right)
+        behavior_similarity = _behavior_similarity_score(left, right)
+        theme_match = _primary_theme_context(left, cfg=cfg).get("primary_theme") == _primary_theme_context(right, cfg=cfg).get("primary_theme")
+        relationship_type = _relationship_type(product_overlap, behavior_similarity, theme_match)
+        rows.append(
+            {
+                "tribe_a_id": int(left["tribe_id"]),
+                "tribe_a_name": left_name,
+                "tribe_a_status": left_status,
+                "tribe_a_status_label": _stage7_status_label(left_status),
+                "tribe_b_id": int(right["tribe_id"]),
+                "tribe_b_name": right_name,
+                "tribe_b_status": right_status,
+                "tribe_b_status_label": _stage7_status_label(right_status),
+                "relationship_scope": "final_pair" if _stage7_status_is_final(left_status) and _stage7_status_is_final(right_status) else "includes_potential_review",
+                "relationship_type": relationship_type,
+                "product_overlap_score": product_overlap,
+                "behavior_similarity_score": behavior_similarity,
+                "relationship_score": round((product_overlap + behavior_similarity + (0.15 if theme_match else 0.0)) / 2.15, 4),
+                "similarity_evidence": _relationship_similarity_evidence(left, right, theme_match, cfg=cfg),
+                "difference_evidence": _relationship_difference_evidence(left, right),
+                "commercial_interpretation": _relationship_commercial_interpretation(relationship_type),
+                "campaign_guidance": _relationship_campaign_guidance(relationship_type),
+            }
+        )
+    result = pl.from_dicts(rows, infer_schema_length=None) if rows else _empty_stage7_relationship_atlas()
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_tribe_relationship_atlas_artifacts(
+    profile_path: str | Path,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_tribe_relationship_atlas_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_tribe_relationship_atlas_table(profile_path, output_csv=csv_path, cfg=cfg)
+    md_path.write_text(_stage7_relationship_atlas_markdown(table), encoding="utf-8")
+    html_path.write_text(_html_table(table, title="Stage 7.8 All-Tribe Relationship Atlas"), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def _stage7_nearest_relationship_map(relationships: pl.DataFrame) -> dict[int, dict[str, Any]]:
+    nearest: dict[int, dict[str, Any]] = {}
+    if relationships.is_empty():
+        return nearest
+    for row in relationships.sort("relationship_score", descending=True).iter_rows(named=True):
+        left_id = int(row["tribe_a_id"])
+        right_id = int(row["tribe_b_id"])
+        score = _safe_float(row.get("relationship_score"))
+        if left_id not in nearest:
+            nearest[left_id] = {
+                "nearest_related_tribe": f"T{right_id}: {row.get('tribe_b_name')}",
+                "nearest_relationship_type": row.get("relationship_type"),
+                "nearest_relationship_score": score,
+                "clearest_differentiator": row.get("difference_evidence"),
+            }
+        if right_id not in nearest:
+            nearest[right_id] = {
+                "nearest_related_tribe": f"T{left_id}: {row.get('tribe_a_name')}",
+                "nearest_relationship_type": row.get("relationship_type"),
+                "nearest_relationship_score": score,
+                "clearest_differentiator": row.get("difference_evidence"),
+            }
+    return nearest
+
+
+def stage7_tribe_promotion_report_table(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Stage 7.1: classify retained tribes while keeping compatibility-first promotion."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    if profiles.is_empty():
+        result = _empty_stage7_tribe_promotion_report()
+        if output_csv is not None:
+            _write_csv(result, output_csv)
+        return result
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    rows: list[dict[str, Any]] = []
+    profile_rows = _stage7_enriched_profile_rows(profiles, distribution_metrics)
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    for row in profile_rows:
+        tribe_id = int(row["tribe_id"])
+        stage6_status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(stage6_status, allowed_statuses)
+        name_fields = name_fields_by_id.get(tribe_id) or _stage7_name_fields(row, cfg=cfg)
+        validation = _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_fields, cfg=cfg)
+        decision = _stage7_promotion_decision(stage6_status, tribe_status, row)
+        rows.append(
+            {
+                "tribe_id": tribe_id,
+                "promotion_decision": decision,
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "tribe_status": tribe_status,
+                "tribe_status_label": _stage7_status_label(tribe_status),
+                "stage6_profile_readiness": stage6_status,
+                "technical_name": name_fields["technical_name"],
+                "business_name": name_fields["business_name"],
+                "legacy_tribe_name": name_fields["legacy_tribe_name"],
+                "name_source": name_fields["name_source"],
+                "legacy_name_source": name_fields["legacy_name_source"],
+                "customers": int(row.get("n_customers") or 0),
+                "population_share_pct": round(100.0 * float(row.get("population_share") or 0.0), 3),
+                "mean_assignment_confidence": _safe_float(row.get("mean_assignment_confidence")),
+                "p10_assignment_confidence": _safe_float(row.get("p10_assignment_confidence")),
+                "jitter_label_recovery_accuracy": _safe_float(row.get("jitter_label_recovery_accuracy")),
+                "statistical_validity_gate": validation["statistical_validity_gate"],
+                "reach_gate": validation["reach_gate"],
+                "distinctiveness_gate": validation["distinctiveness_gate"],
+                "business_relevance_gate": validation["business_relevance_gate"],
+                "naming_quality_gate": validation["naming_quality_gate"],
+                "validation_blockers": validation["validation_blockers"],
+                "business_confidence": _stage7_business_confidence(
+                    stage6_status,
+                    tribe_status,
+                    validation["validation_blockers"],
+                ),
+                "coverage_group": "core_promoted_tribe" if decision == "promoted" else f"{decision}_tribe",
+                "membership_policy": (
+                    "official hard-assigned promoted tribe"
+                    if decision == "promoted"
+                    else "hard-assigned tribe retained outside the core promoted set"
+                ),
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "readiness_caveat": _stage7_readiness_caveat(stage6_status, tribe_status),
+            }
+        )
+    rows = sorted(rows, key=lambda item: (_stage7_decision_sort(item["promotion_decision"]), -int(item["customers"] or 0), int(item["tribe_id"])))
+    for order, row in enumerate(rows, start=1):
+        row["story_order"] = order
+    result = _stage7_frame(rows, _empty_stage7_tribe_promotion_report().schema, sort_by=["story_order"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_1_tribe_promotion_report_artifacts(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_1_tribe_promotion_report_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_tribe_promotion_report_table(profile_path, distribution_metrics=distribution_metrics, output_csv=csv_path, cfg=cfg)
+    markdown = _stage7_simple_report_markdown(
+        "Stage 7.1 Tribe Promotion Report",
+        "Compatibility-first promotion preserves Stage 6 promoted/review membership while exposing Stage 7 advisory gates for reach, distinctiveness, business relevance, and naming quality.",
+        table,
+    )
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.1 Tribe Promotion Report", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_tribe_identity_dossier_table(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Stage 7.2: evidence-first identity construction before business naming."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    if profiles.is_empty():
+        result = _empty_stage7_tribe_identity_dossier()
+        if output_csv is not None:
+            _write_csv(result, output_csv)
+        return result
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    rows: list[dict[str, Any]] = []
+    for row in _stage7_enriched_profile_rows(profiles, distribution_metrics):
+        stage6_status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(stage6_status, allowed_statuses)
+        technical_name = _normalise_tribe_name(_working_label(row))
+        validation = _stage7_validation_summary(
+            row,
+            tribe_status=tribe_status,
+            name_fields={"name_quality_issue": "pass"},
+            cfg=cfg,
+        )
+        rows.append(
+            {
+                "tribe_id": int(row["tribe_id"]),
+                "promotion_decision": _stage7_promotion_decision(stage6_status, tribe_status, row),
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "technical_name": technical_name,
+                "business_name": None,
+                "legacy_tribe_name": _stage7_name_info(row, cfg=cfg)["tribe_name"],
+                "business_confidence": _stage7_business_confidence(stage6_status, tribe_status, validation["validation_blockers"]),
+                "validation_blockers": validation["validation_blockers"],
+                "coverage_group": "identity_dossier",
+                "membership_policy": "evidence review only; business naming happens in Stage 7.3",
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "customers": int(row.get("n_customers") or 0),
+                "defining_products": _product_evidence_text(row),
+                "defining_categories": _sector_theme_evidence(row, cfg=cfg),
+                "high_lift_items": _product_evidence_text(row),
+                "high_reach_items": _broad_reach_products_text(row),
+                "basket_characteristics": _spend_and_visit_context(row),
+                "purchase_mission": row.get("llm_shopping_mission") or _copurchase_text(row),
+                "behavioral_signals": _promo_loyalty_recency_text(row),
+                "evidence_caveat": row.get("llm_confidence_note") or "Purchase behavior only; not a demographic claim.",
+            }
+        )
+    result = _stage7_frame(rows, _empty_stage7_tribe_identity_dossier().schema, sort_by=["promotion_decision", "tribe_id"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_2_tribe_identity_dossier_artifacts(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_2_tribe_identity_dossier_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_tribe_identity_dossier_table(profile_path, distribution_metrics=distribution_metrics, output_csv=csv_path, cfg=cfg)
+    markdown = _stage7_simple_report_markdown(
+        "Stage 7.2 Tribe Identity Dossier",
+        "Evidence-first dossiers describe products, categories, basket patterns, missions, and behavior before stakeholder business names are assigned.",
+        table,
+    )
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.2 Tribe Identity Dossier", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_tribe_handbook_table(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Stage 7.3: stakeholder-ready tribe definitions."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    if profiles.is_empty():
+        result = _empty_stage7_tribe_handbook()
+        if output_csv is not None:
+            _write_csv(result, output_csv)
+        return result
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    profile_rows = _stage7_enriched_profile_rows(profiles, distribution_metrics)
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    rows: list[dict[str, Any]] = []
+    for row in profile_rows:
+        tribe_id = int(row["tribe_id"])
+        stage6_status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(stage6_status, allowed_statuses)
+        name_fields = name_fields_by_id.get(tribe_id) or _stage7_name_fields(row, cfg=cfg)
+        validation = _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_fields, cfg=cfg)
+        rows.append(
+            {
+                "tribe_id": tribe_id,
+                "promotion_decision": _stage7_promotion_decision(stage6_status, tribe_status, row),
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "technical_name": name_fields["technical_name"],
+                "business_name": name_fields["business_name"],
+                "legacy_tribe_name": name_fields["legacy_tribe_name"],
+                "business_confidence": _stage7_business_confidence(stage6_status, tribe_status, validation["validation_blockers"]),
+                "validation_blockers": validation["validation_blockers"],
+                "coverage_group": "core_promoted_tribe" if _stage7_status_is_final(tribe_status) else "review_tribe",
+                "membership_policy": (
+                    "official hard-assigned promoted tribe"
+                    if _stage7_status_is_final(tribe_status)
+                    else "hard-assigned tribe held outside the core promoted set"
+                ),
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "customers": int(row.get("n_customers") or 0),
+                "executive_summary": _business_persona_summary(row, cfg=cfg),
+                "supporting_evidence": _product_evidence_text(row),
+                "behavior_summary": _spend_and_visit_context(row),
+                "shopping_mission": row.get("llm_shopping_mission") or _copurchase_text(row),
+                "name_quality_issue": name_fields.get("name_quality_issue") or "pass",
+                "caveat": _stage7_readiness_caveat(stage6_status, tribe_status),
+            }
+        )
+    result = _stage7_frame(rows, _empty_stage7_tribe_handbook().schema, sort_by=["promotion_decision", "tribe_id"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_3_tribe_handbook_artifacts(
+    profile_path: str | Path,
+    *,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_3_tribe_handbook_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_tribe_handbook_table(profile_path, distribution_metrics=distribution_metrics, output_csv=csv_path, cfg=cfg)
+    markdown = _stage7_simple_report_markdown(
+        "Stage 7.3 Tribe Handbook",
+        "Official source of truth for technical names, business names, executive summaries, supporting evidence, and caveats.",
+        table,
+    )
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.3 Tribe Handbook", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_customer_coverage_report_table(
+    profile_path: str | Path,
+    *,
+    remaining_customer_analysis: str | Path | pl.DataFrame | None = None,
+    soft_audience_opportunities: str | Path | pl.DataFrame | None = None,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Stage 7.4: account for every customer without changing hard assignments."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    remaining = _coerce_table(remaining_customer_analysis)
+    soft = _coerce_table(soft_audience_opportunities)
+    assigned_customers = _profile_population_customer_count(profiles)
+    noise_customers = _profile_noise_customer_count(profiles)
+    total_customers = assigned_customers + noise_customers
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    profile_rows = _stage7_enriched_profile_rows(profiles, distribution_metrics)
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    rows: list[dict[str, Any]] = []
+    for row in profile_rows:
+        tribe_id = int(row["tribe_id"])
+        stage6_status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(stage6_status, allowed_statuses)
+        decision = _stage7_promotion_decision(stage6_status, tribe_status, row)
+        name_fields = name_fields_by_id.get(tribe_id) or _stage7_name_fields(row, cfg=cfg)
+        customers = int(row.get("n_customers") or 0)
+        rows.append(
+            {
+                "segment_id": f"tribe_{tribe_id:02d}",
+                "segment_name": name_fields["business_name"],
+                "coverage_group": "core_promoted_tribes" if decision == "promoted" else f"{decision}_tribes",
+                "tribe_id": tribe_id,
+                "promotion_decision": decision,
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "technical_name": name_fields["technical_name"],
+                "business_name": name_fields["business_name"],
+                "legacy_tribe_name": name_fields["legacy_tribe_name"],
+                "business_confidence": _stage7_business_confidence(
+                    stage6_status,
+                    tribe_status,
+                    _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_fields, cfg=cfg)["validation_blockers"],
+                ),
+                "validation_blockers": _stage7_validation_summary(
+                    row,
+                    tribe_status=tribe_status,
+                    name_fields=name_fields,
+                    cfg=cfg,
+                )["validation_blockers"],
+                "customers": customers,
+                "share_of_total_pct": round(100.0 * customers / max(total_customers, 1), 3),
+                "counts_toward_population_total": True,
+                "membership_policy": (
+                    "official hard-assigned promoted tribe"
+                    if decision == "promoted"
+                    else "hard-assigned tribe retained outside the core promoted set"
+                ),
+                "recommended_use": _stage7_recommended_use(tribe_status),
+            }
+        )
+    remaining_count = 0
+    for row in remaining.iter_rows(named=True):
+        customers = int(_safe_float(row.get("customer_count")) or 0)
+        remaining_count += customers
+        rows.append(
+            {
+                "segment_id": row.get("segment_id"),
+                "segment_name": row.get("segment_name"),
+                "coverage_group": _stage7_remaining_coverage_group(row.get("segment_id")),
+                "tribe_id": None,
+                "promotion_decision": "not_applicable",
+                "validation_tier": "remaining_customer_segment",
+                "technical_name": None,
+                "business_name": row.get("segment_name"),
+                "legacy_tribe_name": None,
+                "business_confidence": "descriptive",
+                "validation_blockers": "not a hard tribe",
+                "customers": customers,
+                "share_of_total_pct": _safe_float(row.get("share_of_total_pct")) or round(100.0 * customers / max(total_customers, 1), 3),
+                "counts_toward_population_total": True,
+                "membership_policy": row.get("membership_policy") or "remaining customer segment; not hard tribe membership",
+                "recommended_use": row.get("recommended_action") or row.get("recommended_use"),
+            }
+        )
+    if noise_customers > remaining_count:
+        gap = noise_customers - remaining_count
+        rows.append(
+            {
+                "segment_id": "remaining_customer_coverage_gap",
+                "segment_name": "Remaining customer coverage gap",
+                "coverage_group": "long_tail_customers",
+                "tribe_id": None,
+                "promotion_decision": "not_applicable",
+                "validation_tier": "remaining_customer_segment",
+                "technical_name": None,
+                "business_name": "Remaining customer coverage gap",
+                "legacy_tribe_name": None,
+                "business_confidence": "needs_review",
+                "validation_blockers": "remaining customer count not fully segmented",
+                "customers": gap,
+                "share_of_total_pct": round(100.0 * gap / max(total_customers, 1), 3),
+                "counts_toward_population_total": True,
+                "membership_policy": "remaining customer placeholder; not hard tribe membership",
+                "recommended_use": "Review Stage 6.7 remaining-customer segmentation coverage.",
+            }
+        )
+    for row in soft.iter_rows(named=True):
+        customers = int(_safe_float(row.get("customer_count")) or 0)
+        rows.append(
+            {
+                "segment_id": f"soft_audience_to_tribe_{int(row.get('target_tribe_id') or 0):02d}",
+                "segment_name": f"Expansion audience for {row.get('target_tribe_name') or 'target tribe'}",
+                "coverage_group": "expansion_audience",
+                "tribe_id": int(row.get("target_tribe_id") or 0),
+                "promotion_decision": "expansion_audience",
+                "validation_tier": row.get("target_tribe_status") or "soft_audience",
+                "technical_name": None,
+                "business_name": row.get("target_tribe_name"),
+                "legacy_tribe_name": None,
+                "business_confidence": "campaign_test",
+                "validation_blockers": "overlaps remaining customers; not additive",
+                "customers": customers,
+                "share_of_total_pct": round(100.0 * customers / max(total_customers, 1), 3),
+                "counts_toward_population_total": False,
+                "membership_policy": row.get("assignment_policy") or "campaign-use only; hard assignment unchanged",
+                "recommended_use": row.get("recommended_use"),
+            }
+        )
+    result = _stage7_frame(rows, _empty_stage7_customer_coverage_report().schema, sort_by=["counts_toward_population_total", "coverage_group", "customers"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_4_customer_coverage_report_artifacts(
+    profile_path: str | Path,
+    *,
+    remaining_customer_analysis: str | Path | pl.DataFrame | None = None,
+    soft_audience_opportunities: str | Path | pl.DataFrame | None = None,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_4_customer_coverage_report_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_customer_coverage_report_table(
+        profile_path,
+        remaining_customer_analysis=remaining_customer_analysis,
+        soft_audience_opportunities=soft_audience_opportunities,
+        distribution_metrics=distribution_metrics,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    markdown = _stage7_customer_coverage_markdown(table)
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.4 Customer Coverage Report", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_segment_action_playbook_table(
+    profile_path: str | Path,
+    *,
+    remaining_customer_analysis: str | Path | pl.DataFrame | None = None,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> pl.DataFrame:
+    """Stage 7.5: actions for promoted tribes and non-core customer groups."""
+
+    profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    remaining = _coerce_table(remaining_customer_analysis)
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    profile_rows = _stage7_enriched_profile_rows(profiles, distribution_metrics)
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    rows: list[dict[str, Any]] = []
+    for row in profile_rows:
+        stage6_status = str(row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(stage6_status, allowed_statuses)
+        if not _stage7_status_is_final(tribe_status):
+            continue
+        tribe_id = int(row["tribe_id"])
+        name_fields = name_fields_by_id.get(tribe_id) or _stage7_name_fields(row, cfg=cfg)
+        action_row = _stage7_action_context_from_profile(row, name_fields, cfg=cfg)
+        rows.append(
+            {
+                "segment_id": f"tribe_{tribe_id:02d}",
+                "segment_name": name_fields["business_name"],
+                "coverage_group": "core_promoted_tribe",
+                "tribe_id": tribe_id,
+                "promotion_decision": "promoted",
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "technical_name": name_fields["technical_name"],
+                "business_name": name_fields["business_name"],
+                "legacy_tribe_name": name_fields["legacy_tribe_name"],
+                "business_confidence": _stage7_business_confidence(
+                    stage6_status,
+                    tribe_status,
+                    _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_fields, cfg=cfg)["validation_blockers"],
+                ),
+                "validation_blockers": _stage7_validation_summary(row, tribe_status=tribe_status, name_fields=name_fields, cfg=cfg)[
+                    "validation_blockers"
+                ],
+                "membership_policy": "official hard-assigned promoted tribe",
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "marketing_actions": _campaign_offer_idea(action_row),
+                "merchandising_actions": _revenue_lever(row),
+                "cross_sell_opportunities": f"Use {action_row.get('top_product') or 'the defining basket'} as an anchor for adjacent mission add-ons.",
+                "retention_opportunities": _campaign_expected_lever(action_row),
+                "exclusions": _campaign_suppression_rules(action_row),
+                "primary_kpi": _campaign_primary_kpi(action_row),
+            }
+        )
+    for row in remaining.iter_rows(named=True):
+        action = _remaining_segment_action_text(row)
+        rows.append(
+            {
+                "segment_id": row.get("segment_id"),
+                "segment_name": row.get("segment_name"),
+                "coverage_group": _stage7_remaining_coverage_group(row.get("segment_id")),
+                "tribe_id": None,
+                "promotion_decision": "not_applicable",
+                "validation_tier": "remaining_customer_segment",
+                "technical_name": None,
+                "business_name": row.get("segment_name"),
+                "legacy_tribe_name": None,
+                "business_confidence": "descriptive",
+                "validation_blockers": "not a hard tribe",
+                "membership_policy": row.get("membership_policy") or "remaining customer segment; not hard tribe membership",
+                "recommended_use": row.get("recommended_action") or row.get("recommended_use"),
+                "marketing_actions": action["marketing_actions"],
+                "merchandising_actions": action["merchandising_actions"],
+                "cross_sell_opportunities": action["cross_sell_opportunities"],
+                "retention_opportunities": action["retention_opportunities"],
+                "exclusions": action["exclusions"],
+                "primary_kpi": action["primary_kpi"],
+            }
+        )
+    result = _stage7_frame(rows, _empty_stage7_segment_action_playbook().schema, sort_by=["coverage_group", "segment_id"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_5_segment_action_playbook_artifacts(
+    profile_path: str | Path,
+    *,
+    remaining_customer_analysis: str | Path | pl.DataFrame | None = None,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_5_segment_action_playbook_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_segment_action_playbook_table(
+        profile_path,
+        remaining_customer_analysis=remaining_customer_analysis,
+        distribution_metrics=distribution_metrics,
+        output_csv=csv_path,
+        cfg=cfg,
+    )
+    markdown = _stage7_simple_report_markdown(
+        "Stage 7.5 Segment Action Playbook",
+        "Action rows translate promoted tribes and remaining-customer groups into marketing, merchandising, cross-sell, retention, exclusion, and KPI guidance.",
+        table,
+    )
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.5 Segment Action Playbook", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_segmentation_framework_table(
+    customer_coverage_report: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+) -> pl.DataFrame:
+    """Stage 7.6: hierarchy joining tribes, expansion audiences, and remaining segments."""
+
+    coverage = _coerce_table(customer_coverage_report)
+    rows: list[dict[str, Any]] = []
+    for row in coverage.iter_rows(named=True):
+        group = str(row.get("coverage_group") or "")
+        if group == "core_promoted_tribes" or group == "core_promoted_tribe":
+            parent = "Core Customer Tribes"
+            role = "official_core_segment"
+        elif group in {"review_tribes", "rejected_tribes"}:
+            parent = "Review And Rejected Tribes"
+            role = "not_core_segment"
+        elif group == "expansion_audience":
+            parent = "Expansion Audiences"
+            role = "campaign_test_audience"
+        else:
+            parent = "Remaining Customer Segments"
+            role = "descriptive_coverage_segment"
+        rows.append(
+            {
+                "hierarchy_level": 2,
+                "parent_segment": parent,
+                "segment_id": row.get("segment_id"),
+                "segment_name": row.get("segment_name"),
+                "coverage_group": row.get("coverage_group"),
+                "segment_role": role,
+                "tribe_id": row.get("tribe_id"),
+                "promotion_decision": row.get("promotion_decision"),
+                "customers": row.get("customers"),
+                "share_of_total_pct": row.get("share_of_total_pct"),
+                "counts_toward_population_total": row.get("counts_toward_population_total"),
+                "membership_policy": row.get("membership_policy"),
+                "recommended_use": row.get("recommended_use"),
+            }
+        )
+    result = _stage7_frame(rows, _empty_stage7_segmentation_framework().schema, sort_by=["parent_segment", "segment_id"])
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_6_segmentation_framework_artifacts(
+    customer_coverage_report: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_6_customer_segmentation_framework_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_segmentation_framework_table(customer_coverage_report, output_csv=csv_path)
+    markdown = _stage7_simple_report_markdown(
+        "Stage 7.6 Customer Segmentation Framework",
+        "Hierarchy showing how promoted tribes, review tribes, expansion audiences, and remaining-customer segments fit together.",
+        table,
+    )
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.6 Customer Segmentation Framework", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def stage7_final_segmentation_report_table(
+    promotion_report: str | Path | pl.DataFrame,
+    tribe_handbook: str | Path | pl.DataFrame,
+    customer_coverage_report: str | Path | pl.DataFrame,
+    segment_action_playbook: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+) -> pl.DataFrame:
+    """Stage 7.7: six-question executive synthesis as a structured table."""
+
+    promotion = _coerce_table(promotion_report)
+    handbook = _coerce_table(tribe_handbook)
+    coverage = _coerce_table(customer_coverage_report)
+    actions = _coerce_table(segment_action_playbook)
+    promoted = promotion.filter(pl.col("promotion_decision") == "promoted") if not promotion.is_empty() else promotion
+    review = promotion.filter(pl.col("promotion_decision") == "review") if not promotion.is_empty() else promotion
+    additive = (
+        coverage.filter(pl.col("counts_toward_population_total") == True)
+        if not coverage.is_empty() and "counts_toward_population_total" in coverage.columns
+        else coverage
+    )
+    rows = [
+        {
+            "question_id": "core_segments",
+            "executive_question": "Who are the core customer segments?",
+            "answer": _stage7_segment_list(promoted, "business_name", "customers"),
+            "supporting_artifact": "Stage 7.1 Tribe Promotion Report; Stage 7.3 Tribe Handbook",
+        },
+        {
+            "question_id": "defining_products",
+            "executive_question": "What products define them?",
+            "answer": _stage7_segment_list(handbook, "supporting_evidence", "customers"),
+            "supporting_artifact": "Stage 7.2 Tribe Identity Dossier; Stage 7.3 Tribe Handbook",
+        },
+        {
+            "question_id": "segment_sizes",
+            "executive_question": "How many customers belong to each?",
+            "answer": _stage7_segment_list(additive, "segment_name", "customers"),
+            "supporting_artifact": "Stage 7.4 Customer Coverage Report",
+        },
+        {
+            "question_id": "non_core_customers",
+            "executive_question": "Which customers are not part of core tribes?",
+            "answer": _stage7_non_core_answer(coverage, review),
+            "supporting_artifact": "Stage 7.4 Customer Coverage Report",
+        },
+        {
+            "question_id": "actions",
+            "executive_question": "What actions should be taken for every segment?",
+            "answer": _stage7_segment_list(actions, "marketing_actions", "segment_name"),
+            "supporting_artifact": "Stage 7.5 Segment Action Playbook",
+        },
+        {
+            "question_id": "population_architecture",
+            "executive_question": "How does the entire customer population fit together?",
+            "answer": _stage7_architecture_answer(coverage),
+            "supporting_artifact": "Stage 7.6 Customer Segmentation Framework",
+        },
+    ]
+    result = _stage7_frame(rows, _empty_stage7_final_segmentation_report().schema)
+    if output_csv is not None:
+        _write_csv(result, output_csv)
+    return result
+
+
+def write_stage7_7_final_segmentation_report_artifacts(
+    promotion_report: str | Path | pl.DataFrame,
+    tribe_handbook: str | Path | pl.DataFrame,
+    customer_coverage_report: str | Path | pl.DataFrame,
+    segment_action_playbook: str | Path | pl.DataFrame,
+    *,
+    output_csv: str | Path | None = None,
+    output_md: str | Path | None = None,
+    output_html: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    csv_path = Path(output_csv) if output_csv else cfg.artifacts / "stage7" / f"stage7_7_final_segmentation_report_{cfg.mode}.csv"
+    md_path = Path(output_md) if output_md else csv_path.with_suffix(".md")
+    html_path = Path(output_html) if output_html else csv_path.with_suffix(".html")
+    table = stage7_final_segmentation_report_table(
+        promotion_report,
+        tribe_handbook,
+        customer_coverage_report,
+        segment_action_playbook,
+        output_csv=csv_path,
+    )
+    markdown = _stage7_final_segmentation_report_markdown(table)
+    md_path.write_text(markdown, encoding="utf-8")
+    html_path.write_text(_simple_html("Stage 7.7 Final Segmentation Report", markdown), encoding="utf-8")
+    return {"csv": csv_path, "markdown": md_path, "html": html_path}
+
+
+def write_stage7_substage_analysis_artifacts(
+    profile_path: str | Path,
+    *,
+    assignments_path: str | Path | None = None,
+    behavior_path: str | Path | None = None,
+    stage68_manifest_path: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Any]:
+    out_dir = Path(output_dir) if output_dir else cfg.artifacts / "stage7"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stage68_paths = _stage68_manifest_paths(stage68_manifest_path, cfg=cfg)
+    manifest = stage68_paths.get("manifest") or {}
+    manifest_inputs = manifest.get("inputs") or {}
+    manifest_outputs = manifest.get("outputs") or {}
+    resolved_assignments = assignments_path or manifest_inputs.get("assignments_path")
+    resolved_behavior = behavior_path or manifest_inputs.get("behavior_path")
+    remaining_segments = manifest_outputs.get("remaining_customer_segments_csv")
+    remaining_affinity = manifest_outputs.get("remaining_customer_affinity_parquet")
+    if distribution_metrics is None:
+        profiles_for_distribution = pl.read_parquet(profile_path).sort("tribe_id")
+        distribution_metrics = _stage7_distribution_metrics_by_tribe(
+            profiles_for_distribution,
+            _stage68_partition_export_paths(manifest, "transaction_exports"),
+            _stage68_partition_export_paths(manifest, "customer_exports"),
+            cfg=cfg,
+        )
+
+    all_profiles = write_stage7_all_tribe_profile_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_all_tribe_profiles_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    promoted_validation = write_stage7_promoted_tribe_validation_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_promoted_tribe_validation_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    review_validation = write_stage7_review_tribe_validation_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_review_tribe_validation_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    product_identity = write_stage7_all_tribe_product_identity_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_all_tribe_product_identity_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    behavior_differentiation = write_stage7_all_tribe_behavior_differentiation_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_all_tribe_behavior_differentiation_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    personas = write_stage7_persona_deep_dive_artifacts(
+        profile_path,
+        output_md=out_dir / f"stage7_all_tribe_dossiers_{cfg.mode}.md",
+        cfg=cfg,
+    )
+    remaining = write_stage7_remaining_customer_analysis_artifacts(
+        resolved_assignments,
+        resolved_behavior,
+        segment_path=remaining_segments,
+        affinity_path=remaining_affinity,
+        output_csv=out_dir / f"stage7_remaining_customer_analysis_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    soft = write_stage7_soft_audience_opportunity_artifacts(
+        resolved_assignments,
+        resolved_behavior,
+        affinity_path=remaining_affinity,
+        profile_path=profile_path,
+        output_csv=out_dir / f"stage7_soft_audience_opportunities_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    relationship = write_stage7_tribe_relationship_atlas_artifacts(
+        profile_path,
+        output_csv=out_dir / f"stage7_all_tribe_relationship_atlas_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    promotion_report = write_stage7_1_tribe_promotion_report_artifacts(
+        profile_path,
+        distribution_metrics=distribution_metrics,
+        output_csv=out_dir / f"stage7_1_tribe_promotion_report_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    identity_dossier = write_stage7_2_tribe_identity_dossier_artifacts(
+        profile_path,
+        distribution_metrics=distribution_metrics,
+        output_csv=out_dir / f"stage7_2_tribe_identity_dossier_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    tribe_handbook = write_stage7_3_tribe_handbook_artifacts(
+        profile_path,
+        distribution_metrics=distribution_metrics,
+        output_csv=out_dir / f"stage7_3_tribe_handbook_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    customer_coverage = write_stage7_4_customer_coverage_report_artifacts(
+        profile_path,
+        remaining_customer_analysis=remaining["csv"],
+        soft_audience_opportunities=soft["csv"],
+        distribution_metrics=distribution_metrics,
+        output_csv=out_dir / f"stage7_4_customer_coverage_report_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    segment_action_playbook = write_stage7_5_segment_action_playbook_artifacts(
+        profile_path,
+        remaining_customer_analysis=remaining["csv"],
+        distribution_metrics=distribution_metrics,
+        output_csv=out_dir / f"stage7_5_segment_action_playbook_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    segmentation_framework = write_stage7_6_segmentation_framework_artifacts(
+        customer_coverage["csv"],
+        output_csv=out_dir / f"stage7_6_customer_segmentation_framework_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    final_segmentation_report = write_stage7_7_final_segmentation_report_artifacts(
+        promotion_report["csv"],
+        tribe_handbook["csv"],
+        customer_coverage["csv"],
+        segment_action_playbook["csv"],
+        output_csv=out_dir / f"stage7_7_final_segmentation_report_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    return {
+        "stage7_1_promotion_report": promotion_report,
+        "stage7_2_identity_dossier": identity_dossier,
+        "stage7_3_tribe_handbook": tribe_handbook,
+        "stage7_4_customer_coverage_report": customer_coverage,
+        "stage7_5_segment_action_playbook": segment_action_playbook,
+        "stage7_6_segmentation_framework": segmentation_framework,
+        "stage7_7_final_report": final_segmentation_report,
+        "all_tribe_profiles": all_profiles,
+        "promoted_tribe_validation": promoted_validation,
+        "review_tribe_validation": review_validation,
+        "review_tribe_audit": review_validation,
+        "all_tribe_product_identity": product_identity,
+        "all_tribe_behavior_differentiation": behavior_differentiation,
+        "all_tribe_dossiers": personas,
+        "persona_deep_dives": personas,
+        "remaining_customer_analysis": remaining,
+        "soft_audience_opportunities": soft,
+        "all_tribe_relationship_atlas": relationship,
+        "tribe_relationship_atlas": relationship,
+        "source_stage68_manifest": Path(stage68_manifest_path) if stage68_manifest_path else None,
+    }
+
+
 def customer_metric_anova_table(
     assignments_path: str | Path,
     behavior_path: str | Path | None = None,
@@ -1399,6 +3259,10 @@ def stage68_artifact_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
         "sector_lifts_path": root / f"sector_lifts_{cfg.mode}.parquet",
         "customer_metric_tests_csv": root / f"customer_metric_tests_{cfg.mode}.csv",
         "noise_vs_core_customer_metrics_csv": root / f"noise_vs_core_customer_metrics_{cfg.mode}.csv",
+        "remaining_customer_segments_csv": root / f"stage6_7_remaining_customer_segments_{cfg.mode}.csv",
+        "remaining_customer_segments_md": root / f"stage6_7_remaining_customer_segments_{cfg.mode}.md",
+        "remaining_customer_segments_html": root / f"stage6_7_remaining_customer_segments_{cfg.mode}.html",
+        "remaining_customer_affinity_parquet": root / f"stage6_7_remaining_customer_affinity_{cfg.mode}.parquet",
         "transaction_export_dir": root / "tribe_transactions",
         "customer_export_dir": root / "tribe_customers",
         "manifest_json": root / f"stage68_manifest_{cfg.mode}.json",
@@ -1441,9 +3305,9 @@ def build_stage68_tribe_evidence(
             "top_n_copurchase_pairs": 10,
             "min_copurchase_baskets": 5,
         },
-        "stage68_schema_version": 2,
+        "stage68_schema_version": 3,
     }
-    required_outputs = [
+    core_required_outputs = [
         paths["tribe_evidence_path"],
         paths["product_lifts_path"],
         paths["sector_lifts_path"],
@@ -1453,14 +3317,22 @@ def build_stage68_tribe_evidence(
         paths["customer_export_dir"] / f"tribe_customers_manifest_{cfg.mode}.csv",
         paths["manifest_json"],
     ]
+    remaining_customer_outputs = [
+        paths["remaining_customer_segments_csv"],
+        paths["remaining_customer_segments_md"],
+        paths["remaining_customer_segments_html"],
+        paths["remaining_customer_affinity_parquet"],
+    ]
+    core_cache_ready = all(path.exists() for path in core_required_outputs) and should_use_cache(
+        paths["manifest_json"],
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    )
+    remaining_cache_ready = all(path.exists() for path in remaining_customer_outputs)
     if (
-        all(path.exists() for path in required_outputs)
-        and should_use_cache(
-            paths["manifest_json"],
-            force=force,
-            use_cached=cfg.get("cache.use_cached", True),
-            metadata=cache_metadata,
-        )
+        core_cache_ready
+        and (remaining_cache_ready or not assignments_file.exists())
     ):
         log_event("Stage 6.8 evidence", "cache hit", cfg=cfg, manifest=paths["manifest_json"])
         return _stage68_result_from_manifest(paths["manifest_json"], cfg=cfg)
@@ -1507,6 +3379,16 @@ def build_stage68_tribe_evidence(
             _empty_customer_metric_tests().write_csv(paths["customer_metric_tests_csv"])
             _empty_noise_vs_core_metric_tests().write_csv(paths["noise_vs_core_customer_metrics_csv"])
 
+        remaining_customer_paths = write_remaining_customer_segment_artifacts(
+            assignments_file,
+            behavior_path=candidate_behavior_path if candidate_behavior_path.exists() else None,
+            output_csv=paths["remaining_customer_segments_csv"],
+            output_md=paths["remaining_customer_segments_md"],
+            output_html=paths["remaining_customer_segments_html"],
+            affinity_output_parquet=paths["remaining_customer_affinity_parquet"],
+            cfg=cfg,
+        )
+
         transaction_exports = write_tribe_transaction_exports(
             assignments_file,
             transactions=transactions,
@@ -1533,6 +3415,7 @@ def build_stage68_tribe_evidence(
             cache_metadata=cache_metadata,
             transaction_exports=transaction_exports,
             customer_exports=customer_exports,
+            remaining_customer_paths=remaining_customer_paths,
             tribe_evidence_path=tribe_evidence_path,
         )
         paths["manifest_json"].write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
@@ -1552,6 +3435,7 @@ def _stage68_manifest(
     cache_metadata: dict[str, Any],
     transaction_exports: dict[str, Path],
     customer_exports: dict[str, Path],
+    remaining_customer_paths: dict[str, Path],
     tribe_evidence_path: Path,
 ) -> dict[str, Any]:
     outputs = {
@@ -1560,6 +3444,12 @@ def _stage68_manifest(
         "sector_lifts_path": str(paths["sector_lifts_path"]),
         "customer_metric_tests_csv": str(paths["customer_metric_tests_csv"]),
         "noise_vs_core_customer_metrics_csv": str(paths["noise_vs_core_customer_metrics_csv"]),
+        "remaining_customer_segments_csv": str(remaining_customer_paths.get("csv", paths["remaining_customer_segments_csv"])),
+        "remaining_customer_segments_md": str(remaining_customer_paths.get("markdown", paths["remaining_customer_segments_md"])),
+        "remaining_customer_segments_html": str(remaining_customer_paths.get("html", paths["remaining_customer_segments_html"])),
+        "remaining_customer_affinity_parquet": str(
+            remaining_customer_paths.get("affinity_parquet", paths["remaining_customer_affinity_parquet"])
+        ),
         "transaction_export_dir": str(transaction_exports.get("directory", paths["transaction_export_dir"])),
         "transaction_export_manifest_csv": str(transaction_exports.get("manifest_csv")) if transaction_exports.get("manifest_csv") else None,
         "customer_export_dir": str(customer_exports.get("directory", paths["customer_export_dir"])),
@@ -1589,6 +3479,12 @@ def _stage68_manifest(
             "sector_lifts": _parquet_row_count(paths["sector_lifts_path"]),
             "customer_metric_tests": _csv_row_count(paths["customer_metric_tests_csv"]),
             "noise_vs_core_customer_metrics": _csv_row_count(paths["noise_vs_core_customer_metrics_csv"]),
+            "remaining_customer_segments": _csv_row_count(
+                remaining_customer_paths.get("csv", paths["remaining_customer_segments_csv"])
+            ),
+            "remaining_customer_affinity": _parquet_row_count(
+                remaining_customer_paths.get("affinity_parquet", paths["remaining_customer_affinity_parquet"])
+            ),
         },
     }
 
@@ -2364,6 +4260,16 @@ def _stage7_final_index_schema() -> dict[str, Any]:
         "tribe_id": pl.Int64,
         "tribe_name": pl.Utf8,
         "name_source": pl.Utf8,
+        "promotion_decision": pl.Utf8,
+        "validation_tier": pl.Utf8,
+        "technical_name": pl.Utf8,
+        "business_name": pl.Utf8,
+        "legacy_tribe_name": pl.Utf8,
+        "business_confidence": pl.Utf8,
+        "validation_blockers": pl.Utf8,
+        "coverage_group": pl.Utf8,
+        "membership_policy": pl.Utf8,
+        "recommended_use": pl.Utf8,
         "stage6_profile_readiness": pl.Utf8,
         "customers_count": pl.Int64,
         "customers": pl.Int64,
@@ -2380,6 +4286,11 @@ def _stage7_final_index_schema() -> dict[str, Any]:
         "primary_theme_product_evidence": pl.Utf8,
         "actionability_proof_source": pl.Utf8,
         "actionability_proof": pl.Utf8,
+        "delivery_product": pl.Utf8,
+        "delivery_product_lift": pl.Float64,
+        "delivery_product_reach_pct": pl.Float64,
+        "delivery_product_customers": pl.Int64,
+        "delivery_product_q_value": pl.Float64,
         "top_product": pl.Utf8,
         "top_product_reach_pct": pl.Float64,
         "top_product_lift": pl.Float64,
@@ -2441,12 +4352,15 @@ def write_stage7_final_handoff_pack(
     max_card_products: int = 8,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Any]:
-    del assignments_path, cluster_readiness_path, readiness_path, behavior_path, transactions
+    del cluster_readiness_path, readiness_path, transactions
     out_dir = Path(output_dir) if output_dir else cfg.artifacts / "stage7" / "final_handoff"
     support_dir = out_dir / "supporting_tables"
     card_dir = out_dir / "tribe_cards"
     stage68_paths = _require_stage68_manifest_paths(stage68_manifest_path, cfg=cfg)
     stage68_manifest = stage68_paths.get("manifest") or {}
+    stage68_inputs = stage68_manifest.get("inputs") or {}
+    resolved_assignments_path = assignments_path or stage68_inputs.get("assignments_path")
+    resolved_behavior_path = behavior_path or stage68_inputs.get("behavior_path")
     out_dir.mkdir(parents=True, exist_ok=True)
     support_dir.mkdir(parents=True, exist_ok=True)
     if write_cards:
@@ -2472,18 +4386,28 @@ def write_stage7_final_handoff_pack(
     product_summary_paths = write_tribe_product_summary_artifacts(
         profile_path,
         output_dir=support_dir / "tribe_product_summaries",
-        combined_output_csv=support_dir / f"stage7_final_product_summary_long_{cfg.mode}.csv",
+        combined_output_csv=support_dir / f"stage7_all_tribe_product_summary_long_{cfg.mode}.csv",
         cfg=cfg,
     )
     comparison_paths = write_tribe_comparison_artifacts(
         profile_path,
-        output_csv=support_dir / f"stage7_final_tribe_comparison_{cfg.mode}.csv",
-        output_md=support_dir / f"stage7_final_tribe_comparison_{cfg.mode}.md",
-        output_html=support_dir / f"stage7_final_tribe_comparison_{cfg.mode}.html",
+        output_csv=support_dir / f"stage7_all_tribe_comparison_{cfg.mode}.csv",
+        output_md=support_dir / f"stage7_all_tribe_comparison_{cfg.mode}.md",
+        output_html=support_dir / f"stage7_all_tribe_comparison_{cfg.mode}.html",
         cfg=cfg,
     )
     llm_evidence_csv = support_dir / f"stage7_llm_evidence_long_{cfg.mode}.csv"
     stage7_llm_evidence_table(profile_path, output_csv=llm_evidence_csv, cfg=cfg)
+
+    substage_paths = write_stage7_substage_analysis_artifacts(
+        profile_path,
+        assignments_path=resolved_assignments_path,
+        behavior_path=resolved_behavior_path,
+        stage68_manifest_path=stage68_manifest_path,
+        output_dir=out_dir.parent,
+        distribution_metrics=distribution_metrics,
+        cfg=cfg,
+    )
 
     metric_tests_path = support_dir / f"stage7_final_customer_metric_tests_{cfg.mode}.csv"
     shutil.copyfile(_require_stage68_output(stage68_paths, "customer_metric_tests_csv"), metric_tests_path)
@@ -2525,6 +4449,33 @@ def write_stage7_final_handoff_pack(
         if not final_index.is_empty() and "tribe_id" in final_index.columns
         else []
     )
+    stage68_outputs = stage68_manifest.get("outputs") or {}
+    activation_csv = out_dir.parent / f"stage7_soft_audience_activation_customers_{cfg.mode}.csv"
+    activation_parquet = out_dir.parent / f"stage7_soft_audience_activation_customers_{cfg.mode}.parquet"
+    all_tribe_profile_index = pl.read_csv(substage_paths["all_tribe_profiles"]["csv"])
+    activation_customers = stage7_soft_audience_activation_customer_table(
+        stage68_outputs.get("remaining_customer_affinity_parquet"),
+        soft_audience_path=substage_paths["soft_audience_opportunities"]["csv"],
+        final_index=all_tribe_profile_index,
+        output_csv=activation_csv,
+        output_parquet=activation_parquet,
+        cfg=cfg,
+    )
+    campaign_playbook_paths = write_stage7_campaign_playbook_artifacts(
+        final_index,
+        output_csv=out_dir.parent / f"stage7_campaign_playbook_{cfg.mode}.csv",
+        cfg=cfg,
+    )
+    stakeholder_readiness_paths = write_stage7_stakeholder_readiness_artifacts(
+        final_index,
+        substage_paths["all_tribe_profiles"]["csv"],
+        substage_paths["remaining_customer_analysis"]["csv"],
+        substage_paths["soft_audience_opportunities"]["csv"],
+        activation_customers,
+        campaign_playbook_paths["csv"],
+        output_csv=out_dir.parent / f"stage7_stakeholder_readiness_{cfg.mode}.csv",
+        cfg=cfg,
+    )
 
     index_csv = out_dir / f"stage7_final_index_{cfg.mode}.csv"
     story_md = out_dir / f"stage7_final_story_{cfg.mode}.md"
@@ -2553,11 +4504,24 @@ def write_stage7_final_handoff_pack(
         "promotion_policy": {
             "readiness_statuses": sorted(_final_readiness_statuses(None, cfg)),
             "readiness_source": "stage6_profile_readiness",
-            "additional_stage7_gates": [],
+            "compatibility_mode": "stage7_gates_are_advisory_by_default",
+            "additional_stage7_gates": [
+                "reach",
+                "distinctiveness",
+                "business_relevance",
+                "naming_quality",
+            ],
         },
         "primary_outputs": {
             "final_index_csv": str(index_csv),
             "final_story_markdown": str(story_md),
+            "stage7_1_promotion_report_csv": str(substage_paths["stage7_1_promotion_report"]["csv"]),
+            "stage7_2_identity_dossier_csv": str(substage_paths["stage7_2_identity_dossier"]["csv"]),
+            "stage7_3_tribe_handbook_csv": str(substage_paths["stage7_3_tribe_handbook"]["csv"]),
+            "stage7_4_customer_coverage_report_csv": str(substage_paths["stage7_4_customer_coverage_report"]["csv"]),
+            "stage7_5_segment_action_playbook_csv": str(substage_paths["stage7_5_segment_action_playbook"]["csv"]),
+            "stage7_6_segmentation_framework_csv": str(substage_paths["stage7_6_segmentation_framework"]["csv"]),
+            "stage7_7_final_report_markdown": str(substage_paths["stage7_7_final_report"]["markdown"]),
             "tribe_card_directory": str(card_dir) if write_cards else None,
         },
         "supporting_outputs": {
@@ -2568,12 +4532,48 @@ def write_stage7_final_handoff_pack(
             "stage68_sector_lifts_parquet": (
                 str(stage68_paths.get("sector_lifts_path")) if stage68_paths.get("sector_lifts_path") else None
             ),
+            "all_tribe_product_summary_long_csv": str(product_summary_paths["combined_csv"]),
             "product_summary_long_csv": str(product_summary_paths["combined_csv"]),
+            "all_tribe_comparison_csv": str(comparison_paths["csv"]),
             "comparison_csv": str(comparison_paths["csv"]),
             "customer_metric_tests_csv": str(metric_tests_path),
             "noise_vs_core_customer_metrics_csv": str(noise_vs_core_metrics_path),
             "evidence_storyline_markdown": str(storyline_paths["markdown"]),
             "llm_evidence_long_csv": str(llm_evidence_csv),
+            "stage7_1_promotion_report_markdown": str(substage_paths["stage7_1_promotion_report"]["markdown"]),
+            "stage7_2_identity_dossier_markdown": str(substage_paths["stage7_2_identity_dossier"]["markdown"]),
+            "stage7_3_tribe_handbook_markdown": str(substage_paths["stage7_3_tribe_handbook"]["markdown"]),
+            "stage7_4_customer_coverage_report_markdown": str(substage_paths["stage7_4_customer_coverage_report"]["markdown"]),
+            "stage7_5_segment_action_playbook_markdown": str(substage_paths["stage7_5_segment_action_playbook"]["markdown"]),
+            "stage7_6_segmentation_framework_markdown": str(substage_paths["stage7_6_segmentation_framework"]["markdown"]),
+            "stage7_7_final_report_csv": str(substage_paths["stage7_7_final_report"]["csv"]),
+            "all_tribe_profiles_csv": str(substage_paths["all_tribe_profiles"]["csv"]),
+            "all_tribe_profiles_markdown": str(substage_paths["all_tribe_profiles"]["markdown"]),
+            "promoted_tribe_validation_csv": str(substage_paths["promoted_tribe_validation"]["csv"]),
+            "promoted_tribe_validation_markdown": str(substage_paths["promoted_tribe_validation"]["markdown"]),
+            "review_tribe_validation_csv": str(substage_paths["review_tribe_validation"]["csv"]),
+            "review_tribe_validation_markdown": str(substage_paths["review_tribe_validation"]["markdown"]),
+            "review_tribe_audit_csv": str(substage_paths["review_tribe_audit"]["csv"]),
+            "review_tribe_audit_markdown": str(substage_paths["review_tribe_audit"]["markdown"]),
+            "all_tribe_product_identity_csv": str(substage_paths["all_tribe_product_identity"]["csv"]),
+            "all_tribe_product_identity_markdown": str(substage_paths["all_tribe_product_identity"]["markdown"]),
+            "all_tribe_behavior_differentiation_csv": str(substage_paths["all_tribe_behavior_differentiation"]["csv"]),
+            "all_tribe_behavior_differentiation_markdown": str(substage_paths["all_tribe_behavior_differentiation"]["markdown"]),
+            "all_tribe_dossiers_markdown": str(substage_paths["all_tribe_dossiers"]["markdown"]),
+            "persona_deep_dives_markdown": str(substage_paths["persona_deep_dives"]["markdown"]),
+            "remaining_customer_analysis_csv": str(substage_paths["remaining_customer_analysis"]["csv"]),
+            "remaining_customer_analysis_markdown": str(substage_paths["remaining_customer_analysis"]["markdown"]),
+            "soft_audience_opportunities_csv": str(substage_paths["soft_audience_opportunities"]["csv"]),
+            "soft_audience_activation_customers_csv": str(activation_csv),
+            "soft_audience_activation_customers_parquet": str(activation_parquet),
+            "campaign_playbook_csv": str(campaign_playbook_paths["csv"]),
+            "campaign_playbook_markdown": str(campaign_playbook_paths["markdown"]),
+            "stakeholder_readiness_csv": str(stakeholder_readiness_paths["csv"]),
+            "stakeholder_readiness_markdown": str(stakeholder_readiness_paths["markdown"]),
+            "all_tribe_relationship_atlas_csv": str(substage_paths["all_tribe_relationship_atlas"]["csv"]),
+            "all_tribe_relationship_atlas_markdown": str(substage_paths["all_tribe_relationship_atlas"]["markdown"]),
+            "tribe_relationship_atlas_csv": str(substage_paths["tribe_relationship_atlas"]["csv"]),
+            "tribe_relationship_atlas_markdown": str(substage_paths["tribe_relationship_atlas"]["markdown"]),
             "tribe_raw_transaction_export_manifest_csv": (
                 str(raw_transaction_export_paths.get("manifest_csv")) if raw_transaction_export_paths else None
             ),
@@ -2609,6 +4609,19 @@ def write_stage7_final_handoff_pack(
         "llm_evidence_csv": llm_evidence_csv,
         "storyline_paths": storyline_paths,
         "distribution_metrics": distribution_metrics,
+        "substage_paths": substage_paths,
+        "stage7_1_promotion_report_paths": substage_paths["stage7_1_promotion_report"],
+        "stage7_2_identity_dossier_paths": substage_paths["stage7_2_identity_dossier"],
+        "stage7_3_tribe_handbook_paths": substage_paths["stage7_3_tribe_handbook"],
+        "stage7_4_customer_coverage_report_paths": substage_paths["stage7_4_customer_coverage_report"],
+        "stage7_5_segment_action_playbook_paths": substage_paths["stage7_5_segment_action_playbook"],
+        "stage7_6_segmentation_framework_paths": substage_paths["stage7_6_segmentation_framework"],
+        "stage7_7_final_report_paths": substage_paths["stage7_7_final_report"],
+        "campaign_playbook_paths": campaign_playbook_paths,
+        "stakeholder_readiness_paths": stakeholder_readiness_paths,
+        "soft_audience_activation_customers_csv": activation_csv,
+        "soft_audience_activation_customers_parquet": activation_parquet,
+        "soft_audience_activation_customers": activation_customers,
     }
 
 
@@ -2639,24 +4652,48 @@ def stage7_final_index_table(
     assigned_population_customers = _profile_population_customer_count(profiles)
     review_excluded_customers = max(assigned_population_customers - promoted_population_customers, 0)
     final_records = sorted(final_records, key=lambda item: int(item[0].get("n_customers") or 0), reverse=True)
-    for order, (row, readiness_row, actionability) in enumerate(final_records, start=1):
+    enriched_final_records = []
+    for row, readiness_row, actionability in final_records:
+        tribe_id = int(row["tribe_id"])
+        metrics = _stage7_distribution_for_tribe(distribution_metrics, tribe_id)
+        enriched_row = _stage7_row_with_distribution_metrics(row, metrics)
+        enriched_final_records.append((row, readiness_row, actionability, enriched_row, metrics))
+    name_fields_by_id = _stage7_name_fields_by_tribe([item[3] for item in enriched_final_records], cfg=cfg)
+    for order, (row, readiness_row, actionability, enriched_row, metrics) in enumerate(enriched_final_records, start=1):
         tribe_id = int(row["tribe_id"])
         customers = int(row.get("n_customers") or 0)
         comparison_row = _row_by_tribe(comparison, tribe_id)
         products = _top_card_products(row, limit=1)
-        metrics = _stage7_distribution_for_tribe(distribution_metrics, tribe_id)
-        enriched_row = _stage7_row_with_distribution_metrics(row, metrics)
         loyalty_profile = _parse_json(enriched_row.get("loyalty_profile"), {})
         theme = _primary_theme_context(enriched_row, cfg=cfg)
-        name_info = _stage7_name_info(enriched_row, cfg=cfg)
+        name_info = name_fields_by_id.get(tribe_id) or _stage7_name_fields(enriched_row, cfg=cfg)
+        delivery_signal = _stage7_delivery_product_signal(enriched_row, cfg)
+        stage6_status = str(readiness_row.get("stage6_profile_readiness") or "not checked")
+        tribe_status = _stage7_tribe_status(stage6_status, _final_readiness_statuses(readiness_statuses, cfg))
+        validation = _stage7_validation_summary(
+            enriched_row,
+            tribe_status=tribe_status,
+            name_fields=name_info,
+            cfg=cfg,
+        )
         ratios = _fixed_behavior_ratios(row)
         rows.append(
             {
                 "story_order": order,
                 "tribe_id": tribe_id,
-                "tribe_name": name_info["tribe_name"],
+                "tribe_name": name_info["business_name"],
                 "name_source": name_info["name_source"],
-                "stage6_profile_readiness": readiness_row.get("stage6_profile_readiness") or "not checked",
+                "promotion_decision": "promoted",
+                "validation_tier": _stage7_validation_tier(stage6_status, tribe_status),
+                "technical_name": name_info["technical_name"],
+                "business_name": name_info["business_name"],
+                "legacy_tribe_name": name_info["legacy_tribe_name"],
+                "business_confidence": _stage7_business_confidence(stage6_status, tribe_status, validation["validation_blockers"]),
+                "validation_blockers": validation["validation_blockers"],
+                "coverage_group": "core_promoted_tribe",
+                "membership_policy": "official hard-assigned promoted tribe",
+                "recommended_use": _stage7_recommended_use(tribe_status),
+                "stage6_profile_readiness": stage6_status,
                 "customers_count": customers,
                 "customers": customers,
                 # Population share is normalized over promoted Stage 7 tribes only, not every Stage 6 candidate.
@@ -2673,6 +4710,11 @@ def stage7_final_index_table(
                 "primary_theme_product_evidence": theme["primary_theme_product_evidence"],
                 "actionability_proof_source": actionability.get("actionability_proof_source"),
                 "actionability_proof": actionability.get("actionability_proof"),
+                "delivery_product": (delivery_signal or {}).get("label"),
+                "delivery_product_lift": (delivery_signal or {}).get("lift_vs_rest"),
+                "delivery_product_reach_pct": (delivery_signal or {}).get("reach_pct"),
+                "delivery_product_customers": (delivery_signal or {}).get("customers"),
+                "delivery_product_q_value": (delivery_signal or {}).get("q_value"),
                 "top_product": products[0]["product"] if products else None,
                 "top_product_reach_pct": products[0]["reach_pct"] if products else None,
                 "top_product_lift": products[0]["lift_vs_rest"] if products else None,
@@ -2766,27 +4808,43 @@ def write_stage7_tribe_card_pngs(
 ) -> dict[int, Path]:
     del readiness_path
     profiles = pl.read_parquet(profile_path).sort("tribe_id")
+    allowed_statuses = _final_readiness_statuses(readiness_statuses, cfg)
     out_dir = Path(output_dir) if output_dir else cfg.figures / "stage7_tribe_cards"
     out_dir.mkdir(parents=True, exist_ok=True)
     for stale_card in out_dir.glob("tribe_*_card.png"):
         stale_card.unlink()
     paths: dict[int, Path] = {}
-    final_records = _final_profile_records(
-        profiles,
-        pl.DataFrame(),
-        readiness_statuses=readiness_statuses,
+    profile_rows = list(profiles.iter_rows(named=True))
+    name_fields_by_id = _stage7_name_fields_by_tribe(
+        _stage7_enriched_profile_rows(profiles, distribution_metrics),
         cfg=cfg,
     )
-    promoted_population_customers = sum(int(item[0].get("n_customers") or 0) for item in final_records)
-    for row, _, _ in final_records:
+    final_records = [
+        row
+        for row in profile_rows
+        if _stage7_status_is_final(_stage7_tribe_status(row.get("stage6_profile_readiness"), allowed_statuses))
+    ]
+    promoted_population_customers = sum(int(item.get("n_customers") or 0) for item in final_records)
+    assigned_population_customers = _profile_population_customer_count(profiles)
+    for row in profile_rows:
         tribe_id = int(row["tribe_id"])
         output = out_dir / f"tribe_{tribe_id:02d}_card.png"
         card_row = dict(row)
+        status = str(card_row.get("stage6_profile_readiness") or "missing").strip()
+        tribe_status = _stage7_tribe_status(status, allowed_statuses)
         metrics = _stage7_distribution_for_tribe(distribution_metrics, tribe_id)
         card_row = _stage7_row_with_distribution_metrics(card_row, metrics)
-        card_row.update(_stage7_name_info(card_row, cfg=cfg))
+        card_row.update(name_fields_by_id.get(tribe_id) or _stage7_name_fields(card_row, cfg=cfg))
+        card_row["tribe_status"] = tribe_status
+        card_row["tribe_status_label"] = _stage7_status_label(tribe_status)
+        card_row["readiness_caveat"] = _stage7_readiness_caveat(status, tribe_status)
+        card_row["recommended_use"] = _stage7_recommended_use(tribe_status)
         card_row["population_share_promoted_pct"] = round(
             100.0 * int(row.get("n_customers") or 0) / max(promoted_population_customers, 1),
+            2,
+        )
+        card_row["population_share_total_pct"] = round(
+            100.0 * int(row.get("n_customers") or 0) / max(assigned_population_customers, 1),
             2,
         )
         card_row["distribution_metrics"] = metrics
@@ -3022,12 +5080,24 @@ def _llm_pack_row(row: dict[str, Any], readiness_row: dict[str, Any], *, cfg: Pi
 def _review_candidates_from_profiles(profiles: pl.DataFrame, final_index: pl.DataFrame, *, cfg: PipelineConfig) -> pl.DataFrame:
     if profiles.is_empty() or "tribe_id" not in profiles.columns:
         return pl.DataFrame(
-            schema={"tribe_id": pl.Int64, "stage6_profile_readiness": pl.Utf8, "review_reason": pl.Utf8}
+            schema={
+                "tribe_id": pl.Int64,
+                "tribe_name": pl.Utf8,
+                "tribe_status": pl.Utf8,
+                "stage6_profile_readiness": pl.Utf8,
+                "customers": pl.Int64,
+                "population_share_pct": pl.Float64,
+                "review_reason": pl.Utf8,
+                "readiness_caveat": pl.Utf8,
+                "recommended_use": pl.Utf8,
+            }
         )
     final_ids = set(final_index["tribe_id"].to_list()) if not final_index.is_empty() and "tribe_id" in final_index.columns else set()
     allowed_statuses = _final_readiness_statuses(None, cfg)
     rows = []
-    for row in profiles.iter_rows(named=True):
+    profile_rows = list(profiles.iter_rows(named=True))
+    name_fields_by_id = _stage7_name_fields_by_tribe(profile_rows, cfg=cfg)
+    for row in profile_rows:
         if int(row["tribe_id"]) in final_ids:
             continue
         status = str(row.get("stage6_profile_readiness") or "missing").strip()
@@ -3035,17 +5105,37 @@ def _review_candidates_from_profiles(profiles: pl.DataFrame, final_index: pl.Dat
             reason = "promoted_status_missing_from_final_index"
         else:
             reason = f"stage6_profile_readiness={status}"
+        tribe_status = _stage7_tribe_status(status, allowed_statuses)
+        name_info = name_fields_by_id.get(int(row["tribe_id"])) or _stage7_name_fields(row, cfg=cfg)
         rows.append(
             {
                 "tribe_id": int(row["tribe_id"]),
+                "tribe_name": name_info["business_name"],
+                "tribe_status": tribe_status,
                 "stage6_profile_readiness": status,
+                "customers": int(row.get("n_customers") or 0),
+                "population_share_pct": round(100.0 * float(row.get("population_share") or 0.0), 3),
                 "review_reason": reason,
+                "readiness_caveat": _stage7_readiness_caveat(status, tribe_status),
+                "recommended_use": _stage7_recommended_use(tribe_status),
             }
         )
     return (
         pl.DataFrame(rows)
         if rows
-        else pl.DataFrame(schema={"tribe_id": pl.Int64, "stage6_profile_readiness": pl.Utf8, "review_reason": pl.Utf8})
+        else pl.DataFrame(
+            schema={
+                "tribe_id": pl.Int64,
+                "tribe_name": pl.Utf8,
+                "tribe_status": pl.Utf8,
+                "stage6_profile_readiness": pl.Utf8,
+                "customers": pl.Int64,
+                "population_share_pct": pl.Float64,
+                "review_reason": pl.Utf8,
+                "readiness_caveat": pl.Utf8,
+                "recommended_use": pl.Utf8,
+            }
+        )
     )
 
 
@@ -3078,6 +5168,9 @@ def _promoted_population_denominator(final_index: pl.DataFrame) -> int:
 def _write_stage7_tribe_card_png(row: dict[str, Any], output_path: Path, *, max_products: int) -> Path:
     import textwrap
 
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     metrics = row.get("distribution_metrics") or _empty_stage7_distribution_metrics()
@@ -3087,21 +5180,26 @@ def _write_stage7_tribe_card_png(row: dict[str, Any], output_path: Path, *, max_
     ax.axis("off")
     title = f"T{int(row.get('tribe_id') or 0)}: {row.get('tribe_name') or _stage7_name_info(row, cfg=CONFIG)['tribe_name']}"
     ax.text(0.04, 0.955, title, fontsize=21, weight="bold", color="#111827")
+    tribe_status = str(row.get("tribe_status") or "potential_review")
+    status_label = str(row.get("tribe_status_label") or _stage7_status_label(tribe_status))
+    status_color = {"final_strong": "#047857", "final_usable": "#b45309"}.get(tribe_status, "#b42318")
     ax.text(
         0.04,
         0.918,
         (
             f"{int(row.get('n_customers') or 0):,} customers | "
-            f"{float(row.get('population_share_promoted_pct') or 0.0):.1f}% of promoted tribe population"
+            f"{status_label} | "
+            f"{float(row.get('population_share_total_pct') or row.get('population_share_promoted_pct') or 0.0):.1f}% of retained hard-cluster customers"
         ),
         fontsize=12,
-        color="#475467",
+        color=status_color,
     )
+    ax.text(0.04, 0.894, str(row.get("recommended_use") or ""), fontsize=9.5, color="#475467")
     left_x = 0.04
     right_x = 0.53
     col_width = 62
 
-    y = 0.858
+    y = 0.842
     ax.text(left_x, y, "MOST DISTINCTIVE PRODUCTS", fontsize=13, weight="bold", color="#111827")
     ax.text(left_x, y - 0.024, PRODUCT_RANKING_CARD_NOTE, fontsize=9.2, color="#667085")
     y -= 0.058
@@ -3179,8 +5277,9 @@ def _write_stage7_tribe_card_png(row: dict[str, Any], output_path: Path, *, max_
 
     footer = (
         f"name_source={row.get('name_source')}; "
+        f"tribe_status={row.get('tribe_status') or 'potential_review'}; "
         f"stage6_profile_readiness={row.get('stage6_profile_readiness') or 'not checked'} | "
-        "Profiles based on purchase behaviour only. Not a demographic profile."
+        f"{row.get('readiness_caveat') or 'Profiles based on purchase behaviour only. Not a demographic profile.'}"
     )
     ax.text(0.04, 0.035, footer, fontsize=9.0, color="#475467")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3286,6 +5385,46 @@ def _final_readiness_statuses(readiness_statuses: list[str] | None, cfg: Pipelin
         configured = cfg.get("profiling.final_handoff_readiness_statuses", ["strong", "usable"])
     values = _configured_status_set(configured)
     return values or {"strong", "usable"}
+
+
+def _stage7_tribe_status(stage6_status: str | None, allowed_statuses: set[str]) -> str:
+    status = str(stage6_status or "").strip()
+    if status in allowed_statuses and status in {"strong", "ready_strong"}:
+        return "final_strong"
+    if status in allowed_statuses:
+        return "final_usable"
+    return "potential_review"
+
+
+def _stage7_status_is_final(tribe_status: str | None) -> bool:
+    return str(tribe_status or "") in {"final_strong", "final_usable"}
+
+
+def _stage7_status_label(tribe_status: str | None) -> str:
+    status = str(tribe_status or "")
+    if status == "final_strong":
+        return "Final - strong"
+    if status == "final_usable":
+        return "Final - usable"
+    return "Potential / Review"
+
+
+def _stage7_readiness_caveat(stage6_status: str | None, tribe_status: str | None) -> str:
+    status = str(stage6_status or "missing").strip() or "missing"
+    if tribe_status == "final_strong":
+        return "Passed final readiness with strong stability evidence."
+    if tribe_status == "final_usable":
+        return "Promoted for final profiling, but below the strong stability tier."
+    return f"Potential tribe only; held for review because stage6_profile_readiness={status}."
+
+
+def _stage7_recommended_use(tribe_status: str | None) -> str:
+    status = str(tribe_status or "")
+    if status == "final_strong":
+        return "Ready for stakeholder segmentation and campaign planning."
+    if status == "final_usable":
+        return "Usable for stakeholder segmentation with the stability caveat stated."
+    return "Promising behavioral pocket; use for exploration, hypothesis testing, or cautious campaign tests only."
 
 
 def _configured_status_set(configured: Any) -> set[str]:
@@ -3467,6 +5606,91 @@ def _actionable_signal(
     }
 
 
+def _stage7_delivery_product_signal(row: dict[str, Any], cfg: PipelineConfig) -> dict[str, Any] | None:
+    """Return one product hook that clears the stakeholder delivery gate."""
+
+    threshold = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+    min_reach = float(cfg.get("profiling.stage7_delivery_readiness.min_product_reach_pct", 1.0))
+    min_customers = int(cfg.get("profiling.stage7_delivery_readiness.min_product_customer_count", 50))
+    q_threshold = float(cfg.get("profiling.significance_q_threshold", 0.05))
+    n_customers = max(
+        int(
+            _safe_float(
+                row.get("n_customers")
+                or row.get("customers")
+                or row.get("customers_count")
+                or row.get("promoted_population_customers")
+            )
+            or 0
+        ),
+        1,
+    )
+
+    candidates: list[dict[str, Any]] = []
+    products = row.get("top_products") or []
+    lifts = row.get("top_product_lifts_vs_rest") or row.get("top_product_lifts") or []
+    q_values = row.get("top_product_q_values") or []
+    counts = row.get("top_product_customer_counts") or []
+    reaches = row.get("top_product_reach_pct") or []
+    for idx, product in enumerate(products):
+        lift = _safe_float(_value_at(lifts, idx))
+        q_value = _safe_float(_value_at(q_values, idx))
+        customers = int(_safe_float(_value_at(counts, idx)) or 0)
+        reach = _safe_float(_value_at(reaches, idx))
+        if reach is None and customers:
+            reach = 100.0 * customers / n_customers
+        if lift is None or lift < threshold:
+            continue
+        if q_value is None or q_value > q_threshold:
+            continue
+        if reach is None or reach < min_reach or customers < min_customers:
+            continue
+        candidates.append(
+            {
+                "label": _repair_display_text(str(product)),
+                "lift_vs_rest": lift,
+                "q_value": q_value,
+                "customers": customers,
+                "reach_pct": reach,
+                "score": _product_rank_score(lift, customers) or 0.0,
+            }
+        )
+
+    if candidates:
+        return sorted(
+            candidates,
+            key=lambda item: (
+                -float(item.get("score") or 0.0),
+                -float(item.get("reach_pct") or 0.0),
+                str(item.get("label") or ""),
+            ),
+        )[0]
+
+    fallback_label = row.get("delivery_product") or row.get("top_product")
+    fallback_lift = _safe_float(row.get("delivery_product_lift") or row.get("top_product_lift"))
+    fallback_reach = _safe_float(row.get("delivery_product_reach_pct") or row.get("top_product_reach_pct"))
+    fallback_customers = int(_safe_float(row.get("delivery_product_customers") or row.get("top_product_customers")) or 0)
+    fallback_q = _safe_float(row.get("delivery_product_q_value") or row.get("top_product_q_value"))
+    if (
+        fallback_label
+        and fallback_lift is not None
+        and fallback_lift >= threshold
+        and fallback_reach is not None
+        and fallback_reach >= min_reach
+        and fallback_customers >= min_customers
+        and (fallback_q is None or fallback_q <= q_threshold)
+    ):
+        return {
+            "label": _repair_display_text(str(fallback_label)),
+            "lift_vs_rest": fallback_lift,
+            "q_value": fallback_q,
+            "customers": fallback_customers,
+            "reach_pct": fallback_reach,
+            "score": _product_rank_score(fallback_lift, fallback_customers) or 0.0,
+        }
+    return None
+
+
 def _proof_signal_text(signal: dict[str, Any]) -> str:
     q_value = signal.get("q_value")
     q_text = "" if q_value is None else f", q={float(q_value):.3g}"
@@ -3581,6 +5805,32 @@ def _theme_label_from_key(key: str) -> str:
     return " ".join(part.capitalize() for part in key.replace("-", "_").split("_") if part) + " Buyers"
 
 
+STAGE7_GENERIC_NAME_THEME_KEYS = {
+    "alcohol",
+    "apparel_textile",
+    "bakery_breakfast",
+    "beverages_soft",
+    "books_toys",
+    "diy_auto_garden",
+    "electronics_appliances",
+    "fresh_produce",
+    "frozen_ice_cream",
+    "fuel_convenience",
+    "health_wellness",
+    "home_cleaning",
+    "home_kitchen",
+    "kids_general",
+    "meat_charcuterie",
+    "pantry_staples",
+    "personal_care_beauty",
+    "premium_indulgence",
+    "ready_meals",
+    "seasonal_celebration",
+    "seafood",
+    "snacks_sweets",
+}
+
+
 def _stage7_name_info(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, str]:
     tribe_id = int(row.get("tribe_id") or 0)
     lookup = cfg.get("profiling.tribe_name_lookup", {}) or {}
@@ -3597,11 +5847,160 @@ def _stage7_name_info(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, 
     return {"tribe_name": fallback, "name_source": "sku_fallback"}
 
 
+def _stage7_name_fields(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, str]:
+    legacy = _stage7_name_info(row, cfg=cfg)
+    legacy_name = _normalise_tribe_name(legacy.get("tribe_name") or "")
+    technical_name = _normalise_tribe_name(_working_label(row))
+    if _stage7_name_needs_technical_fallback(legacy_name):
+        business_name = technical_name
+        source = "technical_name_fallback"
+        issue = "legacy_name_not_business_safe"
+    else:
+        business_name = legacy_name
+        source = legacy.get("name_source") or "unknown"
+        issue = "pass"
+    return {
+        "tribe_name": business_name,
+        "business_name": business_name,
+        "technical_name": technical_name,
+        "legacy_tribe_name": legacy_name,
+        "name_source": source,
+        "legacy_name_source": legacy.get("name_source") or "unknown",
+        "name_quality_issue": issue,
+    }
+
+
+def _stage7_name_fields_by_tribe(rows: list[dict[str, Any]], *, cfg: PipelineConfig) -> dict[int, dict[str, str]]:
+    fields_by_id = {int(row.get("tribe_id") or 0): _stage7_name_fields(row, cfg=cfg) for row in rows}
+    row_by_id = {int(row.get("tribe_id") or 0): row for row in rows}
+    allowed_statuses = _final_readiness_statuses(None, cfg)
+    counts: dict[str, int] = {}
+    for fields in fields_by_id.values():
+        name = fields["business_name"]
+        counts[name] = counts.get(name, 0) + 1
+    technical_counts: dict[str, int] = {}
+    for fields in fields_by_id.values():
+        name = fields["technical_name"]
+        technical_counts[name] = technical_counts.get(name, 0) + 1
+
+    duplicate_ids_by_name: dict[str, list[int]] = {}
+    for tribe_id, fields in fields_by_id.items():
+        duplicate_ids_by_name.setdefault(fields["business_name"], []).append(tribe_id)
+
+    for tribe_id, fields in fields_by_id.items():
+        business_name = fields["business_name"]
+        if counts.get(business_name, 0) <= 1:
+            continue
+        duplicate_ids = duplicate_ids_by_name.get(business_name, [])
+        promoted_duplicate_ids = [
+            item
+            for item in duplicate_ids
+            if str(row_by_id.get(item, {}).get("stage6_profile_readiness") or "").strip() in allowed_statuses
+        ]
+        if len(promoted_duplicate_ids) == 1 and tribe_id == promoted_duplicate_ids[0] and fields.get("name_quality_issue") == "pass":
+            continue
+        technical_name = fields["technical_name"]
+        if technical_counts.get(technical_name, 0) <= 1 and not _stage7_name_needs_technical_fallback(technical_name):
+            fields["business_name"] = technical_name
+            fields["tribe_name"] = technical_name
+            fields["name_source"] = "deduplicated_technical_name"
+        else:
+            unique_name = _normalise_tribe_name(f"T{tribe_id} {technical_name}")
+            fields["business_name"] = unique_name
+            fields["tribe_name"] = unique_name
+            fields["name_source"] = "deduplicated_tribe_id_technical_name"
+        fields["name_quality_issue"] = "duplicate_legacy_business_name"
+    return fields_by_id
+
+
+def _stage7_name_needs_technical_fallback(name: str) -> bool:
+    if not str(name or "").strip():
+        return True
+    return _is_generic_tribe_name(name) or _is_sku_like_name(name) or len(re.findall(r"[A-Za-z]+", name)) > 7
+
+
+def _stage7_promotion_decision(stage6_status: str | None, tribe_status: str | None, row: dict[str, Any] | None = None) -> str:
+    if _stage7_status_is_final(tribe_status):
+        return "promoted"
+    status = str(stage6_status or "").strip().lower()
+    customers = int(_safe_float((row or {}).get("n_customers")) or 0)
+    if customers <= 0 or status in {"reject", "rejected", "fail", "failed", "blocked"}:
+        return "rejected"
+    return "review"
+
+
+def _stage7_validation_tier(stage6_status: str | None, tribe_status: str | None) -> str:
+    status = str(stage6_status or "").strip()
+    if tribe_status == "final_strong":
+        return "promoted_strong"
+    if tribe_status == "final_usable":
+        return "promoted_usable"
+    if status.lower() in {"reject", "rejected", "fail", "failed", "blocked"}:
+        return "rejected"
+    return "review"
+
+
+def _stage7_validation_summary(
+    row: dict[str, Any],
+    *,
+    tribe_status: str | None,
+    name_fields: dict[str, str] | None = None,
+    cfg: PipelineConfig,
+) -> dict[str, str]:
+    customers = int(_safe_float(row.get("n_customers") or row.get("customers") or row.get("customers_count")) or 0)
+    min_customers = int(cfg.get("profiling.stage7_delivery_readiness.min_product_customer_count", 50))
+    actionability = _actionability_proof(row, cfg=cfg)
+    delivery_signal = _stage7_delivery_product_signal(row, cfg)
+    name_issue = (name_fields or {}).get("name_quality_issue") or "pass"
+    gates = {
+        "statistical_validity": "pass" if _stage7_status_is_final(tribe_status) else "review",
+        "reach": "pass" if customers >= max(1, min_customers) else "weak",
+        "distinctiveness": "pass" if _stage7_has_distinctive_product_signal(row, cfg=cfg) else "weak",
+        "business_relevance": "pass" if actionability.get("actionability_proof_source") or delivery_signal else "weak",
+        "naming_quality": "pass" if name_issue == "pass" else name_issue,
+    }
+    blockers = [f"{gate}={status}" for gate, status in gates.items() if status != "pass"]
+    return {
+        **{f"{gate}_gate": status for gate, status in gates.items()},
+        "validation_blockers": "; ".join(blockers) if blockers else "pass",
+    }
+
+
+def _stage7_has_distinctive_product_signal(row: dict[str, Any], *, cfg: PipelineConfig) -> bool:
+    threshold = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+    q_threshold = float(cfg.get("profiling.significance_q_threshold", 0.05))
+    products = row.get("top_products") or []
+    lifts = row.get("top_product_lifts_vs_rest") or row.get("top_product_lifts") or []
+    q_values = row.get("top_product_q_values") or []
+    for idx, _product in enumerate(products[:5]):
+        lift = _safe_float(_value_at(lifts, idx))
+        q_value = _safe_float(_value_at(q_values, idx))
+        if lift is not None and lift >= threshold and (q_value is None or q_value <= q_threshold):
+            return True
+    return False
+
+
+def _stage7_business_confidence(stage6_status: str | None, tribe_status: str | None, validation_blockers: str | None) -> str:
+    blockers = str(validation_blockers or "pass")
+    if not _stage7_status_is_final(tribe_status):
+        return "review_only"
+    if blockers != "pass":
+        return "low"
+    if str(stage6_status or "").strip() in {"strong", "ready_strong"}:
+        return "high"
+    return "medium"
+
+
 def _editorial_theme_name(row: dict[str, Any], *, cfg: PipelineConfig = CONFIG) -> str | None:
     theme = _primary_theme_context(row, cfg=cfg)
     if not theme.get("theme_key"):
         return None
-    return str(theme.get("primary_theme") or "").strip() or None
+    theme_key = str(theme.get("theme_key"))
+    theme_label = str(theme.get("primary_theme") or "").strip()
+    base_theme_label = THEME_LABELS.get(theme_key, _theme_label_from_key(theme_key))
+    if theme_key in STAGE7_GENERIC_NAME_THEME_KEYS and theme_label == base_theme_label:
+        return None
+    return theme_label or None
 
 
 def _normalise_tribe_name(raw: str) -> str:
@@ -3858,11 +6257,24 @@ def _working_label(row: dict[str, Any]) -> str:
 
 
 def _final_story_markdown(final_index: pl.DataFrame, review_candidates: pl.DataFrame) -> str:
+    final_customers = int(final_index["customers"].sum()) if not final_index.is_empty() and "customers" in final_index.columns else 0
+    review_customers = (
+        int(review_candidates["customers"].sum())
+        if not review_candidates.is_empty() and "customers" in review_candidates.columns
+        else 0
+    )
     lines = [
         "# Stage 7 Tribe Profiles",
         "",
-        "Stage 7 turns Stage 6.8 evidence into business-readable tribe profiles. It accepts Stage 6.6 readiness as final and reads only Stage 6.8 aggregate evidence plus per-tribe exports.",
+        "Stage 7 turns Stage 6.8 evidence into a stakeholder-ready segmentation framework. It preserves Stage 6.6 promoted/review membership by default, reads only Stage 6.8 aggregate evidence plus per-tribe exports, and now exposes advisory Stage 7 gates for reach, distinctiveness, business relevance, and naming quality.",
+        "Read the official redesigned outputs in order: Stage 7.1 promotion, Stage 7.2 identity evidence, Stage 7.3 handbook, Stage 7.4 customer coverage, Stage 7.5 actions, Stage 7.6 architecture, and Stage 7.7 executive synthesis.",
         "In the final index, population_share_pct is normalized over promoted final tribes; assigned_population_share_pct preserves the full assigned-profile denominator before review tribes are held out.",
+        "",
+        "## Stakeholder Read",
+        "",
+        f"Final promoted tribes: {final_index.height} tribes covering {final_customers:,} hard-cluster customers.",
+        f"Potential review tribes: {review_candidates.height} tribes covering {review_customers:,} hard-cluster customers.",
+        "Review tribes remain visible in the redesigned framework as non-core candidates, but they are not final validated core tribes.",
         "",
         "## Final Tribes",
         "",
@@ -3871,9 +6283,1555 @@ def _final_story_markdown(final_index: pl.DataFrame, review_candidates: pl.DataF
         lines.append("No tribes were promoted into the final index.")
     else:
         lines.append(_markdown_table(final_index))
-    lines.extend(["", "## Review Candidates", "", "Review candidates held out of the final tribe story remain auditable below.", ""])
+    lines.extend(["", "## Potential Review Tribes", "", "Potential review tribes are held out of the final tribe index but remain visible in all-tribe product, behavior, dossier, and relationship sections.", ""])
     lines.append(_markdown_table(review_candidates) if not review_candidates.is_empty() else "No review candidates.")
     return "\n".join(lines) + "\n"
+
+
+def _empty_remaining_customer_affinity() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "cliente": pl.Int64,
+            "official_tribe_id": pl.Int64,
+            "top_tribe_id": pl.Int64,
+            "top_affinity_score": pl.Float64,
+            "second_tribe_id": pl.Int64,
+            "second_affinity_score": pl.Float64,
+            "affinity_margin": pl.Float64,
+            "affinity_confidence_band": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "official_assignment_policy": pl.Utf8,
+        }
+    )
+
+
+def _empty_remaining_customer_segments() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "segment_id": pl.Utf8,
+            "segment_name": pl.Utf8,
+            "customer_count": pl.Int64,
+            "share_of_remaining_pct": pl.Float64,
+            "share_of_total_pct": pl.Float64,
+            "avg_ticket_count": pl.Float64,
+            "avg_total_spend": pl.Float64,
+            "avg_basket_value": pl.Float64,
+            "avg_promo_share": pl.Float64,
+            "avg_unique_products": pl.Float64,
+            "avg_unique_sectors": pl.Float64,
+            "avg_recency_days": pl.Float64,
+            "avg_frequency_per_30d": pl.Float64,
+            "closest_tribe_id": pl.Int64,
+            "closest_tribe_affinity_mean": pl.Float64,
+            "second_tribe_id": pl.Int64,
+            "affinity_margin_mean": pl.Float64,
+            "product_theme_signal": pl.Utf8,
+            "targetability": pl.Utf8,
+            "likely_reason_for_no_hard_cluster": pl.Utf8,
+            "recommended_action": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_all_tribe_profiles() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_id": pl.Int64,
+            "tribe_name": pl.Utf8,
+            "promotion_status": pl.Utf8,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "membership_policy": pl.Utf8,
+            "tribe_status": pl.Utf8,
+            "tribe_status_label": pl.Utf8,
+            "stage6_profile_readiness": pl.Utf8,
+            "promotion_blocker": pl.Utf8,
+            "readiness_caveat": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "customers": pl.Int64,
+            "population_share_pct": pl.Float64,
+            "mean_assignment_confidence": pl.Float64,
+            "p10_assignment_confidence": pl.Float64,
+            "jitter_label_recovery_accuracy": pl.Float64,
+            "who_is_the_tribe": pl.Utf8,
+            "defining_behavior": pl.Utf8,
+            "distinctive_products": pl.Utf8,
+            "broad_reach_products": pl.Utf8,
+            "sector_theme_evidence": pl.Utf8,
+            "shopping_mission": pl.Utf8,
+            "promo_loyalty_recency": pl.Utf8,
+            "targeting_idea": pl.Utf8,
+            "revenue_lever": pl.Utf8,
+            "confidence_level": pl.Utf8,
+            "evidence_caveat": pl.Utf8,
+            "actionability_proof": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_behavior_differentiation() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_id": pl.Int64,
+            "tribe_name": pl.Utf8,
+            "tribe_status": pl.Utf8,
+            "tribe_status_label": pl.Utf8,
+            "customers": pl.Int64,
+            "population_share_pct": pl.Float64,
+            "total_spend_ratio_vs_rest": pl.Float64,
+            "visit_frequency_ratio_vs_rest": pl.Float64,
+            "basket_value_ratio_vs_rest": pl.Float64,
+            "promo_sensitivity_ratio_vs_rest": pl.Float64,
+            "behavioral_signature": pl.Utf8,
+            "promo_loyalty_recency": pl.Utf8,
+            "readiness_caveat": pl.Utf8,
+            "recommended_use": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_soft_audience_opportunities() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "target_tribe_id": pl.Int64,
+            "customer_count": pl.Int64,
+            "mean_top_affinity": pl.Float64,
+            "p10_top_affinity": pl.Float64,
+            "mean_affinity_margin": pl.Float64,
+            "most_common_second_tribe_id": pl.Int64,
+            "remaining_customer_share_pct": pl.Float64,
+            "audience_label": pl.Utf8,
+            "assignment_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "target_tribe_name": pl.Utf8,
+            "target_tribe_status": pl.Utf8,
+            "target_tribe_status_label": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_relationship_atlas() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_a_id": pl.Int64,
+            "tribe_a_name": pl.Utf8,
+            "tribe_a_status": pl.Utf8,
+            "tribe_a_status_label": pl.Utf8,
+            "tribe_b_id": pl.Int64,
+            "tribe_b_name": pl.Utf8,
+            "tribe_b_status": pl.Utf8,
+            "tribe_b_status_label": pl.Utf8,
+            "relationship_scope": pl.Utf8,
+            "relationship_type": pl.Utf8,
+            "product_overlap_score": pl.Float64,
+            "behavior_similarity_score": pl.Float64,
+            "relationship_score": pl.Float64,
+            "similarity_evidence": pl.Utf8,
+            "difference_evidence": pl.Utf8,
+            "commercial_interpretation": pl.Utf8,
+            "campaign_guidance": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_soft_audience_activation_customers() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "cliente": pl.Utf8,
+            "official_tribe_id": pl.Int64,
+            "target_tribe_id": pl.Int64,
+            "target_tribe_name": pl.Utf8,
+            "target_tribe_status": pl.Utf8,
+            "target_tribe_status_label": pl.Utf8,
+            "top_affinity_score": pl.Float64,
+            "second_tribe_id": pl.Int64,
+            "second_affinity_score": pl.Float64,
+            "affinity_margin": pl.Float64,
+            "affinity_confidence_band": pl.Utf8,
+            "audience_label": pl.Utf8,
+            "assignment_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+        }
+    )
+
+
+def _stage7_soft_audience_activation_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    schema = _empty_stage7_soft_audience_activation_customers().schema
+    if frame.is_empty():
+        return pl.DataFrame(schema=schema)
+    for column, dtype in schema.items():
+        if column not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=dtype).alias(column))
+        else:
+            frame = frame.with_columns(pl.col(column).cast(dtype, strict=False).alias(column))
+    return frame.select(list(schema))
+
+
+def _empty_stage7_campaign_playbook() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_id": pl.Int64,
+            "tribe_name": pl.Utf8,
+            "audience_definition": pl.Utf8,
+            "targeting_hook": pl.Utf8,
+            "offer_idea": pl.Utf8,
+            "recommended_channel": pl.Utf8,
+            "suppression_rules": pl.Utf8,
+            "holdout_control_design": pl.Utf8,
+            "primary_kpi": pl.Utf8,
+            "secondary_kpis": pl.Utf8,
+            "expected_commercial_lever": pl.Utf8,
+            "risk_caveat": pl.Utf8,
+            "evidence_basis": pl.Utf8,
+        }
+    )
+
+
+def _stage7_campaign_playbook_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
+    schema = _empty_stage7_campaign_playbook().schema
+    if not rows:
+        return pl.DataFrame(schema=schema)
+    frame = pl.from_dicts(rows, infer_schema_length=None)
+    for column, dtype in schema.items():
+        if column not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=dtype).alias(column))
+        else:
+            frame = frame.with_columns(pl.col(column).cast(dtype, strict=False).alias(column))
+    return frame.select(list(schema)).sort("tribe_id")
+
+
+def _empty_stage7_readiness() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "check_id": pl.Utf8,
+            "check_area": pl.Utf8,
+            "severity": pl.Utf8,
+            "status": pl.Utf8,
+            "issue_count": pl.Int64,
+            "affected_items": pl.Utf8,
+            "details": pl.Utf8,
+            "recommended_action": pl.Utf8,
+        }
+    )
+
+
+def _stage7_readiness_frame(rows: list[dict[str, Any]]) -> pl.DataFrame:
+    schema = _empty_stage7_readiness().schema
+    if not rows:
+        return pl.DataFrame(schema=schema)
+    frame = pl.from_dicts(rows, infer_schema_length=None)
+    for column, dtype in schema.items():
+        if column not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=dtype).alias(column))
+        else:
+            frame = frame.with_columns(pl.col(column).cast(dtype, strict=False).alias(column))
+    return frame.select(list(schema))
+
+
+def _coerce_table(value: str | Path | pl.DataFrame | None) -> pl.DataFrame:
+    if value is None:
+        return pl.DataFrame()
+    if isinstance(value, pl.DataFrame):
+        return value
+    path = Path(value)
+    if not path.exists():
+        return pl.DataFrame()
+    if path.suffix.lower() == ".parquet":
+        return pl.read_parquet(path)
+    return pl.read_csv(path)
+
+
+def _stage7_frame(rows: list[dict[str, Any]], schema: dict[str, Any], sort_by: list[str] | None = None) -> pl.DataFrame:
+    if not rows:
+        return pl.DataFrame(schema=schema)
+    frame = pl.from_dicts(rows, infer_schema_length=None)
+    for column, dtype in schema.items():
+        if column not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=dtype).alias(column))
+        else:
+            frame = frame.with_columns(pl.col(column).cast(dtype, strict=False).alias(column))
+    frame = frame.select(list(schema))
+    sort_columns = [column for column in (sort_by or []) if column in frame.columns]
+    return frame.sort(sort_columns) if sort_columns else frame
+
+
+def _stage7_enriched_profile_rows(
+    profiles: pl.DataFrame,
+    distribution_metrics: dict[int, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    rows = []
+    for row in profiles.iter_rows(named=True):
+        tribe_id = int(row.get("tribe_id") or 0)
+        metrics = _stage7_distribution_for_tribe(distribution_metrics, tribe_id)
+        rows.append(_stage7_row_with_distribution_metrics(row, metrics))
+    return rows
+
+
+def _empty_stage7_tribe_promotion_report() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "story_order": pl.Int64,
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "tribe_status": pl.Utf8,
+            "tribe_status_label": pl.Utf8,
+            "stage6_profile_readiness": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "name_source": pl.Utf8,
+            "legacy_name_source": pl.Utf8,
+            "customers": pl.Int64,
+            "population_share_pct": pl.Float64,
+            "mean_assignment_confidence": pl.Float64,
+            "p10_assignment_confidence": pl.Float64,
+            "jitter_label_recovery_accuracy": pl.Float64,
+            "statistical_validity_gate": pl.Utf8,
+            "reach_gate": pl.Utf8,
+            "distinctiveness_gate": pl.Utf8,
+            "business_relevance_gate": pl.Utf8,
+            "naming_quality_gate": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "readiness_caveat": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_tribe_identity_dossier() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "customers": pl.Int64,
+            "defining_products": pl.Utf8,
+            "defining_categories": pl.Utf8,
+            "high_lift_items": pl.Utf8,
+            "high_reach_items": pl.Utf8,
+            "basket_characteristics": pl.Utf8,
+            "purchase_mission": pl.Utf8,
+            "behavioral_signals": pl.Utf8,
+            "evidence_caveat": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_tribe_handbook() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "customers": pl.Int64,
+            "executive_summary": pl.Utf8,
+            "supporting_evidence": pl.Utf8,
+            "behavior_summary": pl.Utf8,
+            "shopping_mission": pl.Utf8,
+            "name_quality_issue": pl.Utf8,
+            "caveat": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_customer_coverage_report() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "segment_id": pl.Utf8,
+            "segment_name": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "customers": pl.Int64,
+            "share_of_total_pct": pl.Float64,
+            "counts_toward_population_total": pl.Boolean,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_segment_action_playbook() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "segment_id": pl.Utf8,
+            "segment_name": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "validation_tier": pl.Utf8,
+            "technical_name": pl.Utf8,
+            "business_name": pl.Utf8,
+            "legacy_tribe_name": pl.Utf8,
+            "business_confidence": pl.Utf8,
+            "validation_blockers": pl.Utf8,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+            "marketing_actions": pl.Utf8,
+            "merchandising_actions": pl.Utf8,
+            "cross_sell_opportunities": pl.Utf8,
+            "retention_opportunities": pl.Utf8,
+            "exclusions": pl.Utf8,
+            "primary_kpi": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_segmentation_framework() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "hierarchy_level": pl.Int64,
+            "parent_segment": pl.Utf8,
+            "segment_id": pl.Utf8,
+            "segment_name": pl.Utf8,
+            "coverage_group": pl.Utf8,
+            "segment_role": pl.Utf8,
+            "tribe_id": pl.Int64,
+            "promotion_decision": pl.Utf8,
+            "customers": pl.Int64,
+            "share_of_total_pct": pl.Float64,
+            "counts_toward_population_total": pl.Boolean,
+            "membership_policy": pl.Utf8,
+            "recommended_use": pl.Utf8,
+        }
+    )
+
+
+def _empty_stage7_final_segmentation_report() -> pl.DataFrame:
+    return pl.DataFrame(
+        schema={
+            "question_id": pl.Utf8,
+            "executive_question": pl.Utf8,
+            "answer": pl.Utf8,
+            "supporting_artifact": pl.Utf8,
+        }
+    )
+
+
+def _stage7_simple_report_markdown(title: str, intro: str, table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return f"# {title}\n\n{intro}\n\nNo rows were produced.\n"
+    return f"# {title}\n\n{intro}\n\n{_markdown_table(table)}\n"
+
+
+def _stage7_customer_coverage_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.4 Customer Coverage Report\n\nNo customer coverage rows were produced.\n"
+    additive = (
+        table.filter(pl.col("counts_toward_population_total") == True)
+        if "counts_toward_population_total" in table.columns
+        else table
+    )
+    additive_customers = int(additive["customers"].sum()) if "customers" in additive.columns and not additive.is_empty() else 0
+    lines = [
+        "# Stage 7.4 Customer Coverage Report",
+        "",
+        f"Additive population coverage rows account for {additive_customers:,} customers. Expansion audiences are shown separately and are not additive because they overlap remaining customers.",
+        "",
+        _markdown_table(table),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _stage7_final_segmentation_report_markdown(table: pl.DataFrame) -> str:
+    lines = ["# Stage 7.7 Final Segmentation Report", ""]
+    if table.is_empty():
+        lines.append("No executive synthesis rows were produced.")
+        return "\n".join(lines) + "\n"
+    for row in table.iter_rows(named=True):
+        lines.extend(
+            [
+                f"## {row.get('executive_question')}",
+                "",
+                str(row.get("answer") or "No answer available."),
+                "",
+                f"Supporting artifact: {row.get('supporting_artifact')}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _stage7_decision_sort(decision: str | None) -> int:
+    return {"promoted": 0, "review": 1, "rejected": 2}.get(str(decision or ""), 9)
+
+
+def _stage7_remaining_coverage_group(segment_id: Any) -> str:
+    value = str(segment_id or "")
+    if "near_tribe" in value:
+        return "near_tribe_customers"
+    if "bridge" in value:
+        return "bridge_customers"
+    if "broad" in value or "generalist" in value:
+        return "generalist_or_broad_basket_customers"
+    if "sparse" in value:
+        return "sparse_customers"
+    if "long_tail" in value or "unclear" in value:
+        return "long_tail_customers"
+    return "remaining_customers"
+
+
+def _stage7_action_context_from_profile(
+    row: dict[str, Any],
+    name_fields: dict[str, str],
+    *,
+    cfg: PipelineConfig,
+) -> dict[str, Any]:
+    delivery = _stage7_delivery_product_signal(row, cfg) or {}
+    products = _top_card_products(row, limit=1)
+    ratios = _fixed_behavior_ratios(row)
+    metrics = _empty_stage7_distribution_metrics()
+    return {
+        "tribe_id": row.get("tribe_id"),
+        "tribe_name": name_fields["business_name"],
+        "business_name": name_fields["business_name"],
+        "top_product": delivery.get("label") or (products[0]["product"] if products else None),
+        "delivery_product": delivery.get("label"),
+        "primary_theme": _primary_theme_context(row, cfg=cfg).get("primary_theme"),
+        "promo_sensitivity_ratio_vs_rest": ratios.get("avg_promo_share"),
+        "total_spend_ratio_vs_rest": ratios.get("avg_total_spend"),
+        "active_customer_pct": metrics.get("active_customer_pct"),
+        "at_risk_customer_pct": metrics.get("at_risk_customer_pct"),
+    }
+
+
+def _remaining_segment_action_text(row: dict[str, Any]) -> dict[str, str]:
+    segment_id = str(row.get("segment_id") or "")
+    recommended = str(row.get("recommended_action") or row.get("recommended_use") or "Use as a descriptive planning segment.")
+    if "near_tribe" in segment_id:
+        return {
+            "marketing_actions": "Test soft activation against the closest tribe with a strict holdout.",
+            "merchandising_actions": "Use adjacent products from the closest tribe to build low-risk trial bundles.",
+            "cross_sell_opportunities": "Cross-sell into the nearest promoted tribe mission.",
+            "retention_opportunities": recommended,
+            "exclusions": "Do not count as official tribe members; suppress customers already in a core tribe.",
+            "primary_kpi": "Incremental conversion into target mission products.",
+        }
+    if "bridge" in segment_id:
+        return {
+            "marketing_actions": "Use mixed-mission recommendations and avoid forcing a single tribe message.",
+            "merchandising_actions": "Promote bridge baskets that connect the two strongest affinities.",
+            "cross_sell_opportunities": "Test bundles spanning both closest tribes.",
+            "retention_opportunities": recommended,
+            "exclusions": "Exclude from narrow single-tribe campaigns unless affinity margin improves.",
+            "primary_kpi": "Basket breadth and incremental revenue.",
+        }
+    if "sparse" in segment_id:
+        return {
+            "marketing_actions": "Prioritize data gathering, onboarding offers, and low-frequency reactivation.",
+            "merchandising_actions": "Use broad entry-level offers rather than niche product hooks.",
+            "cross_sell_opportunities": "Recommend common replenishment and high-reach categories.",
+            "retention_opportunities": recommended,
+            "exclusions": "Suppress from high-specificity tribe campaigns until signal improves.",
+            "primary_kpi": "Repeat purchase rate and identifiable basket signal.",
+        }
+    return {
+        "marketing_actions": "Use broad personalized recommendations with conservative targeting.",
+        "merchandising_actions": "Merchandise common basket builders and test category-level offers.",
+        "cross_sell_opportunities": "Cross-sell high-reach adjacent categories based on observed basket breadth.",
+        "retention_opportunities": recommended,
+        "exclusions": "Avoid treating this segment as a core tribe or demographic identity.",
+        "primary_kpi": "Incremental revenue, basket size, and repeat visit rate.",
+    }
+
+
+def _stage7_segment_list(table: pl.DataFrame, label_column: str, value_column: str, limit: int = 10) -> str:
+    if table.is_empty() or label_column not in table.columns:
+        return "No rows available."
+    parts = []
+    for row in table.head(limit).iter_rows(named=True):
+        label = row.get(label_column)
+        if label_column not in {"segment_name", "business_name"}:
+            prefix = row.get("business_name") or row.get("segment_name")
+            if prefix:
+                label = f"{prefix}: {label}"
+        value = row.get(value_column) if value_column in table.columns else None
+        if value_column == "customers" and value is not None:
+            parts.append(f"{label} ({int(_safe_float(value) or 0):,} customers)")
+        elif value is not None and value_column not in {label_column, "customers"}:
+            parts.append(f"{value}: {label}")
+        else:
+            parts.append(str(label))
+    if table.height > limit:
+        parts.append(f"{table.height - limit} additional rows in the supporting artifact")
+    return "; ".join(parts)
+
+
+def _stage7_non_core_answer(coverage: pl.DataFrame, review: pl.DataFrame) -> str:
+    pieces = []
+    if not review.is_empty() and "customers" in review.columns:
+        pieces.append(f"{int(review['customers'].sum()):,} hard-assigned customers sit in review tribes.")
+    if not coverage.is_empty() and {"promotion_decision", "customers"}.issubset(set(coverage.columns)):
+        non_core = coverage.filter(
+            (pl.col("counts_toward_population_total") == True)
+            & (pl.col("promotion_decision") != "promoted")
+        )
+        if not non_core.is_empty():
+            pieces.append(_stage7_segment_list(non_core, "segment_name", "customers"))
+    return " ".join(pieces) if pieces else "No non-core customer rows were available."
+
+
+def _stage7_architecture_answer(coverage: pl.DataFrame) -> str:
+    if coverage.is_empty() or "coverage_group" not in coverage.columns:
+        return "No coverage architecture rows were available."
+    additive = (
+        coverage.filter(pl.col("counts_toward_population_total") == True)
+        if "counts_toward_population_total" in coverage.columns
+        else coverage
+    )
+    grouped = additive.group_by("coverage_group").agg(pl.col("customers").sum().alias("customers")).sort("coverage_group")
+    return _stage7_segment_list(grouped.rename({"coverage_group": "segment_name"}), "segment_name", "customers", limit=20)
+
+
+def _assignment_membership_frame(assignments_path: str | Path) -> pl.DataFrame:
+    scan = pl.scan_parquet(assignments_path)
+    columns = set(schema_names(scan))
+    selected = ["cliente", "tribe_id"]
+    if "assignment_confidence_score" in columns:
+        selected.append("assignment_confidence_score")
+    frame = collect_streaming(scan.select(selected).unique(subset=["cliente"], keep="first"))
+    if "assignment_confidence_score" not in frame.columns:
+        frame = frame.with_columns(pl.lit(None).cast(pl.Float64).alias("assignment_confidence_score"))
+    return frame.select(["cliente", "tribe_id", "assignment_confidence_score"])
+
+
+def _remaining_affinity_feature_columns(schema: Mapping[str, Any], *, cfg: PipelineConfig) -> list[str]:
+    preferred = [
+        "ticket_count",
+        "total_spend",
+        "avg_basket_value",
+        "promo_share",
+        "unique_products",
+        "unique_sectors",
+        "recency_days",
+        "frequency_per_30d",
+    ]
+    numeric = [column for column, dtype in schema.items() if column != "cliente" and dtype.is_numeric()]
+    ordered = [column for column in preferred if column in numeric]
+    ordered.extend(column for column in numeric if column not in ordered)
+    limit = int(cfg.get("profiling.remaining_affinity_max_features", 64))
+    return ordered[: max(limit, 1)]
+
+
+def _remaining_behavior_metric_columns(schema: Mapping[str, Any]) -> list[str]:
+    wanted = [
+        "ticket_count",
+        "total_spend",
+        "avg_basket_value",
+        "promo_share",
+        "unique_products",
+        "unique_sectors",
+        "recency_days",
+        "frequency_per_30d",
+        "avg_ticket_count",
+        "avg_total_spend",
+        "avg_promo_share",
+        "avg_unique_products",
+        "avg_unique_sectors",
+        "avg_recency_days",
+        "avg_frequency_per_30d",
+    ]
+    numeric = {column for column, dtype in schema.items() if column != "cliente" and dtype.is_numeric()}
+    return [column for column in wanted if column in numeric]
+
+
+def _numeric_matrix(frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
+    if not columns:
+        return np.empty((frame.height, 0), dtype=np.float32)
+    matrix = frame.select(columns).to_numpy().astype(np.float32, copy=False)
+    return np.nan_to_num(matrix, copy=False)
+
+
+def _standardized_matrix(frame: pl.DataFrame, columns: list[str], mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    return ((_numeric_matrix(frame, columns) - mean) / std).astype(np.float32, copy=False)
+
+
+def _l2_normalize(matrix: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.maximum(norms, 1e-6)
+
+
+def _affinity_confidence_band(top_score: float, margin: float, *, cfg: PipelineConfig) -> str:
+    high_score = float(cfg.get("profiling.soft_audience_min_affinity", 0.70))
+    high_margin = float(cfg.get("profiling.soft_audience_min_margin", 0.10))
+    medium_score = float(cfg.get("profiling.soft_audience_medium_affinity", 0.58))
+    medium_margin = float(cfg.get("profiling.soft_audience_medium_margin", 0.04))
+    if top_score >= high_score and margin >= high_margin:
+        return "high"
+    if top_score >= medium_score and margin >= medium_margin:
+        return "medium"
+    return "low"
+
+
+def _classify_remaining_customer_segments(frame: pl.DataFrame, *, cfg: PipelineConfig) -> pl.DataFrame:
+    if frame.is_empty():
+        return frame.with_columns(pl.lit("unclear_long_tail_customers").alias("segment_id"))
+    columns = set(frame.columns)
+    spend_col = _first_existing(columns, ["total_spend", "avg_total_spend"])
+    ticket_col = _first_existing(columns, ["ticket_count", "avg_ticket_count"])
+    unique_product_col = _first_existing(columns, ["unique_products", "avg_unique_products"])
+    unique_sector_col = _first_existing(columns, ["unique_sectors", "avg_unique_sectors"])
+
+    spend_p25 = _frame_quantile(frame, spend_col, 0.25)
+    spend_p80 = _frame_quantile(frame, spend_col, 0.80)
+    ticket_p25 = _frame_quantile(frame, ticket_col, 0.25)
+    unique_product_p25 = _frame_quantile(frame, unique_product_col, 0.25)
+    unique_product_p60 = _frame_quantile(frame, unique_product_col, 0.60)
+    unique_sector_p60 = _frame_quantile(frame, unique_sector_col, 0.60)
+
+    top_expr = pl.col("top_affinity_score") if "top_affinity_score" in columns else pl.lit(None)
+    margin_expr = pl.col("affinity_margin") if "affinity_margin" in columns else pl.lit(None)
+    bridge_expr = (top_expr >= float(cfg.get("profiling.remaining_bridge_min_affinity", 0.58))) & (
+        margin_expr <= float(cfg.get("profiling.remaining_bridge_max_margin", 0.06))
+    )
+    near_expr = (top_expr >= float(cfg.get("profiling.remaining_near_tribe_min_affinity", 0.70))) & (
+        margin_expr >= float(cfg.get("profiling.remaining_near_tribe_min_margin", 0.10))
+    )
+    high_value_expr = _threshold_expr(spend_col, spend_p80, ">=") & (
+        _threshold_expr(unique_product_col, unique_product_p60, ">=")
+        | _threshold_expr(unique_sector_col, unique_sector_p60, ">=")
+    )
+    sparse_expr = (
+        _threshold_expr(spend_col, spend_p25, "<=")
+        | _threshold_expr(ticket_col, ticket_p25, "<=")
+        | _threshold_expr(unique_product_col, unique_product_p25, "<=")
+    )
+    broad_expr = _threshold_expr(unique_product_col, unique_product_p60, ">=") | _threshold_expr(
+        unique_sector_col, unique_sector_p60, ">="
+    )
+    return frame.with_columns(
+        pl.when(bridge_expr)
+        .then(pl.lit("bridge_customers_between_tribes"))
+        .when(near_expr)
+        .then(pl.lit("near_tribe_fringe_customers"))
+        .when(high_value_expr)
+        .then(pl.lit("high_value_broad_basket_customers"))
+        .when(sparse_expr)
+        .then(pl.lit("sparse_low_signal_shoppers"))
+        .when(broad_expr)
+        .then(pl.lit("broad_generalist_shoppers"))
+        .otherwise(pl.lit("unclear_long_tail_customers"))
+        .alias("segment_id")
+    )
+
+
+def _remaining_segment_summary_rows(
+    classified: pl.DataFrame,
+    *,
+    total_customers: int,
+    remaining_customers: int,
+) -> list[dict[str, Any]]:
+    rows = []
+    columns = set(classified.columns)
+    metric_map = {
+        "avg_ticket_count": _first_existing(columns, ["ticket_count", "avg_ticket_count"]),
+        "avg_total_spend": _first_existing(columns, ["total_spend", "avg_total_spend"]),
+        "avg_basket_value": _first_existing(columns, ["avg_basket_value"]),
+        "avg_promo_share": _first_existing(columns, ["promo_share", "avg_promo_share"]),
+        "avg_unique_products": _first_existing(columns, ["unique_products", "avg_unique_products"]),
+        "avg_unique_sectors": _first_existing(columns, ["unique_sectors", "avg_unique_sectors"]),
+        "avg_recency_days": _first_existing(columns, ["recency_days", "avg_recency_days"]),
+        "avg_frequency_per_30d": _first_existing(columns, ["frequency_per_30d", "avg_frequency_per_30d"]),
+    }
+    for segment_id in _remaining_segment_order():
+        group = classified.filter(pl.col("segment_id") == segment_id)
+        if group.is_empty():
+            continue
+        definition = _remaining_segment_definition(segment_id)
+        closest_tribe = _mode_int(group, "top_tribe_id")
+        second_tribe = _mode_int(group, "second_tribe_id")
+        count = int(group["cliente"].n_unique()) if "cliente" in group.columns else int(group.height)
+        row = {
+            "segment_id": segment_id,
+            "segment_name": definition["name"],
+            "customer_count": count,
+            "share_of_remaining_pct": round(100.0 * count / max(remaining_customers, 1), 3),
+            "share_of_total_pct": round(100.0 * count / max(total_customers, 1), 3),
+            "closest_tribe_id": closest_tribe,
+            "closest_tribe_affinity_mean": _mean_or_none(group, "top_affinity_score"),
+            "second_tribe_id": second_tribe,
+            "affinity_margin_mean": _mean_or_none(group, "affinity_margin"),
+            "product_theme_signal": definition["signal"],
+            "targetability": definition["targetability"],
+            "likely_reason_for_no_hard_cluster": definition["reason"],
+            "recommended_action": definition["action"],
+        }
+        for output_col, source_col in metric_map.items():
+            row[output_col] = _mean_or_none(group, source_col)
+        rows.append(row)
+    return rows
+
+
+def _remaining_segment_order() -> list[str]:
+    return [
+        "near_tribe_fringe_customers",
+        "bridge_customers_between_tribes",
+        "high_value_broad_basket_customers",
+        "broad_generalist_shoppers",
+        "sparse_low_signal_shoppers",
+        "unclear_long_tail_customers",
+    ]
+
+
+def _remaining_segment_definition(segment_id: str) -> dict[str, str]:
+    definitions = {
+        "near_tribe_fringe_customers": {
+            "name": "Near-tribe fringe customers",
+            "signal": "Behaviorally close to one hard tribe, but not dense enough for official membership.",
+            "targetability": "high",
+            "reason": "Close to a core tribe but outside the dense HDBSCAN region.",
+            "action": "Use as a measured expansion audience for the closest promoted tribe.",
+        },
+        "bridge_customers_between_tribes": {
+            "name": "Bridge customers between tribes",
+            "signal": "Affinity is split across multiple tribes.",
+            "targetability": "medium",
+            "reason": "Mixed purchase missions blur the boundary between tribes.",
+            "action": "Avoid exclusive tribe messaging; test broader mission-led offers.",
+        },
+        "high_value_broad_basket_customers": {
+            "name": "High-value broad-basket customers",
+            "signal": "High spend plus broad product or sector coverage.",
+            "targetability": "high",
+            "reason": "Large baskets span multiple missions rather than one tight tribe.",
+            "action": "Prioritize retention, premium cross-sell, and basket-building mechanics.",
+        },
+        "broad_generalist_shoppers": {
+            "name": "Broad generalist shoppers",
+            "signal": "Wide product or sector variety without one dominant tribe signature.",
+            "targetability": "medium",
+            "reason": "Generalist baskets dilute product-lift and density signals.",
+            "action": "Use lifecycle, store, and basket-size triggers instead of narrow tribe messaging.",
+        },
+        "sparse_low_signal_shoppers": {
+            "name": "Sparse or low-signal shoppers",
+            "signal": "Low spend, low visits, or few unique products.",
+            "targetability": "low",
+            "reason": "Too little behavioral evidence for a stable hard cluster.",
+            "action": "Use onboarding, reactivation, and data-enrichment journeys before tribe targeting.",
+        },
+        "unclear_long_tail_customers": {
+            "name": "Unclear long-tail customers",
+            "signal": "No strong affinity or simple behavioral rule explains the customer.",
+            "targetability": "low",
+            "reason": "Long-tail behavior remains heterogeneous after the hard clustering passes.",
+            "action": "Monitor after more transactions; avoid forcing into core tribe reporting.",
+        },
+    }
+    return definitions.get(segment_id, definitions["unclear_long_tail_customers"])
+
+
+def _remaining_customer_segments_markdown(
+    table: pl.DataFrame,
+    *,
+    title: str = "# Stage 6.7 Remaining Customer Segments",
+) -> str:
+    if table.is_empty():
+        return f"{title}\n\nNo remaining customers were present after hard-cluster assignment.\n"
+    total = int(table["customer_count"].sum()) if "customer_count" in table.columns else 0
+    return (
+        f"{title}\n\n"
+        f"Remaining customers summarized: {total:,}. These are descriptive segments and do not alter hard tribe membership.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_all_tribe_profiles_markdown(table: pl.DataFrame) -> str:
+    return (
+        "# Stage 7.1 All-Tribe Evidence Profiles\n\n"
+        "Includes final promoted tribes and potential review tribes. Use `tribe_status` to separate final_strong, final_usable, and potential_review rows.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_promoted_validation_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.2A Promoted Tribe Validation\n\nNo promoted tribes were present.\n"
+    return (
+        "# Stage 7.2A Promoted Tribe Validation\n\n"
+        "Final promoted tribes are split into `final_strong` and `final_usable`. Both are stakeholder-facing tribes, but usable tribes carry a stability caveat.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_review_validation_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.2B Review Tribe Validation\n\nNo potential review tribes were present.\n"
+    return (
+        "# Stage 7.2B Review Tribe Validation\n\n"
+        "Review tribes are potential behavioral pockets. They have evidence profiles, but they are not final validated tribes and should be used only for exploration or cautious tests.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_review_audit_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.1 Review Tribe Audit\n\nNo review-only tribes were present.\n"
+    return (
+        "# Stage 7.1 Review Tribe Audit\n\n"
+        "These potential tribes retain evidence profiles but are not promoted into the final stakeholder-ready tribe set.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_all_tribe_product_identity_markdown(table: pl.DataFrame) -> str:
+    return (
+        "# Stage 7.3 All-Tribe Product Identity\n\n"
+        "Shows what each retained tribe buys and which products/themes distinguish it. Review tribes are labeled as potential_review.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_all_tribe_behavior_markdown(table: pl.DataFrame) -> str:
+    return (
+        "# Stage 7.4 All-Tribe Behavioral Differentiation\n\n"
+        "Compares retained tribes on spend, visit, basket, and promotion behavior. Review tribes are included as potential tribes.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_persona_deep_dives_markdown(table: pl.DataFrame) -> str:
+    lines = ["# Stage 7.5 All-Tribe Dossiers", ""]
+    if table.is_empty():
+        lines.append("No tribe dossiers were available.")
+        return "\n".join(lines) + "\n"
+    for row in table.iter_rows(named=True):
+        tribe_status = row.get("tribe_status") or "potential_review"
+        status_label = row.get("tribe_status_label") or _stage7_status_label(tribe_status)
+        lines.extend(
+            [
+                f"## T{int(row['tribe_id'])}: {row.get('tribe_name')} [{status_label}]",
+                "",
+                f"**Recommended use:** {row.get('recommended_use')}",
+                "",
+                f"**Who they are:** {row.get('who_is_the_tribe')}",
+                "",
+                f"**Behavior:** {row.get('defining_behavior')}",
+                "",
+                f"**Evidence:** {row.get('distinctive_products')}",
+                "",
+                f"**Broad-reach products:** {row.get('broad_reach_products')}",
+                "",
+                f"**Mission:** {row.get('shopping_mission')}",
+                "",
+                f"**Commercial meaning:** {row.get('revenue_lever')}",
+                "",
+                f"**Nearest related tribe:** {row.get('nearest_related_tribe') or 'Not available'} ({row.get('nearest_relationship_type') or 'no relationship label'}, score={row.get('nearest_relationship_score')})",
+                "",
+                f"**Clearest differentiator:** {row.get('clearest_differentiator') or 'Not available'}",
+                "",
+                f"**Targeting idea:** {row.get('targeting_idea')}",
+                "",
+                f"**Confidence:** {row.get('confidence_level')}",
+                "",
+                f"**Caveat:** {row.get('readiness_caveat')}; {row.get('promotion_blocker')}; {row.get('evidence_caveat')}",
+                "",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _stage7_relationship_atlas_markdown(table: pl.DataFrame) -> str:
+    return (
+        "# Stage 7.8 All-Tribe Relationship Atlas\n\n"
+        "Pairwise tribe relationships compare product overlap, behavior similarity, and mission/theme context. Rows marked includes_potential_review contain at least one potential review tribe.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_campaign_playbook_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.9 Final-Only Campaign Playbook\n\nNo promoted tribes were available for campaign planning.\n"
+    return (
+        "# Stage 7.9 Final-Only Campaign Playbook\n\n"
+        "Campaign guidance is final-promoted-tribe only. Potential review tribes may appear in soft-audience testing, but not in this final playbook.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _stage7_stakeholder_readiness_markdown(table: pl.DataFrame) -> str:
+    if table.is_empty():
+        return "# Stage 7.9 Stakeholder Delivery Readiness\n\nNo readiness checks were produced.\n"
+    overall = table.filter(pl.col("check_id") == "overall_delivery_readiness")
+    status = overall[0, "status"] if not overall.is_empty() else "unknown"
+    return (
+        "# Stage 7.9 Stakeholder Delivery Readiness\n\n"
+        f"Overall status: **{status}**.\n\n"
+        + _markdown_table(table)
+        + "\n"
+    )
+
+
+def _readiness_row(
+    check_id: str,
+    check_area: str,
+    *,
+    severity: str,
+    issue_count: int,
+    affected_items: list[str] | str,
+    details: str,
+    recommended_action: str,
+    warn_only: bool = False,
+) -> dict[str, Any]:
+    if issue_count <= 0:
+        status = "pass"
+    elif warn_only or severity == "warning":
+        status = "warn"
+        severity = "warning"
+    else:
+        status = "fail"
+    if isinstance(affected_items, list):
+        affected = "; ".join(str(item) for item in affected_items[:25]) if affected_items else "none"
+    else:
+        affected = affected_items
+    return {
+        "check_id": check_id,
+        "check_area": check_area,
+        "severity": severity,
+        "status": status,
+        "issue_count": int(issue_count),
+        "affected_items": affected,
+        "details": details,
+        "recommended_action": recommended_action if issue_count else "No action required.",
+    }
+
+
+def _readiness_name_quality_row(index: pl.DataFrame) -> dict[str, Any]:
+    if index.is_empty() or "tribe_name" not in index.columns:
+        return _readiness_row(
+            "tribe_name_quality",
+            "tribe naming",
+            severity="critical",
+            issue_count=1,
+            affected_items="final_index",
+            details="No promoted tribe names were available.",
+            recommended_action="Generate Stage 7 final index before stakeholder submission.",
+        )
+    names = [str(name or "").strip() for name in index["tribe_name"].to_list()]
+    duplicate_names = sorted({name for name in names if name and names.count(name) > 1})
+    bad_names = [
+        name
+        for name in names
+        if not name
+        or _is_generic_tribe_name(name)
+        or _is_sku_like_name(name)
+        or len(re.findall(r"[A-Za-z]+", name)) > 7
+    ]
+    critical_items = sorted(set(duplicate_names + bad_names))
+    if critical_items:
+        return _readiness_row(
+            "tribe_name_quality",
+            "tribe naming",
+            severity="critical",
+            issue_count=len(critical_items),
+            affected_items=critical_items,
+            details="Some promoted tribe names are duplicate, generic, SKU-like, blank, or too long.",
+            recommended_action="Rename affected tribes with unique evidence-led business labels before presenting.",
+        )
+    return _readiness_row(
+        "tribe_name_quality",
+        "tribe naming",
+        severity="warning",
+        issue_count=0,
+        affected_items=[],
+        details="Promoted tribe names must be unique, non-generic, readable, and not raw SKU/code labels.",
+        recommended_action="Review tribe names before final presentation.",
+        warn_only=True,
+    )
+
+
+def _readiness_product_evidence_row(index: pl.DataFrame, *, cfg: PipelineConfig) -> dict[str, Any]:
+    threshold = float(cfg.get("profiling.strong_product_lift_threshold", 1.5))
+    min_reach = float(cfg.get("profiling.stage7_delivery_readiness.min_product_reach_pct", 1.0))
+    min_customers = int(cfg.get("profiling.stage7_delivery_readiness.min_product_customer_count", 50))
+    failures = []
+    caveats = []
+    for row in index.iter_rows(named=True):
+        tribe = f"T{int(row.get('tribe_id') or 0)} {row.get('tribe_name')}"
+        signal = _stage7_delivery_product_signal(row, cfg)
+        hook = row.get("actionability_proof") or (signal or {}).get("label") or row.get("top_product")
+        if not hook:
+            failures.append(tribe)
+        elif not signal:
+            caveats.append(tribe)
+    if failures:
+        return _readiness_row(
+            "promoted_tribe_product_evidence",
+            "product evidence",
+            severity="critical",
+            issue_count=len(failures),
+            affected_items=failures,
+            details=(
+                f"Promoted tribes must have a targeting hook and at least one lifted product signal. "
+                f"The delivery breadth benchmark is lift >= {threshold:.2f}, reach >= {min_reach:.1f}%, "
+                f"and support >= {min_customers} customers."
+            ),
+            recommended_action="Add product evidence or hold affected tribes for review before stakeholder delivery.",
+        )
+    return _readiness_row(
+        "promoted_tribe_product_evidence",
+        "product evidence",
+        severity="warning",
+        issue_count=len(caveats),
+        affected_items=caveats,
+        details=(
+            f"Promoted tribes have product hooks. Rows listed here have niche hooks below the delivery breadth "
+            f"benchmark of lift >= {threshold:.2f}, reach >= {min_reach:.1f}%, and support >= {min_customers} customers."
+        ),
+        recommended_action="Keep the reach caveat visible in cards/dossiers or hold niche tribes for additional review.",
+        warn_only=True,
+    )
+
+
+def _readiness_persona_specificity_row(profiles: pl.DataFrame, *, cfg: PipelineConfig) -> dict[str, Any]:
+    if profiles.is_empty():
+        return _readiness_row(
+            "persona_specificity",
+            "persona prose",
+            severity="critical",
+            issue_count=1,
+            affected_items="all_tribe_profiles",
+            details="No all-tribe profile rows were available.",
+            recommended_action="Run Stage 7.1 and Stage 7.2 before delivery.",
+        )
+    min_words = int(cfg.get("profiling.stage7_delivery_readiness.min_persona_word_count", 45))
+    failures = []
+    promoted = profiles.filter(pl.col("promotion_status") == "promoted") if "promotion_status" in profiles.columns else profiles
+    for row in promoted.iter_rows(named=True):
+        text = " ".join(
+            str(row.get(column) or "")
+            for column in [
+                "who_is_the_tribe",
+                "defining_behavior",
+                "shopping_mission",
+                "targeting_idea",
+                "revenue_lever",
+            ]
+        )
+        if _word_count(text) < min_words or _looks_like_fallback_persona(text):
+            failures.append(f"T{int(row.get('tribe_id') or 0)} {row.get('tribe_name')}")
+    return _readiness_row(
+        "persona_specificity",
+        "persona prose",
+        severity="critical",
+        issue_count=len(failures),
+        affected_items=failures,
+        details=f"Promoted persona prose must be specific and at least {min_words} words across core fields.",
+        recommended_action="Strengthen persona wording with product, behavior, mission, targeting, and caveat evidence.",
+    )
+
+
+def _readiness_remaining_customer_row(remaining: pl.DataFrame, *, cfg: PipelineConfig) -> dict[str, Any]:
+    if remaining.is_empty():
+        return _readiness_row(
+            "remaining_customer_segments",
+            "remaining customers",
+            severity="warning",
+            issue_count=0,
+            affected_items="none",
+            details="No remaining customers were present or no remaining-customer segment table was produced.",
+            recommended_action="No action required.",
+            warn_only=True,
+        )
+    max_unclear = float(cfg.get("profiling.stage7_delivery_readiness.max_unclear_long_tail_share_pct", 50.0))
+    max_single = float(cfg.get("profiling.stage7_delivery_readiness.max_single_remaining_segment_share_pct", 80.0))
+    unclear_share = 0.0
+    if {"segment_id", "share_of_remaining_pct"}.issubset(set(remaining.columns)):
+        unclear = remaining.filter(pl.col("segment_id") == "unclear_long_tail_customers")
+        unclear_share = float(unclear[0, "share_of_remaining_pct"]) if not unclear.is_empty() else 0.0
+    single_share = (
+        float(remaining["share_of_remaining_pct"].max())
+        if "share_of_remaining_pct" in remaining.columns and not remaining.is_empty()
+        else 0.0
+    )
+    issues = []
+    if unclear_share > max_unclear:
+        issues.append(f"unclear_long_tail={unclear_share:.1f}%")
+    if single_share > max_single:
+        issues.append(f"single_segment={single_share:.1f}%")
+    return _readiness_row(
+        "remaining_customer_segments",
+        "remaining customers",
+        severity="critical",
+        issue_count=len(issues),
+        affected_items=issues,
+        details=(
+            f"Unclear long-tail share must be <= {max_unclear:.1f}% and no single remaining segment should exceed "
+            f"{max_single:.1f}%."
+        ),
+        recommended_action="Review Stage 6.7 segmentation thresholds or add more business explanation for remaining customers.",
+    )
+
+
+def _readiness_soft_audience_activation_row(
+    soft: pl.DataFrame,
+    activation: pl.DataFrame,
+    *,
+    cfg: PipelineConfig,
+) -> dict[str, Any]:
+    required = bool(cfg.get("profiling.stage7_delivery_readiness.activation_customer_export_required", True))
+    if not required or soft.is_empty():
+        return _readiness_row(
+            "soft_audience_activation_export",
+            "soft audiences",
+            severity="warning",
+            issue_count=0,
+            affected_items="none",
+            details="No high-confidence soft audience aggregate rows require activation export.",
+            recommended_action="No action required.",
+            warn_only=True,
+        )
+    expected = int(soft["customer_count"].sum()) if "customer_count" in soft.columns else 0
+    actual = int(activation["cliente"].n_unique()) if not activation.is_empty() and "cliente" in activation.columns else 0
+    issue = expected > 0 and actual <= 0
+    return _readiness_row(
+        "soft_audience_activation_export",
+        "soft audiences",
+        severity="critical",
+        issue_count=1 if issue else 0,
+        affected_items="activation_customer_export" if issue else "none",
+        details=f"Soft audience aggregates imply {expected:,} customers; activation export contains {actual:,}.",
+        recommended_action="Write customer-level soft audience activation rows or mark activation export as not required.",
+    )
+
+
+def _readiness_campaign_playbook_row(index: pl.DataFrame, playbook: pl.DataFrame) -> dict[str, Any]:
+    required_columns = [
+        "offer_idea",
+        "recommended_channel",
+        "suppression_rules",
+        "holdout_control_design",
+        "primary_kpi",
+        "expected_commercial_lever",
+        "risk_caveat",
+    ]
+    promoted_ids = set(index["tribe_id"].to_list()) if not index.is_empty() and "tribe_id" in index.columns else set()
+    playbook_ids = set(playbook["tribe_id"].to_list()) if not playbook.is_empty() and "tribe_id" in playbook.columns else set()
+    failures = [f"T{tribe_id}" for tribe_id in sorted(promoted_ids - playbook_ids)]
+    for row in playbook.iter_rows(named=True):
+        missing = [column for column in required_columns if not str(row.get(column) or "").strip()]
+        if missing:
+            failures.append(f"T{int(row.get('tribe_id') or 0)} missing {','.join(missing)}")
+    return _readiness_row(
+        "campaign_playbook_completeness",
+        "campaign playbook",
+        severity="critical",
+        issue_count=len(failures),
+        affected_items=failures,
+        details="Every promoted tribe needs offer, channel, suppression, holdout, KPI, lever, and caveat fields.",
+        recommended_action="Complete the campaign playbook before stakeholder handoff.",
+    )
+
+
+def _is_generic_tribe_name(name: str) -> bool:
+    lowered = name.strip().lower()
+    return bool(re.fullmatch(r"tribe\s+\d+", lowered)) or lowered in {"unknown", "n/a", "none", "buyers"}
+
+
+def _is_sku_like_name(name: str) -> bool:
+    compact = re.sub(r"[^A-Za-z0-9]", "", name)
+    if len(compact) >= 8 and sum(ch.isdigit() for ch in compact) >= 3:
+        return True
+    return bool(re.search(r"\b(sku|idarticu|ean|ref|code)\b", name, flags=re.IGNORECASE))
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", text or ""))
+
+
+def _looks_like_fallback_persona(text: str) -> bool:
+    lowered = (text or "").lower()
+    fallback_phrases = [
+        "until stronger product hooks are available",
+        "purchase behavior only",
+        "n/a",
+        "no tribe personas were available",
+    ]
+    return any(phrase in lowered for phrase in fallback_phrases)
+
+
+def _campaign_offer_idea(row: dict[str, Any]) -> str:
+    top_product = row.get("delivery_product") or row.get("top_product") or row.get("primary_theme") or "core basket products"
+    promo_ratio = _safe_float(row.get("promo_sensitivity_ratio_vs_rest"))
+    spend_ratio = _safe_float(row.get("total_spend_ratio_vs_rest"))
+    if promo_ratio is not None and promo_ratio >= 1.10:
+        return f"Personalized value bundle anchored on {top_product}; protect margin with targeted eligibility."
+    if spend_ratio is not None and spend_ratio >= 1.10:
+        return f"Premium replenishment or cross-sell bundle anchored on {top_product}."
+    return f"Mission-led recommendation set anchored on {top_product} with adjacent basket add-ons."
+
+
+def _campaign_channel(row: dict[str, Any]) -> str:
+    active = _safe_float(row.get("active_customer_pct"))
+    at_risk = _safe_float(row.get("at_risk_customer_pct"))
+    if at_risk is not None and at_risk >= 30.0:
+        return "CRM/email plus app push reactivation sequence."
+    if active is not None and active >= 60.0:
+        return "App push, loyalty app placement, and checkout coupon."
+    return "Email/CRM test with app retargeting for responders."
+
+
+def _campaign_suppression_rules(row: dict[str, Any]) -> str:
+    return (
+        "Suppress customers already targeted by similar-product missions, recent purchasers of the exact offer item, "
+        "lapsed customers requiring reactivation, and anyone in campaign control groups."
+    )
+
+
+def _campaign_primary_kpi(row: dict[str, Any]) -> str:
+    spend_ratio = _safe_float(row.get("total_spend_ratio_vs_rest"))
+    frequency_ratio = _safe_float(row.get("visit_frequency_ratio_vs_rest"))
+    if spend_ratio is not None and spend_ratio >= 1.10:
+        return "Incremental revenue per targeted customer."
+    if frequency_ratio is not None and frequency_ratio < 1.0:
+        return "Incremental visit frequency."
+    return "Incremental basket value and product category penetration."
+
+
+def _campaign_expected_lever(row: dict[str, Any]) -> str:
+    spend_ratio = _safe_float(row.get("total_spend_ratio_vs_rest"))
+    promo_ratio = _safe_float(row.get("promo_sensitivity_ratio_vs_rest"))
+    if spend_ratio is not None and spend_ratio >= 1.10:
+        return "Grow and retain high-value baskets."
+    if promo_ratio is not None and promo_ratio >= 1.10:
+        return "Improve promotion efficiency through targeted incentives."
+    return "Increase frequency, basket breadth, and cross-sell adoption."
+
+
+def _campaign_evidence_basis(row: dict[str, Any]) -> str:
+    parts = [
+        str(row.get("actionability_proof") or "no explicit actionability proof"),
+        str(row.get("distinctive_products") or "no distinctive product summary"),
+        str(row.get("spend_and_visit_context") or "no spend/visit context"),
+    ]
+    return " | ".join(parts)
+
+
+def _business_persona_summary(row: dict[str, Any], *, cfg: PipelineConfig) -> str:
+    if row.get("llm_customer_description"):
+        return str(row["llm_customer_description"])
+    name = _stage7_name_info(row, cfg=cfg)["tribe_name"]
+    theme = _primary_theme_context(row, cfg=cfg)
+    products = _product_evidence_text(row, limit=3)
+    return f"{name} are defined by repeat over-indexing in {products}. {theme.get('theme_read')}"
+
+
+def _broad_reach_products_text(row: dict[str, Any], limit: int = 5) -> str:
+    products = sorted(_top_card_products(row, limit=len(row.get("top_products") or [])), key=lambda item: item["reach_pct"], reverse=True)
+    if not products:
+        return "n/a"
+    return "; ".join(
+        f"{item['product']} ({item['reach_pct']:.1f}% reach, n={item['customers']})" for item in products[:limit]
+    )
+
+
+def _sector_theme_evidence(row: dict[str, Any], *, cfg: PipelineConfig) -> str:
+    theme = _primary_theme_context(row, cfg=cfg)
+    sectors = _format_lift_items(row.get("top_sectors"), row.get("top_sector_lifts"), row.get("top_sector_line_counts"))
+    return f"{theme.get('theme_read')} Sectors: {sectors}."
+
+
+def _promo_loyalty_recency_text(row: dict[str, Any]) -> str:
+    promo = _safe_float(row.get("avg_promo_share"))
+    promo_text = f"promo share {promo:.1%}" if promo is not None else "promo share n/a"
+    return f"{promo_text}; {_loyalty_text(row)}"
+
+
+def _targeting_idea(row: dict[str, Any], *, cfg: PipelineConfig) -> str:
+    actionability = _actionability_proof(row, cfg=cfg)
+    if actionability.get("label"):
+        return f"Build a test audience around {actionability['label']} and adjacent basket missions."
+    products = _top_card_products(row, limit=1)
+    if products:
+        return f"Use {products[0]['product']} as the hook, then cross-sell adjacent high-lift products."
+    return "Use broad basket and lifecycle triggers until stronger product hooks are available."
+
+
+def _revenue_lever(row: dict[str, Any]) -> str:
+    ratios = _fixed_behavior_ratios(row)
+    spend_ratio = ratios.get("avg_total_spend")
+    promo_ratio = ratios.get("avg_promo_share")
+    if spend_ratio is not None and spend_ratio >= 1.10:
+        return "Protect and grow high-value baskets through premium bundles, replenishment, and cross-sell."
+    if promo_ratio is not None and promo_ratio >= 1.10:
+        return "Use margin-aware promotions and personalized offers rather than blanket discounts."
+    return "Increase frequency and basket breadth with mission-led product recommendations."
+
+
+def _evidence_confidence(status: str) -> str:
+    if status in {"strong", "ready_strong"}:
+        return "high"
+    if status in {"usable", "ready", "pass"}:
+        return "medium"
+    return "review_only"
+
+
+def _product_overlap_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_products = _product_identity_set(left)
+    right_products = _product_identity_set(right)
+    if not left_products or not right_products:
+        return 0.0
+    return round(len(left_products & right_products) / max(len(left_products | right_products), 1), 4)
+
+
+def _product_identity_set(row: dict[str, Any], limit: int = 10) -> set[str]:
+    ids = [str(item) for item in (row.get("top_product_ids") or [])[:limit] if item is not None]
+    if ids:
+        return set(ids)
+    return {_repair_display_text(str(item)).lower() for item in (row.get("top_products") or [])[:limit] if item}
+
+
+def _behavior_similarity_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    left_values = _behavior_vector(left)
+    right_values = _behavior_vector(right)
+    valid = [(a, b) for a, b in zip(left_values, right_values) if a is not None and b is not None]
+    if not valid:
+        return 0.0
+    diffs = [abs(a - b) / max(abs(a), abs(b), 1e-6) for a, b in valid]
+    return round(max(0.0, min(1.0, 1.0 - float(np.mean(diffs)))), 4)
+
+
+def _behavior_vector(row: dict[str, Any]) -> list[float | None]:
+    ratios = _fixed_behavior_ratios(row)
+    return [
+        ratios.get("avg_total_spend") or _safe_float(row.get("avg_total_spend")),
+        ratios.get("avg_frequency_per_30d") or _safe_float(row.get("avg_frequency_per_30d")),
+        ratios.get("avg_basket_value") or _safe_float(row.get("avg_basket_value")),
+        ratios.get("avg_promo_share") or _safe_float(row.get("avg_promo_share")),
+        _safe_float(row.get("avg_unique_products")),
+        _safe_float(row.get("avg_unique_sectors")),
+    ]
+
+
+def _relationship_type(product_overlap: float, behavior_similarity: float, theme_match: bool) -> str:
+    if theme_match or product_overlap >= 0.25:
+        return "similar_product_mission"
+    if behavior_similarity >= 0.80:
+        return "behavioral_neighbors"
+    if behavior_similarity <= 0.35 and product_overlap <= 0.05:
+        return "commercial_contrast"
+    return "distinct_tribes"
+
+
+def _relationship_similarity_evidence(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    theme_match: bool,
+    *,
+    cfg: PipelineConfig,
+) -> str:
+    shared = _product_identity_set(left) & _product_identity_set(right)
+    theme_text = "same primary theme" if theme_match else "different primary themes"
+    return f"{len(shared)} overlapping top products; {theme_text}; {_behavior_similarity_score(left, right):.2f} behavior similarity."
+
+
+def _relationship_difference_evidence(left: dict[str, Any], right: dict[str, Any]) -> str:
+    left_top = _value_at(left.get("top_products"), 0) or "n/a"
+    right_top = _value_at(right.get("top_products"), 0) or "n/a"
+    return f"Top lifted products differ: T{left.get('tribe_id')} {left_top}; T{right.get('tribe_id')} {right_top}."
+
+
+def _relationship_commercial_interpretation(relationship_type: str) -> str:
+    mapping = {
+        "similar_product_mission": "Treat as related missions; coordinate offers to avoid cannibalization.",
+        "behavioral_neighbors": "Customers behave similarly even if product hooks differ; share campaign mechanics, vary creative.",
+        "commercial_contrast": "Use as contrasting portfolio roles with different value propositions and success metrics.",
+        "distinct_tribes": "Keep positioning separate, but watch for cross-sell opportunities in overlapping baskets.",
+    }
+    return mapping.get(relationship_type, mapping["distinct_tribes"])
+
+
+def _relationship_campaign_guidance(relationship_type: str) -> str:
+    mapping = {
+        "similar_product_mission": "Use coordinated suppression and rotation rules across campaigns.",
+        "behavioral_neighbors": "Reuse timing and incentive mechanics, but keep product recommendations tribe-specific.",
+        "commercial_contrast": "Separate targeting strategy and KPI benchmarks.",
+        "distinct_tribes": "Run independent campaigns; test cross-sell only where product overlap appears.",
+    }
+    return mapping.get(relationship_type, mapping["distinct_tribes"])
+
+
+def _first_existing(columns: set[str], candidates: list[str]) -> str | None:
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _frame_quantile(frame: pl.DataFrame, column: str | None, quantile: float) -> float | None:
+    if column is None or column not in frame.columns:
+        return None
+    value = frame.select(pl.col(column).quantile(quantile)).item()
+    return _safe_float(value)
+
+
+def _threshold_expr(column: str | None, threshold: float | None, op: str) -> pl.Expr:
+    if column is None or threshold is None:
+        return pl.lit(False)
+    if op == ">=":
+        return pl.col(column) >= threshold
+    return pl.col(column) <= threshold
+
+
+def _mean_or_none(frame: pl.DataFrame, column: str | None) -> float | None:
+    if column is None or column not in frame.columns:
+        return None
+    return _safe_float(frame.select(pl.col(column).mean()).item())
+
+
+def _mode_int(frame: pl.DataFrame, column: str) -> int | None:
+    if column not in frame.columns:
+        return None
+    values = frame.select(pl.col(column).drop_nulls().mode().first()).to_series().to_list()
+    return _to_int_or_none(values[0]) if values else None
+
+
+def _write_parquet(frame: pl.DataFrame, path: str | Path) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(output)
 
 
 def _read_optional_table(path: str | Path | None) -> pl.DataFrame:

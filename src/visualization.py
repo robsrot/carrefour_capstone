@@ -14,6 +14,13 @@ from src.config import CONFIG, PipelineConfig
 from src.progress import log_event, stage_timer
 from src.utils import collect_streaming, deterministic_sample_indices, frame_to_numpy, numeric_feature_columns, scan_if_path, schema_names
 
+try:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+except ImportError:
+    pass
+
 
 KING_BLUE = "#0050A4"
 
@@ -71,6 +78,24 @@ SCATTER_CMAP = "Blues"
 
 def _color(name: str) -> str:
     return FIGURE_COLORS[name]
+
+
+def _stage7_visual_status(readiness: Any) -> str:
+    status = str(readiness or "").strip()
+    if status in {"strong", "ready_strong"}:
+        return "final_strong"
+    if status in {"usable", "ready", "pass"}:
+        return "final_usable"
+    return "potential_review"
+
+
+def _stage7_visual_status_short(status: Any) -> str:
+    value = str(status or "")
+    if value == "final_strong":
+        return "S"
+    if value == "final_usable":
+        return "U"
+    return "R"
 
 
 def apply_visual_theme() -> None:
@@ -1313,18 +1338,47 @@ def plot_stage6_cluster_readiness(
         "usable": "#F2A900",
         "review": "#C2410C",
     }
-    pdf["profile_readiness"] = pdf["profile_readiness"].fillna("review").astype(str)
-    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].fillna(0.0).astype(float)
-    pdf["customers"] = pdf["customers"].fillna(0).astype(float)
-    pdf["core_customer_share_pct"] = pdf["core_customer_share_pct"].fillna(0.0).astype(float)
-    min_cluster_size = float(pdf["min_cluster_size_reference"].dropna().iloc[0]) if "min_cluster_size_reference" in pdf else 0.0
+    from src.cluster_validation import _profile_readiness
 
-    fig, ax = plt.subplots(figsize=(10.8, 6.6))
-    for readiness_label, group in pdf.groupby("profile_readiness"):
-        sizes = 70.0 + group["core_customer_share_pct"].clip(lower=0, upper=35) * 24.0
+    pdf["profile_readiness"] = pdf["profile_readiness"].fillna("review").astype(str)
+    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].astype(float)
+    pdf["jitter_label_recovery_accuracy_mean"] = pdf["jitter_label_recovery_accuracy_mean"].astype(float)
+    if "p10_assignment_confidence" in pdf:
+        pdf["p10_assignment_confidence"] = pdf["p10_assignment_confidence"].astype(float)
+    else:
+        pdf["p10_assignment_confidence"] = np.nan
+    if "min_cluster_size_reference" not in pdf:
+        pdf["min_cluster_size_reference"] = 0
+    pdf["customers"] = pdf["customers"].fillna(0).astype(float)
+    pdf["plot_readiness"] = pdf.apply(
+        lambda row: _profile_readiness(
+            customers=int(row["customers"]),
+            min_cluster_size=int(_as_float_for_plot(row.get("min_cluster_size_reference")) or 0),
+            recovery=_as_float_for_plot(row.get("jitter_label_recovery_accuracy_mean")),
+            confidence=_as_float_for_plot(row.get("mean_assignment_confidence")),
+            p10_confidence=_as_float_for_plot(row.get("p10_assignment_confidence")),
+        )[0],
+        axis=1,
+    )
+    pdf["mean_assignment_confidence"] = pdf["mean_assignment_confidence"].fillna(0.0)
+    pdf["jitter_label_recovery_accuracy_mean"] = pdf["jitter_label_recovery_accuracy_mean"].fillna(0.0)
+    max_customers = max(float(pdf["customers"].max()), 1.0)
+
+    fig, ax = plt.subplots(figsize=(11.8, 6.6))
+    readiness_order = ["review", "usable", "strong"]
+    grouped_readiness = {
+        readiness_label: group for readiness_label, group in pdf.groupby("plot_readiness")
+    }
+    ordered_readiness = [
+        *[label for label in readiness_order if label in grouped_readiness],
+        *[label for label in sorted(grouped_readiness) if label not in readiness_order],
+    ]
+    for readiness_label in ordered_readiness:
+        group = grouped_readiness[readiness_label]
+        sizes = 80.0 + group["customers"].clip(lower=0) / max_customers * 860.0
         ax.scatter(
-            group["customers"],
             group["mean_assignment_confidence"],
+            group["jitter_label_recovery_accuracy_mean"],
             s=sizes,
             color=readiness_colors.get(readiness_label, _color("neutral")),
             alpha=0.82,
@@ -1333,28 +1387,59 @@ def plot_stage6_cluster_readiness(
             label=readiness_label,
         )
         for _, row in group.iterrows():
+            label_on_left = float(row["mean_assignment_confidence"]) > 0.96
             ax.annotate(
                 str(int(row["tribe_id"])),
-                (row["customers"], row["mean_assignment_confidence"]),
-                xytext=(4, 4),
+                (row["mean_assignment_confidence"], row["jitter_label_recovery_accuracy_mean"]),
+                xytext=(-5, 4) if label_on_left else (4, 4),
                 textcoords="offset points",
                 fontsize=8,
+                ha="right" if label_on_left else "left",
                 color=_color("text"),
             )
 
-    if min_cluster_size > 0:
-        ax.axvline(min_cluster_size, color="#475467", linestyle="--", linewidth=1.0, alpha=0.8)
-        ax.text(min_cluster_size, ax.get_ylim()[1] * 0.96, "min cluster size", rotation=90, va="top", ha="right", fontsize=8)
-    ax.axhline(0.30, color="#475467", linestyle=":", linewidth=1.0, alpha=0.8)
-    ax.text(ax.get_xlim()[1] * 0.99, 0.305, "confidence review line", ha="right", va="bottom", fontsize=8)
-    ax.set_xlabel("Customers in core tribe")
-    ax.set_ylabel("Mean assignment confidence")
+    confidence_baseline = 0.50
+    ax.axvline(confidence_baseline, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.axhline(0.60, color="#475467", linestyle="--", linewidth=1.0, alpha=0.75)
+    ax.axhline(0.80, color="#475467", linestyle=":", linewidth=1.0, alpha=0.75)
+    ax.set_xlim(confidence_baseline, min(1.02, max(1.0, float(pdf["mean_assignment_confidence"].max()) * 1.03)))
+    ax.set_ylim(0.0, min(1.02, max(1.0, float(pdf["jitter_label_recovery_accuracy_mean"].max()) * 1.08)))
+    ax.text(confidence_baseline + 0.006, 0.98, "confidence baseline", rotation=90, va="top", ha="left", fontsize=8)
+    ax.text(confidence_baseline + 0.01, 0.605, "jitter minimum", ha="left", va="bottom", fontsize=8)
+    ax.text(confidence_baseline + 0.01, 0.805, "strong jitter target", ha="left", va="bottom", fontsize=8)
+    ax.set_xlabel("Mean assignment confidence")
+    ax.set_ylabel("Jitter label recovery accuracy")
     ax.set_title(title or "Stage 6.6 Cluster Readiness Before Profiling")
     ax.grid(alpha=0.22)
-    ax.legend(title="Profile readiness", frameon=False, loc="best")
+    readiness_legend = ax.legend(title="Profile readiness", frameon=False, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    ax.add_artist(readiness_legend)
+    if max_customers > 0:
+        customer_levels = sorted({int(round(value)) for value in np.linspace(max_customers * 0.25, max_customers, 3)})
+        size_handles = [
+            ax.scatter(
+                [],
+                [],
+                s=80.0 + level / max_customers * 860.0,
+                color=_color("neutral"),
+                alpha=0.35,
+                edgecolor="white",
+                linewidth=0.8,
+            )
+            for level in customer_levels
+        ]
+        ax.legend(
+            size_handles,
+            [f"{level:,}" for level in customer_levels],
+            title="Customers",
+            frameon=False,
+            loc="upper left",
+            bbox_to_anchor=(1.01, 0.58),
+            scatterpoints=1,
+            labelspacing=1.2,
+        )
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=170)
+    fig.savefig(output, dpi=170, bbox_inches="tight")
     plt.close(fig)
     log_event("Stage 6.6 diagnostics", "wrote cluster readiness plot", cfg=cfg, path=output)
     return output
@@ -2271,14 +2356,18 @@ def plot_tribe_profile_comparison_heatmap(
     im = ax.imshow(masked, aspect="auto", cmap=cmap, vmin=-1.25, vmax=2.0)
 
     tribe_labels = [
-        f"T{row.get('tribe_id')} {shorten(str(row.get('suggested_tribe_name') or ''), width=26, placeholder='...')}".strip()
+        (
+            f"T{row.get('tribe_id')} "
+            f"[{_stage7_visual_status_short(_stage7_visual_status(row.get('stage6_profile_readiness')))}] "
+            f"{shorten(str(row.get('suggested_tribe_name') or ''), width=24, placeholder='...')}"
+        ).strip()
         for row in rows
     ]
     ax.set_yticks(np.arange(len(rows)))
     ax.set_yticklabels(tribe_labels)
     ax.set_xticks(np.arange(len(metric_values)))
     ax.set_xticklabels([label for label, _ in metric_values], rotation=35, ha="right")
-    ax.set_title("Stage 7 Between-Tribe Profile Comparison")
+    ax.set_title("Stage 7 All-Tribe Behavioral Differentiation")
     ax.set_xlabel("Metric ratio versus rest of assigned population")
     ax.set_ylabel("Tribe")
     for row_idx in range(matrix.shape[0]):
@@ -2410,7 +2499,11 @@ def plot_tribe_theme_lift_heatmap(
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     im = ax.imshow(matrix, aspect="auto", cmap=SEQUENTIAL_CMAP, vmin=0.0, vmax=max(float(matrix.max()), 1.5))
     ax.set_yticks(np.arange(len(tribe_ids)))
-    ax.set_yticklabels([f"T{tribe_id}" for tribe_id in tribe_ids])
+    readiness_by_tribe = {
+        int(row.get("tribe_id")): _stage7_visual_status(row.get("stage6_profile_readiness"))
+        for row in profiles.iter_rows(named=True)
+    }
+    ax.set_yticklabels([f"T{tribe_id} [{_stage7_visual_status_short(readiness_by_tribe.get(tribe_id))}]" for tribe_id in tribe_ids])
     ax.set_xticks(np.arange(len(selected_themes)))
     ax.set_xticklabels(
         [shorten(theme.replace("_", " "), width=18, placeholder="...") for theme in selected_themes],
@@ -2418,8 +2511,8 @@ def plot_tribe_theme_lift_heatmap(
         ha="right",
     )
     ax.set_xlabel("Product-theme evidence")
-    ax.set_ylabel("Selected core tribe")
-    ax.set_title("Stage 7 Product-Theme Lift By Selected Tribe")
+    ax.set_ylabel("Retained tribe")
+    ax.set_title("Stage 7 All-Tribe Product-Theme Lift")
     threshold = float(cfg.get("profiling.strong_theme_lift_threshold", 1.2))
     for y in range(matrix.shape[0]):
         for x in range(matrix.shape[1]):
@@ -2430,6 +2523,236 @@ def plot_tribe_theme_lift_heatmap(
     cbar.set_label("Theme lift vs assigned population")
     fig.tight_layout()
     return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote tribe-theme heatmap")
+
+
+def plot_stage7_relationship_heatmap(
+    relationship_path: str | Path | pl.DataFrame,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot all retained tribe relationships from the Stage 7 relationship atlas."""
+
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = (
+        Path(output_path)
+        if output_path
+        else cfg.figures / f"stage_07_all_tribe_relationship_heatmap_{cfg.mode}.png"
+    )
+    relationships = relationship_path if isinstance(relationship_path, pl.DataFrame) else pl.read_csv(relationship_path)
+    if relationships.is_empty():
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "No tribe relationships available.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty relationship heatmap")
+
+    ids = sorted(
+        {
+            int(value)
+            for column in ["tribe_a_id", "tribe_b_id"]
+            if column in relationships.columns
+            for value in relationships[column].drop_nulls().to_list()
+        }
+    )
+    if not ids:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "No tribe IDs available for relationship heatmap.", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return _save_figure(fig, output, cfg, "Stage 7 figures", "wrote empty relationship heatmap")
+
+    index = {tribe_id: idx for idx, tribe_id in enumerate(ids)}
+    matrix = np.eye(len(ids), dtype=float)
+    status_by_id: dict[int, str] = {}
+    name_by_id: dict[int, str] = {}
+    for row in relationships.iter_rows(named=True):
+        left_id = int(row.get("tribe_a_id"))
+        right_id = int(row.get("tribe_b_id"))
+        score = _finite_float(row.get("relationship_score")) or 0.0
+        matrix[index[left_id], index[right_id]] = score
+        matrix[index[right_id], index[left_id]] = score
+        status_by_id[left_id] = str(row.get("tribe_a_status") or status_by_id.get(left_id) or "potential_review")
+        status_by_id[right_id] = str(row.get("tribe_b_status") or status_by_id.get(right_id) or "potential_review")
+        name_by_id[left_id] = str(row.get("tribe_a_name") or name_by_id.get(left_id) or "")
+        name_by_id[right_id] = str(row.get("tribe_b_name") or name_by_id.get(right_id) or "")
+
+    fig_size = max(8.0, 0.42 * len(ids) + 4.5)
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    im = ax.imshow(matrix, aspect="equal", cmap=SEQUENTIAL_CMAP, vmin=0.0, vmax=1.0)
+    labels = [
+        f"T{tribe_id} [{_stage7_visual_status_short(status_by_id.get(tribe_id))}] "
+        f"{shorten(name_by_id.get(tribe_id, ''), width=20, placeholder='...')}".strip()
+        for tribe_id in ids
+    ]
+    ax.set_xticks(np.arange(len(ids)))
+    ax.set_yticks(np.arange(len(ids)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    ax.set_title("Stage 7 All-Tribe Relationship Heatmap")
+    ax.set_xlabel("Retained tribe")
+    ax.set_ylabel("Retained tribe")
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            if row_idx == col_idx:
+                continue
+            value = matrix[row_idx, col_idx]
+            if value >= 0.45:
+                ax.text(col_idx, row_idx, f"{value:.2f}", ha="center", va="center", fontsize=7, color=_color("text"))
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Relationship score")
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 7 figures", "wrote all-tribe relationship heatmap")
+    plt.close(fig)
+    return path
+
+
+def plot_stage7_customer_coverage_bar(
+    coverage: pl.DataFrame,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot Stage 7 customer coverage groups."""
+
+    return _plot_stage7_count_bar(
+        coverage,
+        label_column="coverage_group",
+        value_column="customers",
+        title="Stage 7 Customer Coverage",
+        output_path=output_path or cfg.figures / f"stage_07_customer_coverage_{cfg.mode}.png",
+        empty_message="No customer coverage rows available.",
+        cfg=cfg,
+    )
+
+
+def plot_stage7_review_blockers(
+    review: pl.DataFrame,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot why potential review tribes are not final promoted tribes."""
+
+    if not review.is_empty() and "promotion_blocker" in review.columns:
+        frame = (
+            review.group_by("promotion_blocker")
+            .agg(pl.len().alias("tribes"))
+            .rename({"promotion_blocker": "blocker"})
+            .sort("tribes", descending=True)
+        )
+    else:
+        frame = pl.DataFrame(schema={"blocker": pl.Utf8, "tribes": pl.Int64})
+    return _plot_stage7_count_bar(
+        frame,
+        label_column="blocker",
+        value_column="tribes",
+        title="Stage 7 Review Tribe Blockers",
+        output_path=output_path or cfg.figures / f"stage_07_review_tribe_blockers_{cfg.mode}.png",
+        empty_message="No potential review tribe blockers available.",
+        cfg=cfg,
+    )
+
+
+def plot_stage7_remaining_customer_segments(
+    remaining: pl.DataFrame,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot remaining/noise customer segment sizes."""
+
+    return _plot_stage7_count_bar(
+        remaining,
+        label_column="segment_name",
+        value_column="customer_count",
+        title="Stage 7 Remaining Customer Segments",
+        output_path=output_path or cfg.figures / f"stage_07_remaining_customer_segments_{cfg.mode}.png",
+        empty_message="No remaining customer segments available.",
+        cfg=cfg,
+    )
+
+
+def plot_stage7_soft_audience_opportunities(
+    soft: pl.DataFrame,
+    output_path: str | Path | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> Path:
+    """Plot campaign-use soft audience opportunities."""
+
+    frame = soft
+    if not frame.is_empty():
+        label_expr = (
+            pl.concat_str(
+                [
+                    pl.lit("T"),
+                    pl.col("target_tribe_id").cast(pl.Utf8),
+                    pl.lit(" ["),
+                    pl.col("target_tribe_status").fill_null("unknown").cast(pl.Utf8),
+                    pl.lit("]"),
+                ]
+            ).alias("soft_audience")
+            if "target_tribe_status" in frame.columns
+            else pl.concat_str([pl.lit("T"), pl.col("target_tribe_id").cast(pl.Utf8)]).alias("soft_audience")
+        )
+        frame = frame.with_columns(label_expr)
+    return _plot_stage7_count_bar(
+        frame,
+        label_column="soft_audience",
+        value_column="customer_count",
+        title="Stage 7 Campaign-Use Soft Audiences",
+        output_path=output_path or cfg.figures / f"stage_07_soft_audience_opportunities_{cfg.mode}.png",
+        empty_message="No soft audience opportunities available.",
+        cfg=cfg,
+    )
+
+
+def _plot_stage7_count_bar(
+    frame: pl.DataFrame,
+    *,
+    label_column: str,
+    value_column: str,
+    title: str,
+    output_path: str | Path,
+    empty_message: str,
+    cfg: PipelineConfig,
+) -> Path:
+    import matplotlib.pyplot as plt
+
+    cfg.ensure_directories()
+    output = Path(output_path)
+    if frame.is_empty() or label_column not in frame.columns or value_column not in frame.columns:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, empty_message, ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return _save_figure(fig, output, cfg, "Stage 7 figures", f"wrote empty {title.lower()}")
+
+    plot_frame = (
+        frame.select(
+            [
+                pl.col(label_column).cast(pl.Utf8).fill_null("unknown").alias("label"),
+                pl.col(value_column).cast(pl.Float64, strict=False).fill_null(0.0).alias("value"),
+            ]
+        )
+        .sort("value", descending=True)
+        .head(12)
+        .reverse()
+    )
+    labels = [shorten(str(value), width=42, placeholder="...") for value in plot_frame["label"].to_list()]
+    values = [float(value or 0.0) for value in plot_frame["value"].to_list()]
+    fig_height = max(4.0, 0.42 * len(labels) + 1.8)
+    fig, ax = plt.subplots(figsize=(10, fig_height))
+    bars = ax.barh(np.arange(len(labels)), values, color=KING_BLUE, alpha=0.86)
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_yticklabels(labels)
+    ax.set_title(title)
+    ax.set_xlabel(value_column.replace("_", " ").title())
+    ax.grid(axis="x", color=_color("grid"), alpha=0.6)
+    for bar, value in zip(bars, values):
+        ax.text(value, bar.get_y() + bar.get_height() / 2, f" {value:,.0f}", va="center", fontsize=8)
+    fig.tight_layout()
+    path = _save_figure(fig, output, cfg, "Stage 7 figures", f"wrote {title.lower()}")
+    plt.close(fig)
+    return path
 
 
 def plot_mission_microtribe_overview(

@@ -3,6 +3,7 @@ import polars as pl
 from src.config import PipelineConfig
 from src.model_selection import (
     _apply_lift_filter_to_assignments,
+    _merge_hdbscan_assignment_stages,
     _product_lift_filter_evidence,
     run_official_two_stage_hdbscan_lift_core,
     two_stage_hdbscan_artifact_paths,
@@ -103,6 +104,61 @@ def test_lift_filter_can_require_significant_product_lift(tmp_path):
         {"tribe_id": 0, "passes_lift_filter": False},
         {"tribe_id": 1, "passes_lift_filter": True},
     ]
+
+
+def test_three_stage_merge_remaps_labels_and_preserves_assignment_sources(tmp_path):
+    stage1 = tmp_path / "stage1.parquet"
+    stage2 = tmp_path / "stage2.parquet"
+    stage3 = tmp_path / "stage3.parquet"
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "c5"],
+            "tribe_id": [2, -1, -1, -1, -1],
+            "assignment_probability": [0.9, None, None, None, None],
+            "assignment_confidence_score": [0.9, None, None, None, None],
+            "assignment_confidence_type": ["hdbscan_membership_strength", None, None, None, None],
+        }
+    ).write_parquet(stage1)
+    pl.DataFrame(
+        {
+            "cliente": ["c2", "c3", "c4", "c5"],
+            "tribe_id": [7, 8, -1, -1],
+            "assignment_probability": [0.8, 0.7, None, None],
+            "assignment_confidence_score": [0.8, 0.7, None, None],
+            "assignment_confidence_type": ["hdbscan_membership_strength", "hdbscan_membership_strength", None, None],
+        }
+    ).write_parquet(stage2)
+    pl.DataFrame(
+        {
+            "cliente": ["c4", "c5"],
+            "tribe_id": [3, -1],
+            "assignment_probability": [0.6, None],
+            "assignment_confidence_score": [0.6, None],
+            "assignment_confidence_type": ["hdbscan_membership_strength", None],
+        }
+    ).write_parquet(stage3)
+
+    merged = _merge_hdbscan_assignment_stages(
+        [
+            {"path": stage1, "prefix": "stage1", "core_source": "three_stage_hdbscan_stage1_core"},
+            {"path": stage2, "prefix": "stage2", "core_source": "three_stage_hdbscan_stage2_noise_core"},
+            {"path": stage3, "prefix": "stage3", "core_source": "three_stage_hdbscan_stage3_remaining_noise_core"},
+        ],
+        model_name="model_e",
+        model_variant="variant",
+        noise_source="three_stage_hdbscan_noise_unassigned",
+    )
+
+    rows = {row["cliente"]: row for row in merged.iter_rows(named=True)}
+    assert rows["c1"]["tribe_id"] == 0
+    assert rows["c2"]["tribe_id"] == 1
+    assert rows["c3"]["tribe_id"] == 2
+    assert rows["c4"]["tribe_id"] == 3
+    assert rows["c5"]["tribe_id"] == -1
+    assert rows["c1"]["assignment_source"] == "three_stage_hdbscan_stage1_core"
+    assert rows["c2"]["assignment_source"] == "three_stage_hdbscan_stage2_noise_core"
+    assert rows["c4"]["assignment_source"] == "three_stage_hdbscan_stage3_remaining_noise_core"
+    assert rows["c5"]["assignment_source"] == "three_stage_hdbscan_noise_unassigned"
 
 
 def test_two_stage_cache_backfills_lift_csv_and_rewrites_current_paths(tmp_path):

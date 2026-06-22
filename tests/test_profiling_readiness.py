@@ -14,8 +14,22 @@ from src.profiling import (
     noise_audit_table,
     profile_quality_summary,
     profile_readiness_evidence_table,
+    remaining_customer_affinity_table,
+    remaining_customer_segments_table,
+    stage7_all_tribe_behavior_differentiation_table,
+    stage7_all_tribe_product_identity_table,
+    stage7_all_tribe_profiles_table,
+    stage7_campaign_playbook_table,
     stage7_final_index_table,
+    stage7_promoted_tribe_validation_table,
+    stage7_review_tribe_audit_table,
+    stage7_soft_audience_opportunities_table,
+    stage7_soft_audience_activation_customer_table,
+    stage7_stakeholder_readiness_table,
     stage7_storyline_table,
+    stage7_tribe_handbook_table,
+    stage7_tribe_promotion_report_table,
+    stage7_tribe_relationship_atlas_table,
     stage68_artifact_paths,
     tribe_comparison_table,
     tribe_product_summary_tables,
@@ -1025,8 +1039,9 @@ def test_stage7_final_handoff_pack_creates_curated_profile_first_outputs(tmp_pat
     assert row["lapsed_customer_pct"] == 50.0
     assert "Reach caveat" in row["top_product_reach_warning"]
     assert "total spend" in row["spend_and_visit_context"]
-    assert sorted(outputs["card_paths"]) == [0]
+    assert sorted(outputs["card_paths"]) == [0, 1]
     assert outputs["card_paths"][0].exists()
+    assert outputs["card_paths"][1].exists()
     assert not stale_card.exists()
     assert final_index_row["card_png"].endswith("tribe_00_card.png")
     assert final_index_row["primary_theme"] == "Dairy & Eggs Buyers"
@@ -1039,6 +1054,8 @@ def test_stage7_final_handoff_pack_creates_curated_profile_first_outputs(tmp_pat
     assert "Reach caveat" in final_index_row["top_product_reach_warning"]
     assert "lift_vs_rest x log(customer_count + 1)" in final_index_row["product_ranking_basis"]
     assert review_candidates["tribe_id"].to_list() == [1]
+    assert review_candidates[0, "tribe_status"] == "potential_review"
+    assert review_candidates[0, "recommended_use"].startswith("Promising behavioral pocket")
     assert outputs["index_csv"].exists()
     assert outputs["llm_evidence_csv"].exists()
     assert outputs["noise_vs_core_customer_metrics_csv"].exists()
@@ -1046,6 +1063,56 @@ def test_stage7_final_handoff_pack_creates_curated_profile_first_outputs(tmp_pat
     assert "primary_actionability_proof" in llm_evidence["proof_role"].to_list()
     assert "supplemental_curated_theme_context" in llm_evidence["proof_role"].to_list()
     assert outputs["comparison_paths"]["html"].exists()
+    assert outputs["substage_paths"]["promoted_tribe_validation"]["csv"].exists()
+    assert outputs["substage_paths"]["review_tribe_validation"]["csv"].exists()
+    assert outputs["substage_paths"]["all_tribe_product_identity"]["csv"].exists()
+    assert outputs["substage_paths"]["all_tribe_behavior_differentiation"]["csv"].exists()
+    assert outputs["substage_paths"]["all_tribe_dossiers"]["markdown"].exists()
+    assert outputs["substage_paths"]["all_tribe_relationship_atlas"]["csv"].exists()
+    redesigned_keys = [
+        "stage7_1_promotion_report",
+        "stage7_2_identity_dossier",
+        "stage7_3_tribe_handbook",
+        "stage7_4_customer_coverage_report",
+        "stage7_5_segment_action_playbook",
+        "stage7_6_segmentation_framework",
+        "stage7_7_final_report",
+    ]
+    for key in redesigned_keys:
+        assert outputs["substage_paths"][key]["csv"].exists()
+        assert outputs["substage_paths"][key]["markdown"].exists()
+    promotion_report = pl.read_csv(outputs["substage_paths"]["stage7_1_promotion_report"]["csv"])
+    assert {
+        "promotion_decision",
+        "validation_tier",
+        "technical_name",
+        "business_name",
+        "legacy_tribe_name",
+        "business_confidence",
+        "validation_blockers",
+        "coverage_group",
+        "membership_policy",
+        "recommended_use",
+    }.issubset(set(promotion_report.columns))
+    assert promotion_report.filter(pl.col("promotion_decision") == "promoted").height == 1
+    assert promotion_report.filter(pl.col("promotion_decision") == "review").height == 1
+    identity_dossier = pl.read_csv(outputs["substage_paths"]["stage7_2_identity_dossier"]["csv"])
+    assert identity_dossier[0, "technical_name"] == "Greek Yogurt Buyers"
+    assert identity_dossier[0, "business_name"] is None
+    handbook = pl.read_csv(outputs["substage_paths"]["stage7_3_tribe_handbook"]["csv"])
+    assert handbook[0, "business_name"] == "Dairy & Eggs Buyers"
+    assert handbook[0, "technical_name"] == "Greek Yogurt Buyers"
+    coverage = pl.read_csv(outputs["substage_paths"]["stage7_4_customer_coverage_report"]["csv"])
+    additive = coverage.filter(pl.col("counts_toward_population_total") == True)
+    assert int(additive["customers"].sum()) == 200
+    action_playbook = pl.read_csv(outputs["substage_paths"]["stage7_5_segment_action_playbook"]["csv"])
+    assert "marketing_actions" in action_playbook.columns
+    final_report = outputs["substage_paths"]["stage7_7_final_report"]["markdown"].read_text(encoding="utf-8")
+    assert "Who are the core customer segments?" in final_report
+    assert outputs["campaign_playbook_paths"]["csv"].exists()
+    assert outputs["stakeholder_readiness_paths"]["csv"].exists()
+    assert outputs["soft_audience_activation_customers_csv"].exists()
+    assert outputs["soft_audience_activation_customers_parquet"].exists()
     assert outputs["raw_transaction_export_paths"]["manifest_csv"].exists()
     assert outputs["customer_summary_export_paths"]["manifest_csv"].exists()
     raw_manifest = pl.read_csv(outputs["raw_transaction_export_paths"]["manifest_csv"])
@@ -1059,11 +1126,19 @@ def test_stage7_final_handoff_pack_creates_curated_profile_first_outputs(tmp_pat
     assert {"cliente", "total_spend", "recency_days"}.issubset(set(customer_tribe_0.columns))
     assert customer_tribe_0.height == 2
     assert "Stage 7 Tribe Profiles" in story
-    assert "Review candidates held out" in story
+    assert "Potential review tribes" in story
     assert "\"promoted_tribes\": [\n    0\n  ]" in manifest
     assert "\"review_tribes\"" in manifest
+    assert "all_tribe_product_identity_csv" in manifest
+    assert "all_tribe_behavior_differentiation_csv" in manifest
+    assert "all_tribe_relationship_atlas_csv" in manifest
     assert "\"llm_enabled\": false" in manifest
     assert "tribe_raw_transaction_export_directory" in manifest
+    assert "campaign_playbook_csv" in manifest
+    assert "stakeholder_readiness_csv" in manifest
+    assert "stage7_1_promotion_report_csv" in manifest
+    assert "stage7_7_final_report_markdown" in manifest
+    assert "soft_audience_activation_customers_csv" in manifest
 
 
 def test_stage7_names_from_single_tribe_transaction_theme_evidence(tmp_path):
@@ -1291,8 +1366,10 @@ def test_stage7_final_handoff_with_no_promoted_tribes_writes_readable_empty_inde
     assert {"tribe_id", "tribe_name", "population_share_pct"}.issubset(set(index.columns))
     assert llm_evidence.height == 0
     assert {"tribe_id", "proof_role", "evidence"}.issubset(set(llm_evidence.columns))
-    assert outputs["card_paths"] == {}
+    assert sorted(outputs["card_paths"]) == [0]
+    assert outputs["card_paths"][0].exists()
     assert outputs["review_candidates"]["tribe_id"].to_list() == [0]
+    assert outputs["review_candidates"][0, "tribe_status"] == "potential_review"
     assert manifest["promoted_tribes"] == []
     assert manifest["review_tribes"] == {"0": "stage6_profile_readiness=review"}
 
@@ -1524,4 +1601,472 @@ def test_noise_audit_profiles_hidden_noise_structure_without_assignment(tmp_path
     assert outputs["csv"].exists()
     assert outputs["markdown"].exists()
     assert "noise_share" in outputs["markdown"].read_text(encoding="utf-8")
+
+
+def test_remaining_customer_segments_and_soft_audiences_do_not_mutate_hard_assignments(tmp_path):
+    cfg = PipelineConfig(
+        values={
+            "paths": {"outputs": "outputs"},
+            "profiling": {
+                "soft_audience_min_affinity": 0.20,
+                "soft_audience_min_margin": 0.0,
+                "remaining_near_tribe_min_affinity": 0.20,
+                "remaining_near_tribe_min_margin": 0.0,
+                "remaining_affinity_max_features": 4,
+            },
+        },
+        mode="dev",
+        root=tmp_path,
+    )
+    assignments_path = tmp_path / "assignments.parquet"
+    behavior_path = tmp_path / "behavior.parquet"
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "n1", "n2", "n3"],
+            "tribe_id": [0, 0, 1, 1, -1, -1, -1],
+            "assignment_confidence_score": [0.9, 0.8, 0.9, 0.8, None, None, None],
+        }
+    ).write_parquet(assignments_path)
+    before = pl.read_parquet(assignments_path).sort("cliente")
+    pl.DataFrame(
+        {
+            "cliente": ["c1", "c2", "c3", "c4", "n1", "n2", "n3"],
+            "total_spend": [100.0, 95.0, 30.0, 35.0, 98.0, 220.0, 5.0],
+            "ticket_count": [8.0, 7.0, 3.0, 4.0, 7.0, 9.0, 1.0],
+            "unique_products": [20.0, 18.0, 8.0, 9.0, 19.0, 35.0, 1.0],
+            "unique_sectors": [6.0, 5.0, 3.0, 3.0, 6.0, 8.0, 1.0],
+            "avg_basket_value": [12.5, 13.0, 10.0, 9.0, 12.0, 24.0, 5.0],
+            "promo_share": [0.10, 0.12, 0.20, 0.22, 0.11, 0.15, 0.00],
+            "recency_days": [10.0, 12.0, 30.0, 28.0, 11.0, 8.0, 90.0],
+            "frequency_per_30d": [2.0, 1.8, 1.0, 1.1, 1.9, 2.5, 0.2],
+        }
+    ).write_parquet(behavior_path)
+
+    affinity = remaining_customer_affinity_table(assignments_path, behavior_path, cfg=cfg)
+    segments = remaining_customer_segments_table(assignments_path, behavior_path, cfg=cfg)
+    soft = stage7_soft_audience_opportunities_table(assignments_path, behavior_path, cfg=cfg)
+    after = pl.read_parquet(assignments_path).sort("cliente")
+
+    assert affinity.height == 3
+    assert set(segments["segment_id"].to_list())
+    assert {"segment_name", "targetability", "likely_reason_for_no_hard_cluster"}.issubset(set(segments.columns))
+    assert not soft.is_empty()
+    assert set(soft["audience_label"].to_list()) == {"soft audience opportunity"}
+    assert before.equals(after)
+
+
+def test_stage7_all_profiles_include_review_tribes_and_relationship_interpretation(tmp_path):
+    cfg = PipelineConfig(
+        values={
+            "paths": {"outputs": "outputs"},
+            "profiling": {
+                "final_handoff_readiness_statuses": ["strong", "usable"],
+                "strong_product_lift_threshold": 1.5,
+                "significance_q_threshold": 0.05,
+                "tribe_name_lookup": {},
+            },
+        },
+        mode="dev",
+        root=tmp_path,
+    )
+    profile_path = tmp_path / "profiles.parquet"
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "n_customers": 120,
+                "population_share": 0.12,
+                "stage6_profile_readiness": "strong",
+                "top_product_ids": ["p1", "p2"],
+                "top_products": ["BIO MILK", "BIO YOGURT"],
+                "top_product_lifts": [2.0, 1.8],
+                "top_product_lifts_vs_rest": [2.1, 1.9],
+                "top_product_q_values": [0.01, 0.02],
+                "top_product_customer_counts": [60, 50],
+                "top_product_reach_pct": [50.0, 41.7],
+                "top_sectors": ["P.G.C."],
+                "top_sector_lifts": [1.3],
+                "top_sector_line_counts": [200],
+                "top_themes": [],
+                "behavior_ratio_vs_rest": json.dumps({"avg_total_spend": 1.2, "avg_frequency_per_30d": 1.1}),
+                "avg_total_spend": 140.0,
+                "avg_frequency_per_30d": 2.0,
+                "avg_basket_value": 22.0,
+                "avg_promo_share": 0.11,
+            },
+            {
+                "tribe_id": 1,
+                "n_customers": 90,
+                "population_share": 0.09,
+                "stage6_profile_readiness": "usable",
+                "top_product_ids": ["p1", "p3"],
+                "top_products": ["BIO MILK", "CEREAL"],
+                "top_product_lifts": [1.9, 1.7],
+                "top_product_lifts_vs_rest": [2.0, 1.8],
+                "top_product_q_values": [0.01, 0.03],
+                "top_product_customer_counts": [40, 35],
+                "top_product_reach_pct": [44.4, 38.9],
+                "top_sectors": ["P.G.C."],
+                "top_sector_lifts": [1.2],
+                "top_sector_line_counts": [150],
+                "top_themes": [],
+                "behavior_ratio_vs_rest": json.dumps({"avg_total_spend": 1.15, "avg_frequency_per_30d": 1.05}),
+                "avg_total_spend": 120.0,
+                "avg_frequency_per_30d": 1.8,
+                "avg_basket_value": 21.0,
+                "avg_promo_share": 0.12,
+            },
+            {
+                "tribe_id": 2,
+                "n_customers": 70,
+                "population_share": 0.07,
+                "stage6_profile_readiness": "review",
+                "top_product_ids": ["p9"],
+                "top_products": ["NICHE SAUCE"],
+                "top_product_lifts": [2.4],
+                "top_product_lifts_vs_rest": [2.5],
+                "top_product_q_values": [0.01],
+                "top_product_customer_counts": [30],
+                "top_product_reach_pct": [42.9],
+                "top_sectors": ["BAZAR"],
+                "top_sector_lifts": [1.5],
+                "top_sector_line_counts": [80],
+                "top_themes": [],
+                "behavior_ratio_vs_rest": json.dumps({"avg_total_spend": 0.7, "avg_frequency_per_30d": 0.8}),
+                "avg_total_spend": 60.0,
+                "avg_frequency_per_30d": 0.8,
+                "avg_basket_value": 15.0,
+                "avg_promo_share": 0.30,
+            },
+        ]
+    ).write_parquet(profile_path)
+
+    all_profiles = stage7_all_tribe_profiles_table(profile_path, cfg=cfg)
+    promoted = stage7_promoted_tribe_validation_table(profile_path, cfg=cfg)
+    product_identity = stage7_all_tribe_product_identity_table(profile_path, cfg=cfg)
+    behavior = stage7_all_tribe_behavior_differentiation_table(profile_path, cfg=cfg)
+    review = stage7_review_tribe_audit_table(profile_path, cfg=cfg)
+    relationships = stage7_tribe_relationship_atlas_table(profile_path, cfg=cfg)
+
+    assert all_profiles.height == 3
+    assert set(all_profiles["tribe_status"].to_list()) == {"final_strong", "final_usable", "potential_review"}
+    assert all_profiles.filter(pl.col("tribe_id") == 2)[0, "promotion_status"] == "not_promoted_review"
+    assert all_profiles.filter(pl.col("tribe_id") == 2)[0, "tribe_status"] == "potential_review"
+    assert "stage6_profile_readiness=review" in all_profiles.filter(pl.col("tribe_id") == 2)[0, "promotion_blocker"]
+    assert promoted["tribe_id"].to_list() == [0, 1]
+    assert product_identity.height == 3
+    assert behavior.height == 3
+    assert "tribe_status" in product_identity.columns
+    assert "tribe_status" in behavior.columns
+    assert review["tribe_id"].to_list() == [2]
+    assert relationships.height == 3
+    assert {
+        "tribe_a_status",
+        "tribe_b_status",
+        "relationship_scope",
+        "similarity_evidence",
+        "difference_evidence",
+        "commercial_interpretation",
+    }.issubset(set(relationships.columns))
+    assert "includes_potential_review" in relationships["relationship_scope"].to_list()
+
+
+def test_stage7_promotion_and_handbook_deduplicate_business_names(tmp_path):
+    cfg = _test_config(tmp_path)
+    cfg.values["profiling"]["tribe_name_lookup"] = {"0": "Pantry Buyers", "1": "Pantry Buyers"}
+    profile_path = tmp_path / "profiles.parquet"
+    pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "n_customers": 100,
+                "population_share": 0.50,
+                "stage6_profile_readiness": "strong",
+                "top_products": ["Greek Yogurt", "Honey"],
+                "top_product_lifts_vs_rest": [2.5, 1.7],
+                "top_product_lifts": [2.2, 1.6],
+                "top_product_q_values": [0.001, 0.02],
+                "top_product_customer_counts": [60, 30],
+                "top_product_reach_pct": [60.0, 30.0],
+                "top_themes": [],
+                "behavior_ratio_vs_rest": json.dumps({"avg_total_spend": 1.2}),
+                "avg_total_spend": 120.0,
+                "avg_frequency_per_30d": 2.0,
+                "avg_basket_value": 18.0,
+                "avg_promo_share": 0.1,
+            },
+            {
+                "tribe_id": 1,
+                "n_customers": 80,
+                "population_share": 0.40,
+                "stage6_profile_readiness": "usable",
+                "top_products": ["Prepared Salad", "Soup"],
+                "top_product_lifts_vs_rest": [2.3, 1.8],
+                "top_product_lifts": [2.0, 1.7],
+                "top_product_q_values": [0.001, 0.02],
+                "top_product_customer_counts": [50, 25],
+                "top_product_reach_pct": [62.5, 31.25],
+                "top_themes": [],
+                "behavior_ratio_vs_rest": json.dumps({"avg_total_spend": 1.1}),
+                "avg_total_spend": 100.0,
+                "avg_frequency_per_30d": 1.8,
+                "avg_basket_value": 16.0,
+                "avg_promo_share": 0.12,
+            },
+        ]
+    ).write_parquet(profile_path)
+
+    promotion = stage7_tribe_promotion_report_table(profile_path, cfg=cfg)
+    handbook = stage7_tribe_handbook_table(profile_path, cfg=cfg)
+
+    assert promotion["promotion_decision"].to_list() == ["promoted", "promoted"]
+    assert handbook["business_name"].n_unique() == 2
+    assert "Pantry Buyers" not in handbook["business_name"].to_list()
+    assert handbook["technical_name"].to_list() == ["Greek Yogurt Buyers", "Prepared Salad Buyers"]
+    assert set(promotion["naming_quality_gate"].to_list()) == {"duplicate_legacy_business_name"}
+    assert set(promotion["business_confidence"].to_list()) == {"low"}
+
+
+def test_stage7_stakeholder_readiness_flags_delivery_blockers(tmp_path):
+    cfg = _test_config(tmp_path)
+    final_index = pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "tribe_name": "Tribe 1",
+                "customers": 100,
+                "top_product": None,
+                "top_product_lift": 1.1,
+                "top_product_reach_pct": 0.4,
+                "top_reach_product_customers": 10,
+                "actionability_proof": None,
+            }
+        ]
+    )
+    all_profiles = pl.DataFrame(
+        [
+            {
+                "tribe_id": 0,
+                "tribe_name": "Tribe 1",
+                "promotion_status": "promoted",
+                "who_is_the_tribe": "Generic shoppers.",
+                "defining_behavior": "n/a",
+                "shopping_mission": "n/a",
+                "targeting_idea": "Use broad basket and lifecycle triggers until stronger product hooks are available.",
+                "revenue_lever": "Increase frequency.",
+            }
+        ]
+    )
+    remaining = pl.DataFrame(
+        [
+            {
+                "segment_id": "unclear_long_tail_customers",
+                "segment_name": "Unclear long-tail customers",
+                "customer_count": 600,
+                "share_of_remaining_pct": 60.0,
+            }
+        ]
+    )
+    soft = pl.DataFrame(
+        [
+            {
+                "target_tribe_id": 0,
+                "customer_count": 50,
+                "mean_top_affinity": 0.8,
+                "p10_top_affinity": 0.74,
+                "mean_affinity_margin": 0.15,
+                "most_common_second_tribe_id": 1,
+                "remaining_customer_share_pct": 5.0,
+                "audience_label": "soft audience opportunity",
+                "assignment_policy": "campaign-use only",
+                "recommended_use": "Test.",
+            }
+        ]
+    )
+    readiness = stage7_stakeholder_readiness_table(
+        final_index,
+        all_profiles,
+        remaining,
+        soft,
+        pl.DataFrame(),
+        pl.DataFrame(),
+        cfg=cfg,
+    )
+    statuses = {row["check_id"]: row for row in readiness.iter_rows(named=True)}
+
+    assert statuses["overall_delivery_readiness"]["status"] == "fail"
+    assert statuses["tribe_name_quality"]["status"] == "fail"
+    assert statuses["promoted_tribe_product_evidence"]["status"] == "fail"
+    assert statuses["persona_specificity"]["status"] == "fail"
+    assert statuses["remaining_customer_segments"]["status"] == "fail"
+    assert statuses["soft_audience_activation_export"]["status"] == "fail"
+    assert statuses["campaign_playbook_completeness"]["status"] == "fail"
+
+
+def test_stage7_stakeholder_readiness_uses_delivery_product_signal(tmp_path):
+    cfg = _test_config(tmp_path)
+    final_index = pl.DataFrame(
+        [
+            {
+                "tribe_id": 8,
+                "tribe_name": "Gluten-Free Breakfast Mission",
+                "customers": 1000,
+                "top_product": "Very Niche Gluten-Free SKU",
+                "top_product_lift": 20.0,
+                "top_product_reach_pct": 0.2,
+                "delivery_product": "Gluten-Free Breakfast Cereal",
+                "delivery_product_lift": 4.2,
+                "delivery_product_reach_pct": 6.0,
+                "delivery_product_customers": 60,
+                "delivery_product_q_value": 0.01,
+                "actionability_proof": "Lifted-product proof: Gluten-Free Breakfast Cereal",
+            }
+        ]
+    )
+    all_profiles = pl.DataFrame(
+        [
+            {
+                "tribe_id": 8,
+                "tribe_name": "Gluten-Free Breakfast Mission",
+                "promotion_status": "promoted",
+                "who_is_the_tribe": "These customers repeatedly over-index on gluten-free breakfast and bakery products with enough reach to support a clear shopper mission.",
+                "defining_behavior": "They combine specialist dietary products with regular breakfast trips and show a clear basket pattern around cereal, bakery, and pantry replenishment.",
+                "shopping_mission": "The mission is planned replenishment for gluten-free breakfast occasions, with adjacent bakery and snack products as natural extensions.",
+                "targeting_idea": "Use cereal and bakery bundles with measured holdouts and keep creative focused on the dietary breakfast mission.",
+                "revenue_lever": "Grow category penetration through cross-sell across breakfast, bakery, and snacks while tracking incremental basket value.",
+            }
+        ]
+    )
+    campaign_playbook = pl.DataFrame(
+        [
+            {
+                "tribe_id": 8,
+                "offer_idea": "Breakfast bundle anchored on Gluten-Free Breakfast Cereal.",
+                "recommended_channel": "App push and loyalty placement.",
+                "suppression_rules": "Suppress recent exact-product purchasers and campaign controls.",
+                "holdout_control_design": "Hold out 10% of eligible customers.",
+                "primary_kpi": "Incremental category penetration.",
+                "expected_commercial_lever": "Grow breakfast basket breadth.",
+                "risk_caveat": "Dietary-mission segment only.",
+            }
+        ]
+    )
+
+    readiness = stage7_stakeholder_readiness_table(
+        final_index,
+        all_profiles,
+        pl.DataFrame(),
+        pl.DataFrame(),
+        pl.DataFrame(),
+        campaign_playbook,
+        cfg=cfg,
+    )
+    statuses = {row["check_id"]: row for row in readiness.iter_rows(named=True)}
+
+    assert statuses["overall_delivery_readiness"]["status"] == "pass"
+    assert statuses["promoted_tribe_product_evidence"]["status"] == "pass"
+
+
+def test_stage7_soft_audience_activation_exports_customer_rows_without_mutating_assignments(tmp_path):
+    cfg = _test_config(tmp_path)
+    affinity_path = tmp_path / "affinity.parquet"
+    soft_path = tmp_path / "soft.csv"
+    csv_path = tmp_path / "activation.csv"
+    parquet_path = tmp_path / "activation.parquet"
+    pl.DataFrame(
+        [
+            {
+                "cliente": "cust-101",
+                "official_tribe_id": -1,
+                "top_tribe_id": 3,
+                "top_affinity_score": 0.82,
+                "second_tribe_id": 2,
+                "second_affinity_score": 0.60,
+                "affinity_margin": 0.22,
+                "affinity_confidence_band": "high",
+                "recommended_use": "soft audience opportunity",
+                "official_assignment_policy": "hard assignments unchanged",
+            },
+            {
+                "cliente": "cust-102",
+                "official_tribe_id": 3,
+                "top_tribe_id": 3,
+                "top_affinity_score": 0.90,
+                "second_tribe_id": 2,
+                "second_affinity_score": 0.60,
+                "affinity_margin": 0.30,
+                "affinity_confidence_band": "high",
+                "recommended_use": "already assigned",
+                "official_assignment_policy": "hard assignments unchanged",
+            },
+        ]
+    ).write_parquet(affinity_path)
+    pl.DataFrame(
+        [
+            {
+                "target_tribe_id": 3,
+                "customer_count": 1,
+                "mean_top_affinity": 0.82,
+                "p10_top_affinity": 0.82,
+                "mean_affinity_margin": 0.22,
+                "most_common_second_tribe_id": 2,
+                "remaining_customer_share_pct": 100.0,
+                "audience_label": "soft audience opportunity",
+                "assignment_policy": "campaign-use only",
+                "recommended_use": "Test.",
+            }
+        ]
+    ).write_csv(soft_path)
+
+    activation = stage7_soft_audience_activation_customer_table(
+        affinity_path,
+        soft_audience_path=soft_path,
+        final_index=pl.DataFrame([{"tribe_id": 3, "tribe_name": "Fresh Mission Buyers"}]),
+        output_csv=csv_path,
+        output_parquet=parquet_path,
+        cfg=cfg,
+    )
+
+    assert activation["cliente"].to_list() == ["cust-101"]
+    assert activation["cliente"].n_unique() == 1
+    assert activation[0, "official_tribe_id"] == -1
+    assert activation[0, "target_tribe_name"] == "Fresh Mission Buyers"
+    assert csv_path.exists()
+    assert parquet_path.exists()
+
+
+def test_stage7_campaign_playbook_contains_campaign_ready_fields(tmp_path):
+    cfg = _test_config(tmp_path)
+    final_index = pl.DataFrame(
+        [
+            {
+                "tribe_id": 7,
+                "tribe_name": "Fresh Meal Builders",
+                "customers": 250,
+                "actionability_proof": "Lifted-product proof: prepared salad",
+                "delivery_product": "Prepared Salad",
+                "top_product": "Prepared Salad",
+                "top_reach_product": "Chicken",
+                "total_spend_ratio_vs_rest": 1.2,
+                "visit_frequency_ratio_vs_rest": 1.1,
+                "promo_sensitivity_ratio_vs_rest": 0.9,
+                "distinctive_products": "Prepared Salad 2.1x",
+                "spend_and_visit_context": "Higher total spend",
+                "caveat": "Purchase behavior only.",
+            }
+        ]
+    )
+    playbook = stage7_campaign_playbook_table(final_index, cfg=cfg)
+    row = playbook.row(0, named=True)
+
+    assert row["tribe_id"] == 7
+    assert row["offer_idea"]
+    assert "Prepared Salad" in row["offer_idea"]
+    assert "Chicken" not in row["offer_idea"]
+    assert row["recommended_channel"]
+    assert row["suppression_rules"]
+    assert row["holdout_control_design"]
+    assert row["primary_kpi"]
+    assert row["expected_commercial_lever"]
+    assert row["risk_caveat"]
 

@@ -111,7 +111,14 @@ def run_candidate_model_suite(
                 soft_assignment=allow_noise_assignment,
                 strategy=noise_assignment_strategy if allow_noise_assignment else None,
             )
-            if bool(cfg.get("official_model_suite.two_stage_hdbscan.enabled", False)):
+            if _three_stage_hdbscan_enabled(cfg):
+                assignment, results, best = run_official_three_stage_hdbscan_lift_core(
+                    feature_path,
+                    umap_path,
+                    force=force,
+                    cfg=cfg,
+                )
+            elif bool(cfg.get("official_model_suite.two_stage_hdbscan.enabled", False)):
                 assignment, results, best = run_official_two_stage_hdbscan_lift_core(umap_path, force=force, cfg=cfg)
             else:
                 assignment, results, best = run_hdbscan(
@@ -225,7 +232,12 @@ def run_official_umap_hdbscan_core(
         trial=settings["trial_name"],
     ):
         umap_path = build_official_umap_core_representation(feature_path, force=force, cfg=cfg)
-        assignment, results, best = run_official_hdbscan_core(umap_path, force=force, cfg=cfg)
+        assignment, results, best = run_official_hdbscan_core(
+            umap_path,
+            feature_path=feature_path,
+            force=force,
+            cfg=cfg,
+        )
         _record_candidate(candidate_results, assignment_paths, result_paths, assignment, results, best)
 
     return {
@@ -322,11 +334,19 @@ def _official_pca_for_umap_summary_path(cfg: PipelineConfig) -> Path:
 
 def run_official_hdbscan_core(
     umap_path: str | Path,
+    feature_path: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Stage 6.2: run the official hard HDBSCAN core discovery flow."""
 
+    if _three_stage_hdbscan_enabled(cfg):
+        return run_official_three_stage_hdbscan_lift_core(
+            feature_path or _official_selection_feature_path(cfg),
+            umap_path,
+            force=force,
+            cfg=cfg,
+        )
     if bool(cfg.get("official_model_suite.two_stage_hdbscan.enabled", False)):
         return run_official_two_stage_hdbscan_lift_core(umap_path, force=force, cfg=cfg)
 
@@ -392,6 +412,70 @@ def official_two_stage_hdbscan_settings(cfg: PipelineConfig = CONFIG) -> dict[st
     }
 
 
+def _three_stage_hdbscan_enabled(cfg: PipelineConfig = CONFIG) -> bool:
+    return bool(cfg.get("official_model_suite.three_stage_hdbscan.enabled", False))
+
+
+def _official_selection_feature_path(cfg: PipelineConfig = CONFIG) -> Path:
+    feature_set = str(cfg.get("modeling.feature_set_for_selection", "embeddings_only"))
+    outputs = cfg.get("feature_sets.outputs", {}) or {}
+    filename = outputs.get(feature_set, f"feature_set_{feature_set}.parquet")
+    return cfg.outputs / "features" / str(filename)
+
+
+def official_three_stage_hdbscan_settings(cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
+    """Return settings for the official three-pass hard HDBSCAN flow."""
+
+    two_stage_settings = official_two_stage_hdbscan_settings(cfg)
+    three_stage = cfg.get("official_model_suite.three_stage_hdbscan", {}) or {}
+    legacy_probe = cfg.get("official_model_suite.two_stage_hdbscan.stage3_noise_probe", {}) or {}
+
+    third_stage_hdbscan = {
+        **dict(two_stage_settings["second_stage_overrides"]),
+        **dict(legacy_probe.get("hdbscan", {}) or {}),
+        **dict(three_stage.get("third_stage_hdbscan", {}) or {}),
+    }
+    if bool(third_stage_hdbscan.get("allow_noise_assignment", False)):
+        raise ValueError(
+            "Three-stage official HDBSCAN must keep noise unassigned. "
+            "Set official_model_suite.three_stage_hdbscan.third_stage_hdbscan.allow_noise_assignment=false."
+        )
+    third_stage_hdbscan["allow_noise_assignment"] = False
+    third_stage_hdbscan.pop("noise_assignment_strategy", None)
+
+    output_prefix = str(three_stage.get("output_prefix", "model_e_three_stage_hdbscan_lift_core"))
+    return {
+        "enabled": bool(three_stage.get("enabled", False)),
+        "base": two_stage_settings,
+        "three_stage": three_stage,
+        "first_stage_cfg": two_stage_settings["first_stage_cfg"],
+        "second_stage_cfg": two_stage_settings["second_stage_cfg"],
+        "third_stage_cfg": _config_with_section_overrides(cfg, "hdbscan", third_stage_hdbscan),
+        "third_stage_overrides": third_stage_hdbscan,
+        "min_noise_customers": int(
+            three_stage.get(
+                "min_noise_customers",
+                legacy_probe.get("min_noise_customers", third_stage_hdbscan.get("min_cluster_size", 2)),
+            )
+        ),
+        "trial_name": str(three_stage.get("trial_name", "three_stage_u20_n75_leaf_mcs_lift_core")),
+        "model_name": str(three_stage.get("model_name", "model_e_three_stage_hdbscan_lift_core")),
+        "output_prefix": output_prefix,
+        "algorithm_name": str(three_stage.get("algorithm_name", "UMAP_HDBSCAN_ThreeStageLiftCore")),
+        "feature_space": str(three_stage.get("feature_space", two_stage_settings["feature_space"])),
+        "variant_prefix": str(three_stage.get("variant_prefix", output_prefix)),
+        "third_stage_feature_space": str(
+            three_stage.get("third_stage_feature_space", f"{two_stage_settings['feature_space']}_stage2_noise")
+        ),
+        "lift_filter": {
+            **dict(two_stage_settings["lift_filter"]),
+            **dict(legacy_probe.get("lift_filter", {}) or {}),
+            **dict(three_stage.get("lift_filter", {}) or {}),
+        },
+        "promoted": two_stage_settings["promoted"],
+    }
+
+
 def stage3_noise_probe_settings(cfg: PipelineConfig = CONFIG) -> dict[str, Any]:
     """Return settings for a candidate-only HDBSCAN pass over remaining official noise."""
 
@@ -451,6 +535,34 @@ def two_stage_hdbscan_artifact_paths(
         "stage2_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_stage2_noise.parquet",
         "stage2_results_path": cfg.model_selection_cache / f"{output_prefix}_stage2_noise_results.parquet",
         "stage2_noise_feature_path": cfg.model_selection_cache / f"{output_prefix}_stage2_noise_features.parquet",
+        "unfiltered_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_unfiltered.parquet",
+        "unfiltered_profile_path": cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}_unfiltered.parquet",
+        "lift_evidence_path": lift_evidence_path,
+        "lift_evidence_csv_path": lift_evidence_path.with_suffix(".csv"),
+    }
+
+
+def three_stage_hdbscan_artifact_paths(
+    cfg: PipelineConfig = CONFIG,
+) -> dict[str, Path]:
+    """Return the standard official three-stage HDBSCAN artifact paths."""
+
+    settings = official_three_stage_hdbscan_settings(cfg)
+    output_prefix = settings["output_prefix"]
+    lift_evidence_path = cfg.artifacts / "stage6" / f"{output_prefix}_lift_filter_evidence.parquet"
+    return {
+        "assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}.parquet",
+        "results_path": cfg.model_selection_cache / f"{output_prefix}_results.parquet",
+        "stage1_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_stage1.parquet",
+        "stage1_results_path": cfg.model_selection_cache / f"{output_prefix}_stage1_results.parquet",
+        "stage2_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_stage2_noise.parquet",
+        "stage2_results_path": cfg.model_selection_cache / f"{output_prefix}_stage2_noise_results.parquet",
+        "stage2_noise_feature_path": cfg.model_selection_cache / f"{output_prefix}_stage2_noise_features.parquet",
+        "stage2_unfiltered_assignment_path": cfg.model_selection_cache
+        / f"cluster_assignments_{output_prefix}_stage1_stage2_unfiltered.parquet",
+        "stage3_noise_feature_path": cfg.model_selection_cache / f"{output_prefix}_stage3_remaining_noise_features.parquet",
+        "stage3_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_stage3_remaining_noise.parquet",
+        "stage3_results_path": cfg.model_selection_cache / f"{output_prefix}_stage3_remaining_noise_results.parquet",
         "unfiltered_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_unfiltered.parquet",
         "unfiltered_profile_path": cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}_unfiltered.parquet",
         "lift_evidence_path": lift_evidence_path,
@@ -572,6 +684,45 @@ def _with_current_two_stage_result_paths(
     return patched
 
 
+def _with_current_three_stage_result_paths(
+    result: dict[str, Any],
+    paths: dict[str, Path],
+    *,
+    stage1_assignment_path: Path | None = None,
+    stage1_results_path: Path | None = None,
+    stage2_assignment_path: Path | None = None,
+    stage2_results_path: Path | None = None,
+    stage2_noise_feature_path: Path | None = None,
+    stage3_assignment_path: Path | None = None,
+    stage3_results_path: Path | None = None,
+    stage3_noise_feature_path: Path | None = None,
+) -> dict[str, Any]:
+    patched = _with_current_two_stage_result_paths(
+        result,
+        paths,
+        stage1_assignment_path=stage1_assignment_path,
+        stage1_results_path=stage1_results_path,
+        stage2_assignment_path=stage2_assignment_path,
+        stage2_results_path=stage2_results_path,
+        stage2_noise_feature_path=stage2_noise_feature_path,
+    )
+    patched["stage2_unfiltered_assignment_path"] = str(paths["stage2_unfiltered_assignment_path"])
+    patched["stage3_noise_feature_path"] = str(stage3_noise_feature_path or paths["stage3_noise_feature_path"])
+    patched["stage3_assignment_path"] = _current_optional_result_path(
+        patched,
+        "stage3_assignment_path",
+        paths["stage3_assignment_path"],
+        stage3_assignment_path,
+    )
+    patched["stage3_result_path"] = _current_optional_result_path(
+        patched,
+        "stage3_result_path",
+        paths["stage3_results_path"],
+        stage3_results_path,
+    )
+    return patched
+
+
 def stage3_noise_probe_artifact_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
     settings = stage3_noise_probe_settings(cfg)
     output_prefix = settings["output_prefix"]
@@ -615,6 +766,36 @@ def _two_stage_cache_metadata(
         "profiling": cfg.get("profiling", {}),
         "quality_gates": cfg.get("quality_gates", {}),
         "assignment_schema_version": 2,
+    }
+
+
+def _three_stage_cache_metadata(
+    feature_path: str | Path,
+    umap_path: str | Path,
+    settings: dict[str, Any],
+    behavior_path: Path | None,
+    cfg: PipelineConfig,
+) -> dict[str, Any]:
+    return {
+        "stage": "three_stage_hdbscan_lift_core",
+        "mode": cfg.mode,
+        "feature_path": file_fingerprint(feature_path),
+        "umap_path": file_fingerprint(umap_path),
+        "prepared_transactions": file_fingerprint(cfg.prepared_transactions_path),
+        "behavior": file_fingerprint(behavior_path) if behavior_path else None,
+        "output_prefix": settings["output_prefix"],
+        "model_name": settings["model_name"],
+        "algorithm_name": settings["algorithm_name"],
+        "feature_space": settings["feature_space"],
+        "trial_name": settings["trial_name"],
+        "first_stage_hdbscan": settings["base"]["base"]["hdbscan_overrides"],
+        "second_stage_hdbscan": settings["base"]["second_stage_overrides"],
+        "third_stage_hdbscan": settings["third_stage_overrides"],
+        "third_stage_representation": "stage6_1_umap_remaining_noise_subset",
+        "lift_filter": settings["lift_filter"],
+        "profiling": cfg.get("profiling", {}),
+        "quality_gates": cfg.get("quality_gates", {}),
+        "assignment_schema_version": 4,
     }
 
 
@@ -698,6 +879,172 @@ def run_official_two_stage_hdbscan_second_pass(
         cfg=settings["second_stage_cfg"],
     )
     return noise_feature_path, noise_rows, stage2_assignment, stage2_results, stage2_best
+
+
+def run_official_three_stage_hdbscan_first_pass(
+    umap_path: str | Path,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Run the first hard HDBSCAN pass for the official three-stage flow."""
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    stage1_prefix = f"{settings['output_prefix']}_stage1"
+    return run_hdbscan(
+        umap_path,
+        output_prefix=stage1_prefix,
+        model_label="Model E",
+        model_name=f"{settings['model_name']}_stage1",
+        algorithm_name="UMAP_HDBSCAN_Stage1",
+        feature_space=settings["feature_space"],
+        trial_name=f"{settings['trial_name']}_stage1",
+        variant_prefix=f"{settings['variant_prefix']}_stage1",
+        scale_features=False,
+        force=force,
+        allow_noise_assignment=False,
+        cfg=settings["first_stage_cfg"],
+    )
+
+
+def run_official_three_stage_hdbscan_second_pass(
+    umap_path: str | Path,
+    stage1_assignment_path: str | Path | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, int, Path | None, Path | None, dict[str, Any]]:
+    """Run the second hard HDBSCAN pass over first-pass noise for the three-stage flow."""
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    paths = three_stage_hdbscan_artifact_paths(cfg)
+    stage1_assignment = Path(stage1_assignment_path) if stage1_assignment_path else paths["stage1_assignment_path"]
+    noise_feature_path = paths["stage2_noise_feature_path"]
+    noise_rows = _write_stage2_noise_feature_subset(
+        umap_path,
+        stage1_assignment,
+        noise_feature_path,
+        cfg=cfg,
+    )
+    min_stage2_rows = max(int(settings["second_stage_cfg"].get("hdbscan.min_cluster_size", 2)), 2)
+    if noise_rows < min_stage2_rows:
+        log_event(
+            "Stage 6.3 second-pass HDBSCAN",
+            "skipping second pass because first-pass noise is below min_cluster_size",
+            cfg=settings["second_stage_cfg"],
+            noise_customers=noise_rows,
+            min_cluster_size=min_stage2_rows,
+        )
+        return (
+            noise_feature_path,
+            noise_rows,
+            None,
+            None,
+            {"cluster_count": 0, "noise_pct": 100.0 if noise_rows else 0.0, "assignment_path": None},
+        )
+
+    stage2_prefix = f"{settings['output_prefix']}_stage2_noise"
+    stage2_assignment, stage2_results, stage2_best = run_hdbscan(
+        noise_feature_path,
+        output_prefix=stage2_prefix,
+        model_label="Model E",
+        model_name=f"{settings['model_name']}_stage2",
+        algorithm_name="UMAP_HDBSCAN_Stage2Noise",
+        feature_space=f"{settings['feature_space']}_stage1_noise",
+        trial_name=f"{settings['trial_name']}_stage2_noise",
+        variant_prefix=f"{settings['variant_prefix']}_stage2",
+        scale_features=False,
+        force=force,
+        allow_noise_assignment=False,
+        cfg=settings["second_stage_cfg"],
+    )
+    return noise_feature_path, noise_rows, stage2_assignment, stage2_results, stage2_best
+
+
+def run_official_three_stage_hdbscan_third_pass(
+    umap_path: str | Path,
+    *,
+    stage1_assignment_path: str | Path | None = None,
+    stage2_assignment_path: str | Path | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, int, Path | None, Path | None, dict[str, Any]]:
+    """Run the third hard HDBSCAN pass on remaining noise in the Stage 6.1 UMAP space."""
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    paths = three_stage_hdbscan_artifact_paths(cfg)
+    stage1_assignment = Path(stage1_assignment_path) if stage1_assignment_path else paths["stage1_assignment_path"]
+    stage2_assignment = Path(stage2_assignment_path) if stage2_assignment_path is not None else None
+
+    interim = _merge_hdbscan_assignment_stages(
+        [
+            {
+                "path": stage1_assignment,
+                "prefix": "stage1",
+                "core_source": "three_stage_hdbscan_stage1_core",
+            },
+            {
+                "path": stage2_assignment if stage2_assignment is not None and stage2_assignment.exists() else None,
+                "prefix": "stage2",
+                "core_source": "three_stage_hdbscan_stage2_noise_core",
+            },
+        ],
+        model_name=settings["model_name"],
+        model_variant=_three_stage_model_variant(settings),
+        noise_source="three_stage_hdbscan_noise_unassigned",
+    )
+    paths["stage2_unfiltered_assignment_path"].parent.mkdir(parents=True, exist_ok=True)
+    interim.write_parquet(paths["stage2_unfiltered_assignment_path"])
+    write_artifact_metadata(
+        paths["stage2_unfiltered_assignment_path"],
+        {"stage": "three_stage_hdbscan_stage1_stage2_interim_assignment", "mode": cfg.mode},
+    )
+
+    noise_feature_path = paths["stage3_noise_feature_path"]
+    noise_rows = _write_remaining_noise_feature_subset(
+        umap_path,
+        paths["stage2_unfiltered_assignment_path"],
+        noise_feature_path,
+        cfg=cfg,
+        metadata_stage="three_stage_hdbscan_stage3_noise_feature_subset",
+    )
+    min_stage3_rows = max(int(settings["min_noise_customers"]), int(settings["third_stage_cfg"].get("hdbscan.min_cluster_size", 2)), 3)
+    if noise_rows < min_stage3_rows:
+        log_event(
+            "Stage 6.4 third-pass HDBSCAN",
+            "skipping third pass because remaining noise is below configured minimum",
+            cfg=settings["third_stage_cfg"],
+            noise_customers=noise_rows,
+            min_noise_customers=min_stage3_rows,
+        )
+        return (
+            noise_feature_path,
+            noise_rows,
+            None,
+            None,
+            {"cluster_count": 0, "noise_pct": 100.0 if noise_rows else 0.0, "assignment_path": None},
+        )
+
+    stage3_prefix = f"{settings['output_prefix']}_stage3_remaining_noise"
+    stage3_assignment, stage3_results, stage3_best = run_hdbscan(
+        noise_feature_path,
+        output_prefix=stage3_prefix,
+        model_label="Model E",
+        model_name=f"{settings['model_name']}_stage3",
+        algorithm_name="UMAP_HDBSCAN_Stage3Noise",
+        feature_space=settings["third_stage_feature_space"],
+        trial_name=f"{settings['trial_name']}_stage3_noise",
+        variant_prefix=f"{settings['variant_prefix']}_stage3",
+        scale_features=False,
+        force=force,
+        allow_noise_assignment=False,
+        cfg=settings["third_stage_cfg"],
+    )
+    return noise_feature_path, noise_rows, stage3_assignment, stage3_results, stage3_best
 
 
 def build_stage6_stage3_noise_umap_probe(
@@ -957,6 +1304,305 @@ def _stage6_remaining_noise_recommendation(
     if lift_supported_candidate_tribes > 0:
         return "Candidate-only lifted structure found; review before any future promotion into official tribes."
     return "Candidate HDBSCAN ran, but no lift-supported candidate tribes survived the product evidence gate."
+
+
+def merge_official_three_stage_hdbscan_lift_core(
+    feature_path: str | Path,
+    umap_path: str | Path,
+    *,
+    stage1_assignment_path: str | Path | None = None,
+    stage1_results_path: str | Path | None = None,
+    stage2_assignment_path: str | Path | None = None,
+    stage2_results_path: str | Path | None = None,
+    stage2_noise_feature_path: str | Path | None = None,
+    stage2_noise_customers: int | None = None,
+    stage3_assignment_path: str | Path | None = None,
+    stage3_results_path: str | Path | None = None,
+    stage3_noise_feature_path: str | Path | None = None,
+    stage3_noise_customers: int | None = None,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Merge first/second/third hard HDBSCAN passes, then retain lifted clusters."""
+
+    from src.profiling import profile_tribes
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    paths = three_stage_hdbscan_artifact_paths(cfg)
+    assignment_path = paths["assignment_path"]
+    results_path = paths["results_path"]
+    unfiltered_assignment_path = paths["unfiltered_assignment_path"]
+    unfiltered_profile_path = paths["unfiltered_profile_path"]
+    lift_evidence_path = paths["lift_evidence_path"]
+    lift_evidence_csv_path = paths["lift_evidence_csv_path"]
+    stage1_assignment = Path(stage1_assignment_path) if stage1_assignment_path else paths["stage1_assignment_path"]
+    stage1_results = Path(stage1_results_path) if stage1_results_path else paths["stage1_results_path"]
+    stage2_assignment = Path(stage2_assignment_path) if stage2_assignment_path is not None else None
+    stage2_results = Path(stage2_results_path) if stage2_results_path is not None else None
+    stage2_noise_features = Path(stage2_noise_feature_path) if stage2_noise_feature_path else paths["stage2_noise_feature_path"]
+    stage3_assignment = Path(stage3_assignment_path) if stage3_assignment_path is not None else None
+    stage3_results = Path(stage3_results_path) if stage3_results_path is not None else None
+    stage3_noise_features = Path(stage3_noise_feature_path) if stage3_noise_feature_path else paths["stage3_noise_feature_path"]
+    behavior_path = _optional_behavior_feature_path(cfg)
+    cache_metadata = _three_stage_cache_metadata(feature_path, umap_path, settings, behavior_path, cfg)
+    use_cached = cfg.get("cache.use_cached", True)
+    if _should_use_cached_artifact_set(
+        _two_stage_primary_cache_paths(paths),
+        force=force,
+        use_cached=use_cached,
+        metadata=cache_metadata,
+    ) and _ensure_two_stage_lift_evidence_artifacts(paths, settings, cache_metadata, cfg):
+        log_event("Stage 6.5 three-stage merge", "cache hit", cfg=cfg, results=results_path)
+        result = pl.read_parquet(results_path).row(0, named=True)
+        result = _with_current_three_stage_result_paths(
+            result,
+            paths,
+            stage1_assignment_path=stage1_assignment,
+            stage1_results_path=stage1_results,
+            stage2_assignment_path=stage2_assignment,
+            stage2_results_path=stage2_results,
+            stage2_noise_feature_path=stage2_noise_features,
+            stage3_assignment_path=stage3_assignment,
+            stage3_results_path=stage3_results,
+            stage3_noise_feature_path=stage3_noise_features,
+        )
+        pl.DataFrame([result]).write_parquet(results_path)
+        write_artifact_metadata(results_path, cache_metadata)
+        return assignment_path, results_path, result
+
+    stage1_best = pl.read_parquet(stage1_results).row(0, named=True) if stage1_results.exists() else {}
+    stage2_best = (
+        pl.read_parquet(stage2_results).row(0, named=True)
+        if stage2_results is not None and stage2_results.exists()
+        else {"cluster_count": 0, "noise_pct": 100.0 if stage2_noise_customers else 0.0, "assignment_path": None}
+    )
+    stage3_best = (
+        pl.read_parquet(stage3_results).row(0, named=True)
+        if stage3_results is not None and stage3_results.exists()
+        else {"cluster_count": 0, "noise_pct": 100.0 if stage3_noise_customers else 0.0, "assignment_path": None}
+    )
+    stage2_noise_rows = (
+        int(stage2_noise_customers)
+        if stage2_noise_customers is not None
+        else _row_count(stage2_noise_features) if stage2_noise_features.exists() else 0
+    )
+    stage3_noise_rows = (
+        int(stage3_noise_customers)
+        if stage3_noise_customers is not None
+        else _row_count(stage3_noise_features) if stage3_noise_features.exists() else 0
+    )
+    variant = _three_stage_model_variant(settings)
+    unfiltered_assignments = _merge_hdbscan_assignment_stages(
+        [
+            {"path": stage1_assignment, "prefix": "stage1", "core_source": "three_stage_hdbscan_stage1_core"},
+            {
+                "path": stage2_assignment if stage2_assignment and stage2_assignment.exists() else None,
+                "prefix": "stage2",
+                "core_source": "three_stage_hdbscan_stage2_noise_core",
+            },
+            {
+                "path": stage3_assignment if stage3_assignment and stage3_assignment.exists() else None,
+                "prefix": "stage3",
+                "core_source": "three_stage_hdbscan_stage3_remaining_noise_core",
+            },
+        ],
+        model_name=settings["model_name"],
+        model_variant=variant,
+        noise_source="three_stage_hdbscan_noise_unassigned",
+    )
+    unfiltered_assignment_path.parent.mkdir(parents=True, exist_ok=True)
+    unfiltered_assignments.write_parquet(unfiltered_assignment_path)
+    write_artifact_metadata(unfiltered_assignment_path, cache_metadata)
+
+    profile_path = profile_tribes(
+        unfiltered_assignment_path,
+        output_path=unfiltered_profile_path,
+        force=force,
+        enable_copurchase=False,
+        enable_temporal=False,
+        enable_loyalty=False,
+        enable_llm=False,
+        cfg=cfg,
+    )
+    lift_evidence = _product_lift_filter_evidence(pl.read_parquet(profile_path), settings["lift_filter"], cfg=cfg)
+    lift_evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    lift_evidence.write_parquet(lift_evidence_path)
+    _lift_evidence_csv_frame(lift_evidence).write_csv(lift_evidence_csv_path)
+    write_artifact_metadata(lift_evidence_path, cache_metadata)
+    write_artifact_metadata(lift_evidence_csv_path, cache_metadata)
+
+    final_assignments, lift_stats = _apply_lift_filter_to_assignments(
+        unfiltered_assignments,
+        lift_evidence,
+        rejected_source="three_stage_hdbscan_lift_rejected",
+    )
+    assignment_path.parent.mkdir(parents=True, exist_ok=True)
+    final_assignments.write_parquet(assignment_path)
+    metrics, confidence_mean = _evaluate_assignment_on_umap(umap_path, final_assignments, cfg=settings["first_stage_cfg"])
+    passes_gate, gate_reason = quality_gate_result(metrics, cfg=settings["first_stage_cfg"])
+    unfiltered_summary = cluster_size_summary(unfiltered_assignments["tribe_id"].to_numpy().astype(np.int32))
+    result = {
+        "model": "Model E",
+        "model_id": settings["model_name"],
+        "model_name": settings["model_name"],
+        "algorithm_name": settings["algorithm_name"],
+        "model_variant": variant,
+        "feature_space": settings["feature_space"],
+        "trial_name": settings["trial_name"],
+        "promoted_from_experiment": settings["promoted"].get("promoted_from_experiment"),
+        "hdbscan_backend": "three_stage_run_hdbscan",
+        "scale_features": False,
+        "assignment_policy": "hard_three_stage_hdbscan_lift_core_noise_retained",
+        "soft_assignment_enabled": False,
+        "soft_assignment_strategy": None,
+        "soft_assignment_distance_threshold": None,
+        "soft_assigned_customers": 0,
+        "soft_assigned_pct": 0.0,
+        "soft_assignment_confidence_mean": None,
+        "soft_assignment_confidence_p10": None,
+        "soft_assignment_confidence_min": None,
+        "stage1_assignment_path": str(stage1_assignment),
+        "stage1_result_path": str(stage1_results),
+        "stage1_cluster_count": int(stage1_best.get("cluster_count") or 0),
+        "stage1_noise_pct": stage1_best.get("noise_pct"),
+        "stage1_core_coverage_pct": stage1_best.get("core_coverage_pct")
+        or (100.0 - float(stage1_best.get("noise_pct") or 0.0)),
+        "stage2_noise_feature_path": str(stage2_noise_features),
+        "stage2_noise_customers": int(stage2_noise_rows),
+        "stage2_assignment_path": str(stage2_assignment) if stage2_assignment else None,
+        "stage2_result_path": str(stage2_results) if stage2_results else None,
+        "stage2_cluster_count": int(stage2_best.get("cluster_count") or 0),
+        "stage2_noise_pct_within_stage1_noise": stage2_best.get("noise_pct"),
+        "stage2_unfiltered_assignment_path": str(paths["stage2_unfiltered_assignment_path"]),
+        "stage3_noise_feature_path": str(stage3_noise_features),
+        "stage3_noise_customers": int(stage3_noise_rows),
+        "stage3_feature_space": settings["third_stage_feature_space"],
+        "stage3_representation_policy": "stage6_1_umap_remaining_noise_subset",
+        "stage3_assignment_path": str(stage3_assignment) if stage3_assignment else None,
+        "stage3_result_path": str(stage3_results) if stage3_results else None,
+        "stage3_cluster_count": int(stage3_best.get("cluster_count") or 0),
+        "stage3_noise_pct_within_remaining_noise": stage3_best.get("noise_pct"),
+        "unfiltered_assignment_path": str(unfiltered_assignment_path),
+        "unfiltered_profile_path": str(profile_path),
+        "lift_filter_evidence_path": str(lift_evidence_path),
+        "lift_filter_evidence_csv_path": str(lift_evidence_csv_path),
+        "unfiltered_cluster_count": int(unfiltered_summary.get("cluster_count") or 0),
+        "unfiltered_noise_pct": unfiltered_summary.get("noise_pct"),
+        "lift_supported_cluster_count": int(lift_stats["kept_cluster_count"]),
+        "lift_rejected_cluster_count": int(lift_stats["rejected_cluster_count"]),
+        "lift_rejected_customers": int(lift_stats["rejected_customer_count"]),
+        "strong_product_lift_threshold": float(cfg.get("profiling.strong_product_lift_threshold", 1.5)),
+        "min_strong_product_lifts": int(
+            settings["lift_filter"].get(
+                "min_strong_product_lifts",
+                cfg.get("quality_gates.min_strong_product_lifts_per_cluster", 1),
+            )
+        ),
+        "require_significant_product_lift": bool(settings["lift_filter"].get("require_significant_product_lift", False)),
+        **metrics,
+        "avg_assignment_confidence": confidence_mean,
+        "core_coverage_pct": metrics.get("coverage_pct"),
+        "core_noise_pct": metrics.get("noise_pct"),
+        "final_noise_pct": metrics.get("noise_pct"),
+        "passes_quality_gate": passes_gate,
+        "quality_gate_reason": gate_reason,
+        "assignment_path": str(assignment_path),
+        "selection_rank": 1,
+        "selected_within_family": passes_gate,
+        "stage6_flow": "6.1_umap_6.2_first_hdbscan_6.3_second_noise_hdbscan_6.4_third_noise_hdbscan_6.5_merge_lift_filter",
+    }
+    pl.DataFrame([result]).write_parquet(results_path)
+    write_artifact_metadata(assignment_path, cache_metadata)
+    write_artifact_metadata(results_path, cache_metadata)
+    log_event(
+        "Stage 6.5 three-stage merge",
+        "model evaluated",
+        cfg=cfg,
+        clusters=result["cluster_count"],
+        noise_pct=result["noise_pct"],
+        kept_clusters=result["lift_supported_cluster_count"],
+        rejected_clusters=result["lift_rejected_cluster_count"],
+    )
+    return assignment_path, results_path, result
+
+
+def run_official_three_stage_hdbscan_lift_core(
+    feature_path: str | Path,
+    umap_path: str | Path,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Run three hard HDBSCAN passes, then keep only product-lift-supported clusters."""
+
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    paths = three_stage_hdbscan_artifact_paths(cfg)
+    behavior_path = _optional_behavior_feature_path(cfg)
+    cache_metadata = _three_stage_cache_metadata(feature_path, umap_path, settings, behavior_path, cfg)
+    if _should_use_cached_artifact_set(
+        _two_stage_primary_cache_paths(paths),
+        force=force,
+        use_cached=cfg.get("cache.use_cached", True),
+        metadata=cache_metadata,
+    ) and _ensure_two_stage_lift_evidence_artifacts(paths, settings, cache_metadata, cfg):
+        result = pl.read_parquet(paths["results_path"]).row(0, named=True)
+        result = _with_current_three_stage_result_paths(result, paths)
+        pl.DataFrame([result]).write_parquet(paths["results_path"])
+        write_artifact_metadata(paths["results_path"], cache_metadata)
+        log_event("Stage 6 three-stage HDBSCAN", "cache hit", cfg=cfg, results=paths["results_path"])
+        return paths["assignment_path"], paths["results_path"], result
+
+    with stage_timer(
+        "Stage 6 three-stage HDBSCAN",
+        "fitting hard density clusters across three noise passes",
+        cfg=settings["first_stage_cfg"],
+        trial=settings["trial_name"],
+    ):
+        stage1_assignment, stage1_results, _ = run_official_three_stage_hdbscan_first_pass(
+            umap_path,
+            force=force,
+            cfg=cfg,
+        )
+        stage2_noise_feature, stage2_noise_rows, stage2_assignment, stage2_results, _ = (
+            run_official_three_stage_hdbscan_second_pass(
+                umap_path,
+                stage1_assignment_path=stage1_assignment,
+                force=force,
+                cfg=cfg,
+            )
+        )
+        (
+            stage3_noise_feature,
+            stage3_noise_rows,
+            stage3_assignment,
+            stage3_results,
+            _,
+        ) = run_official_three_stage_hdbscan_third_pass(
+            umap_path,
+            stage1_assignment_path=stage1_assignment,
+            stage2_assignment_path=stage2_assignment,
+            force=force,
+            cfg=cfg,
+        )
+        return merge_official_three_stage_hdbscan_lift_core(
+            feature_path,
+            umap_path,
+            stage1_assignment_path=stage1_assignment,
+            stage1_results_path=stage1_results,
+            stage2_assignment_path=stage2_assignment,
+            stage2_results_path=stage2_results,
+            stage2_noise_feature_path=stage2_noise_feature,
+            stage2_noise_customers=stage2_noise_rows,
+            stage3_assignment_path=stage3_assignment,
+            stage3_results_path=stage3_results,
+            stage3_noise_feature_path=stage3_noise_feature,
+            stage3_noise_customers=stage3_noise_rows,
+            force=force,
+            cfg=cfg,
+        )
 
 
 def merge_official_two_stage_hdbscan_lift_core(
@@ -1383,6 +2029,21 @@ def _two_stage_model_variant(settings: dict[str, Any]) -> str:
     )
 
 
+def _three_stage_model_variant(settings: dict[str, Any]) -> str:
+    first_cfg = settings["first_stage_cfg"]
+    second_cfg = settings["second_stage_cfg"]
+    third_cfg = settings["third_stage_cfg"]
+    return (
+        f"{settings['variant_prefix']}_"
+        f"stage1_mcs{first_cfg.get('hdbscan.min_cluster_size')}_ms{first_cfg.get('hdbscan.min_samples')}_"
+        f"{first_cfg.get('hdbscan.cluster_selection_method')}_"
+        f"stage2_mcs{second_cfg.get('hdbscan.min_cluster_size')}_ms{second_cfg.get('hdbscan.min_samples')}_"
+        f"{second_cfg.get('hdbscan.cluster_selection_method')}_"
+        f"stage3_mcs{third_cfg.get('hdbscan.min_cluster_size')}_ms{third_cfg.get('hdbscan.min_samples')}_"
+        f"{third_cfg.get('hdbscan.cluster_selection_method')}_lift"
+    )
+
+
 def _write_stage2_noise_feature_subset(
     umap_path: str | Path,
     stage1_assignment_path: str | Path,
@@ -1537,61 +2198,93 @@ def _merge_two_stage_hdbscan_assignments(
     model_name: str,
     model_variant: str,
 ) -> pl.DataFrame:
-    stage1 = _assignment_stage_frame(stage1_assignment_path, "stage1")
-    stage2 = _assignment_stage_frame(stage2_assignment_path, "stage2")
-    stage1_labels = stage1["stage1_tribe_id"].to_list() if "stage1_tribe_id" in stage1.columns else []
-    stage2_labels = stage2["stage2_tribe_id"].to_list() if "stage2_tribe_id" in stage2.columns else []
-    stage1_map = _label_mapping(stage1_labels, offset=0).rename(
-        {"source_tribe_id": "stage1_tribe_id", "final_tribe_id": "stage1_final_tribe_id"}
+    return _merge_hdbscan_assignment_stages(
+        [
+            {
+                "path": stage1_assignment_path,
+                "prefix": "stage1",
+                "core_source": "two_stage_hdbscan_stage1_core",
+            },
+            {
+                "path": stage2_assignment_path,
+                "prefix": "stage2",
+                "core_source": "two_stage_hdbscan_stage2_noise_core",
+            },
+        ],
+        model_name=model_name,
+        model_variant=model_variant,
+        noise_source="two_stage_hdbscan_noise_unassigned",
     )
-    stage2_offset = stage1_map.height
-    stage2_map = _label_mapping(stage2_labels, offset=stage2_offset).rename(
-        {"source_tribe_id": "stage2_tribe_id", "final_tribe_id": "stage2_final_tribe_id"}
-    )
-    joined = stage1.join(stage2, on="cliente", how="left").join(stage1_map, on="stage1_tribe_id", how="left")
-    if stage2_map.height:
-        joined = joined.join(stage2_map, on="stage2_tribe_id", how="left")
-    else:
-        joined = joined.with_columns(pl.lit(None).cast(pl.Int32).alias("stage2_final_tribe_id"))
 
-    stage1_core = pl.col("stage1_final_tribe_id").is_not_null()
-    stage2_core = pl.col("stage2_final_tribe_id").is_not_null()
+
+def _merge_hdbscan_assignment_stages(
+    stages: list[dict[str, Any]],
+    *,
+    model_name: str,
+    model_variant: str,
+    noise_source: str,
+) -> pl.DataFrame:
+    if not stages:
+        return pl.DataFrame(
+            schema={
+                "cliente": pl.Utf8,
+                "tribe_id": pl.Int32,
+                "model_name": pl.Utf8,
+                "model_variant": pl.Utf8,
+                "assignment_probability": pl.Float32,
+                "assignment_confidence_score": pl.Float32,
+                "assignment_confidence_type": pl.Utf8,
+                "assignment_source": pl.Utf8,
+            }
+        )
+
+    prepared: list[dict[str, Any]] = []
+    offset = 0
+    for stage in stages:
+        prefix = str(stage["prefix"])
+        frame = _assignment_stage_frame(stage.get("path"), prefix)
+        labels = frame[f"{prefix}_tribe_id"].to_list() if f"{prefix}_tribe_id" in frame.columns else []
+        mapping = _label_mapping(labels, offset=offset).rename(
+            {"source_tribe_id": f"{prefix}_tribe_id", "final_tribe_id": f"{prefix}_final_tribe_id"}
+        )
+        offset += mapping.height
+        prepared.append({**stage, "frame": frame, "mapping": mapping})
+
+    joined = prepared[0]["frame"]
+    for stage in prepared[1:]:
+        joined = joined.join(stage["frame"], on="cliente", how="left")
+    for stage in prepared:
+        mapping = stage["mapping"]
+        prefix = str(stage["prefix"])
+        if mapping.height:
+            joined = joined.join(mapping, on=f"{prefix}_tribe_id", how="left")
+        else:
+            joined = joined.with_columns(pl.lit(None).cast(pl.Int32).alias(f"{prefix}_final_tribe_id"))
+
+    core_exprs = [pl.col(f"{stage['prefix']}_final_tribe_id").is_not_null() for stage in prepared]
+    tribe_expr = pl.when(core_exprs[0]).then(pl.col(f"{prepared[0]['prefix']}_final_tribe_id"))
+    probability_expr = pl.when(core_exprs[0]).then(pl.col(f"{prepared[0]['prefix']}_assignment_probability"))
+    confidence_expr = pl.when(core_exprs[0]).then(pl.col(f"{prepared[0]['prefix']}_assignment_confidence_score"))
+    confidence_type_expr = pl.when(core_exprs[0]).then(pl.col(f"{prepared[0]['prefix']}_assignment_confidence_type"))
+    source_expr = pl.when(core_exprs[0]).then(pl.lit(str(prepared[0]["core_source"])))
+    for stage, core_expr in zip(prepared[1:], core_exprs[1:]):
+        prefix = str(stage["prefix"])
+        tribe_expr = tribe_expr.when(core_expr).then(pl.col(f"{prefix}_final_tribe_id"))
+        probability_expr = probability_expr.when(core_expr).then(pl.col(f"{prefix}_assignment_probability"))
+        confidence_expr = confidence_expr.when(core_expr).then(pl.col(f"{prefix}_assignment_confidence_score"))
+        confidence_type_expr = confidence_type_expr.when(core_expr).then(pl.col(f"{prefix}_assignment_confidence_type"))
+        source_expr = source_expr.when(core_expr).then(pl.lit(str(stage["core_source"])))
+
     return (
         joined.with_columns(
             [
-                pl.when(stage1_core)
-                .then(pl.col("stage1_final_tribe_id"))
-                .when(stage2_core)
-                .then(pl.col("stage2_final_tribe_id"))
-                .otherwise(pl.lit(-1))
-                .cast(pl.Int32)
-                .alias("tribe_id"),
+                tribe_expr.otherwise(pl.lit(-1)).cast(pl.Int32).alias("tribe_id"),
                 pl.lit(model_name).alias("model_name"),
                 pl.lit(model_variant).alias("model_variant"),
-                pl.when(stage1_core)
-                .then(pl.col("stage1_assignment_probability"))
-                .when(stage2_core)
-                .then(pl.col("stage2_assignment_probability"))
-                .otherwise(pl.lit(None).cast(pl.Float32))
-                .alias("assignment_probability"),
-                pl.when(stage1_core)
-                .then(pl.col("stage1_assignment_confidence_score"))
-                .when(stage2_core)
-                .then(pl.col("stage2_assignment_confidence_score"))
-                .otherwise(pl.lit(None).cast(pl.Float32))
-                .alias("assignment_confidence_score"),
-                pl.when(stage1_core)
-                .then(pl.col("stage1_assignment_confidence_type"))
-                .when(stage2_core)
-                .then(pl.col("stage2_assignment_confidence_type"))
-                .otherwise(pl.lit(None).cast(pl.Utf8))
-                .alias("assignment_confidence_type"),
-                pl.when(stage1_core)
-                .then(pl.lit("two_stage_hdbscan_stage1_core"))
-                .when(stage2_core)
-                .then(pl.lit("two_stage_hdbscan_stage2_noise_core"))
-                .otherwise(pl.lit("two_stage_hdbscan_noise_unassigned"))
-                .alias("assignment_source"),
+                probability_expr.otherwise(pl.lit(None).cast(pl.Float32)).alias("assignment_probability"),
+                confidence_expr.otherwise(pl.lit(None).cast(pl.Float32)).alias("assignment_confidence_score"),
+                confidence_type_expr.otherwise(pl.lit(None).cast(pl.Utf8)).alias("assignment_confidence_type"),
+                source_expr.otherwise(pl.lit(noise_source)).alias("assignment_source"),
             ]
         )
         .select(
@@ -1962,6 +2655,7 @@ def build_stage6_hdbscan_diagnostics(
     hard_core_policies = {
         "hard_hdbscan_core_noise_retained",
         "hard_two_stage_hdbscan_lift_core_noise_retained",
+        "hard_three_stage_hdbscan_lift_core_noise_retained",
     }
 
     blocking_issues = []

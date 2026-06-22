@@ -39,6 +39,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.tmp/
 
 # JUPYTER
 .ipynb_checkpoints/

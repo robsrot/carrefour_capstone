@@ -331,6 +331,23 @@ official_model_suite:
     lift_filter:
       min_strong_product_lifts: 2
       require_significant_product_lift: true
+  three_stage_hdbscan:
+    enabled: true
+    trial_name: three_stage_u20_n75_leaf_mcs500_ms12_lift_core
+    model_name: model_e_three_stage_hdbscan_lift_core
+    output_prefix: model_e_three_stage_hdbscan_lift_core
+    algorithm_name: UMAP_HDBSCAN_ThreeStageLiftCore
+    feature_space: umap_customer_embeddings_pca64_u20_n75
+    variant_prefix: three_stage_u20_n75_leaf_mcs500_ms12
+    min_noise_customers: 100
+    third_stage_hdbscan:
+      min_cluster_size: 150
+      min_samples: 8
+      cluster_selection_method: leaf
+      allow_noise_assignment: false
+    lift_filter:
+      min_strong_product_lifts: 2
+      require_significant_product_lift: true
 
 stability:
   sample_size: 10000
@@ -407,6 +424,25 @@ profiling:
   noise_audit_strong_lift_threshold: 1.25
   noise_audit_high_noise_pct: 60.0
   noise_audit_second_pass_signal_count: 5
+  remaining_affinity_max_features: 64
+  remaining_affinity_chunk_size: 100000
+  remaining_near_tribe_min_affinity: 0.70
+  remaining_near_tribe_min_margin: 0.10
+  remaining_bridge_min_affinity: 0.58
+  remaining_bridge_max_margin: 0.06
+  soft_audience_min_affinity: 0.70
+  soft_audience_min_margin: 0.10
+  soft_audience_medium_affinity: 0.58
+  soft_audience_medium_margin: 0.04
+  stage7_delivery_readiness:
+    enabled: true
+    fail_on_critical: true
+    min_product_customer_count: 50
+    min_product_reach_pct: 1.0
+    max_unclear_long_tail_share_pct: 50.0
+    max_single_remaining_segment_share_pct: 80.0
+    min_persona_word_count: 45
+    activation_customer_export_required: true
   min_ready_evidence_signals: 1
   tribe_name_lookup: {}
   # Stage 7 accepts Stage 6.6 readiness as final. These are Stage 6.6

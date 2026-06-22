@@ -16,27 +16,38 @@ profiling:
 
 official_model_suite:
   umap_hdbscan:
-    # Dev uses min_cluster_size=500 on the dev subset. Production fits HDBSCAN
-    # on a 300k customer sample, so this keeps a similar minimum density share
-    # while preserving the promoted PCA64/u20/n75/leaf/ms12 recipe.
-    trial_name: u20_n75_leaf_mcs5400_ms12_core
-    variant_prefix: u20_n75_leaf_mcs5400_ms12
+    # Conservative noise-reduction pass: keep the promoted PCA64/u20/n75/leaf
+    # representation, but relax HDBSCAN density enough to search for 12-17
+    # strong core tribes without changing PCA/UMAP.
+    trial_name: u20_n75_leaf_mcs3000_ms6_core
+    variant_prefix: u20_n75_leaf_mcs3000_ms6
     umap:
       # Fit the expensive manifold step on a deterministic customer sample,
       # then transform the full production population in memory-bounded batches.
       fit_sample_size: 300000
       transform_batch_size: 50000
     hdbscan:
-      min_cluster_size: 5000
-  two_stage_hdbscan:
-    trial_name: two_stage_u20_n75_leaf_mcs5400_ms12_lift_core
-    variant_prefix: two_stage_u20_n75_leaf_mcs5400_ms12
-    second_stage_hdbscan:
       min_cluster_size: 3500
+      min_samples: 8
+  two_stage_hdbscan:
+    trial_name: two_stage_u20_n75_leaf_mcs3000_ms6_balanced_lift_core
+    variant_prefix: two_stage_u20_n75_leaf_mcs3000_ms6_balanced
+    second_stage_hdbscan:
+      min_cluster_size: 3000
+      min_samples: 6
     stage3_noise_probe:
       min_noise_customers: 1000
       hdbscan:
         min_cluster_size: 1200
+  three_stage_hdbscan:
+    trial_name: three_stage_u20_n75_leaf_mcs3000_ms6_balanced_lift_core
+    variant_prefix: three_stage_u20_n75_leaf_mcs3000_ms6_balanced
+    min_noise_customers: 1000
+    umap:
+      transform_batch_size: 50000
+    third_stage_hdbscan:
+      min_cluster_size: 2000
+      min_samples: 6
 
 hdbscan:
   # Prod raw-HDBSCAN diagnostics, if enabled, use a scaled minimum density share.

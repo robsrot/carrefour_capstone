@@ -17,6 +17,7 @@ dependencies:
   - plotly=5.22.0
   - pip=26.1.1
   - pip:
+    - dash>=2.17,<3
     - polars==1.40.1
     - torch==2.12.0
     - gensim==4.4.0
