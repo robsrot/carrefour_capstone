@@ -4,20 +4,19 @@ Product-first behavioral customer segmentation for Carrefour checkout data. The 
 
 ## Current Status
 
-As of 2026-06-18:
+As of 2026-06-22:
 
 - Production preprocessing and dev-subset generation are complete in the local workspace: prepared tables live under `data/processed/` and `data/dev/`, while generated ML artifacts live under `outputs/<mode>/`.
 - The official modeling recipe is product-first and YAML-driven. Stage 4 uses `customer_embeddings.weight_strategy: quantity_idf`, `quantity_transform: log1p`, product-purchase recency decay, product-specific basket-count frequency scaling, and normalized customer vectors.
 - Official customer vectors do not use `importe`, total spend, average basket value, revenue tier, or demographics. Spend and KPIs are interpretation context only after clustering.
 - Official model selection uses the `embeddings_only` feature set. Behavioral and product-exposure features can be built for diagnostics, challenger evidence, and profiling, but they are not the default clustering signal.
-- Stage 6 is now a hard two-stage UMAP-HDBSCAN flow: PCA pre-reduction, UMAP representation, first HDBSCAN pass, stricter second pass over first-pass noise, merge, product-lift filtering, density evidence, readiness checks, remaining-noise probe, and Stage 6.8 evidence assembly.
+- Stage 6 is now a hard three-stage UMAP-HDBSCAN flow: PCA pre-reduction, UMAP representation, first HDBSCAN pass, stricter second pass over first-pass noise, third pass over remaining noise, three-pass merge, product-lift filtering, density evidence, readiness checks, remaining-customer evidence, and Stage 6.8 evidence assembly.
+- Stage 6.6 readiness uses jitter recovery as the stability gate: `strong` requires no blockers and jitter recovery >= 0.80; `usable` has no blockers but is below the strong target; `review` is used for blockers such as jitter recovery < 0.60 or assignment-confidence issues.
 - HDBSCAN noise stays honest as `tribe_id = -1`. Stage 6.7 can inspect remaining noise and optionally run candidate-only HDBSCAN after visual review, but it does not alter the official assignment.
 - Stage 7 is a read-only communication layer. It consumes the Stage 6.8 evidence bundle and writes the final story, final index, manifest, tribe cards, product summaries, comparison tables, customer-metric context, and aggregate-only LLM evidence.
 - UMAP is a clustering representation aid, not automatic proof. The 10-15 tribe range is a client hypothesis, not a hard clustering constraint.
 - Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`. Existing artifacts are reused when caching is enabled and `force=False`; metadata status is diagnostic, so use `force=True`, disable cache, or delete targeted generated files when rebuilding after logic/config changes.
 - Dev-mode experiment sandboxes live in `notebooks/04_experiment_sandbox.ipynb`; alternate vector recipes and broader sweeps belong there before any setting is promoted into YAML.
-
-For the detailed status, gaps, and next actions, see [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md).
 
 ## Quick Start
 
@@ -122,7 +121,7 @@ For experimentation:
 ```text
 configs/          Hyperparameters and dev/prod overrides
 data/             Local raw, processed, and dev data artifacts; never committed except docs/.gitkeep
-docs/             Project context, status, run contracts, reproducibility notes, and inventory
+docs/             Project context and methodological notes
 notebooks/        Ordered analysis, official pipeline, and sandbox notebooks
 outputs/          Mode-scoped generated artifacts; never committed
 src/              Reusable pipeline modules
@@ -176,8 +175,4 @@ outputs/<mode>/
 
 - [AGENTS.md](AGENTS.md) is the agent/operator guide for this repo.
 - [data/README.md](data/README.md) documents local data expectations.
-- [docs/PROJECT_STATUS_AND_ROADMAP.md](docs/PROJECT_STATUS_AND_ROADMAP.md) is the current state, remaining risks, and next actions.
-- [docs/PROJECT_FILE_INVENTORY.md](docs/PROJECT_FILE_INVENTORY.md) is the current source-file and artifact inventory.
-- [docs/notebook_contract.md](docs/notebook_contract.md) is the stage-by-stage notebook operating contract.
-- [docs/CROSS_MACHINE_REPRODUCIBILITY.md](docs/CROSS_MACHINE_REPRODUCIBILITY.md) captures reproducibility guardrails.
 - [docs/Carrefour_Data_Challenge_Project_Context.md](docs/Carrefour_Data_Challenge_Project_Context.md) preserves the original project brief and methodological constraints.

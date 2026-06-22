@@ -61,9 +61,10 @@ After changing vectorization, feature construction, UMAP, clustering, evidence a
 - Stage 6.1 builds the PCA-pre-reduced UMAP representation from `embeddings_only`.
 - Stage 6.2 runs the first hard HDBSCAN pass.
 - Stage 6.3 runs a stricter hard HDBSCAN pass only on first-pass noise.
-- Stage 6.4 merges the two passes and applies the product-lift filter. This merged, lift-filtered assignment is the official assignment.
-- Stage 6.5 writes representation and density-quality evidence.
-- Stage 6.6 checks cluster stability, confidence, and profile readiness.
+- Stage 6.4 runs a third hard HDBSCAN pass only on customers still left as noise.
+- Stage 6.5 merges all three passes and applies the product-lift filter. This merged, lift-filtered assignment is the official assignment.
+- The Stage 6 quality-evidence cell writes representation and density checks before readiness.
+- Stage 6.6 checks cluster stability, confidence, and profile readiness. `strong` requires no blockers and jitter recovery >= 0.80; `usable` has no blockers but is below the strong target; `review` is used for blockers such as jitter recovery < 0.60, missing recovery, low assignment confidence, or undersized clusters.
 - Stage 6.7 probes remaining noise for visual review only; candidate-only HDBSCAN there does not alter the official assignment.
 - Stage 6.8 writes the raw-data evidence bundle that Stage 7 consumes.
 - Stage 7 is read-only: it accepts Stage 6.6 readiness carried through Stage 6.8 and writes the final handoff pack without reopening global transactions or applying new promotion gates.
