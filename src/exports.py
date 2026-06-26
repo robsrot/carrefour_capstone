@@ -45,14 +45,14 @@ def collect_cached_presentation_figures(
         seen_paths.add(path_key)
 
     known_presentation_files = [
-        ("Selected Tribe Vs Population Dashboard", f"stage_07_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"),
-        ("Selected Tribe Theme Lift Heatmap", f"stage_07_tribe_theme_lift_heatmap_{cfg.mode}.png"),
+        ("Selected Tribe Vs Population Dashboard", f"stage7_tribe_vs_population_evidence_dashboard_{cfg.mode}.png"),
+        ("Selected Tribe Product/Sector Lift Heatmap", f"stage7_all_tribe_product_theme_lift_heatmap_{cfg.mode}.png"),
         ("Core Tribe Sizes", f"stage_09_core_tribe_sizes_{cfg.mode}.png"),
         ("Assignment Provenance", f"stage_09_assignment_provenance_{cfg.mode}.png"),
         ("Shopping Mission Overview", f"stage_09_shopping_mission_overview_{cfg.mode}.png"),
         ("Core Mission Lift Heatmap", f"stage_09_core_tribe_by_shopping_mission_lift_{cfg.mode}.png"),
-        ("Stage 6.6 PCA Projection", f"stage_06_6_winner_projection_pca.png"),
-        ("Stage 6.6 UMAP Projection", f"stage_06_6_winner_projection_umap.png"),
+        ("Stage 6.6 PCA Projection", f"stage6_6_winner_projection_pca.png"),
+        ("Stage 6.6 UMAP Projection", f"stage6_6_winner_projection_umap.png"),
         ("Stage 6.7 Remaining Noise UMAP Probe", "stage6_7_remaining_noise_umap_probe.png"),
         ("Stage 9 PCA Projection", f"stage_09_final_projection_pca.png"),
         ("Stage 9 UMAP Projection", f"stage_09_final_projection_umap.png"),
@@ -137,7 +137,7 @@ def build_model_comparison(
                     f"{quality['clusters_with_product_lift']}/{quality['profiled_clusters']} tribes have strong product lift; "
                     f"{quality['clusters_with_sector_lift']}/{quality['profiled_clusters']} have sector lift; "
                     f"{quality.get('clusters_with_theme_lift', 0)}/{quality['profiled_clusters']} have theme lift; "
-                    f"avg soft-assigned share {float(quality.get('avg_soft_assigned_share') or 0.0):.2%}."
+                    f"avg centroid-rescued coverage share {float(quality.get('avg_soft_assigned_share') or 0.0):.2%}."
                 )
                 row["profile_path"] = str(profile_path)
             else:
@@ -224,9 +224,8 @@ def _rank_rows(rows: list[dict[str, Any]], cfg: PipelineConfig = CONFIG) -> list
         row["eligible_for_selection"] = not blockers
         row["selection_blockers"] = "; ".join(blockers) if blockers else "pass"
         row["selection_basis"] = (
-            "Eligible candidates are ranked by coverage_adjusted_silhouette descending, "
-            "then Davies-Bouldin ascending, cluster_size_cv ascending, noise_pct ascending, "
-            "and product-lift evidence descending. No hidden weighted score is used."
+            "Eligible candidates are ranked by transparent quality gates, coverage/balance diagnostics, "
+            "noise handling, and product-lift evidence. No hidden weighted score is used."
         )
 
     def _rank_key(row: dict[str, Any]) -> tuple[float, float, float, float, float, float]:
@@ -392,11 +391,9 @@ def write_decision_log(
         "",
         (
             f"The selected solution passed the configured quality gates and ranked first among eligible candidates "
-            f"using coverage-adjusted silhouette, Davies-Bouldin, balance, noise, and product-lift evidence. "
-            f"Its silhouette was "
-            f"{_fmt_metric(selected.get('silhouette'))}, Davies-Bouldin "
-            f"{_fmt_metric(selected.get('davies_bouldin'))}, noise share "
-            f"{_fmt_metric(selected.get('noise_pct'), suffix='%')}, and cluster balance "
+            f"using transparent quality gates, coverage/balance diagnostics, honest noise handling, "
+            f"and product-lift evidence. Noise share before the rescue layer was "
+            f"{_fmt_metric(selected.get('noise_pct'), suffix='%')}, with cluster balance "
             f"{selected.get('cluster_balance')}."
         ),
         (
@@ -416,8 +413,7 @@ def write_decision_log(
             continue
         lines.append(
             f"- {row.get('model_name')} ({row.get('model_variant')}) was not selected: "
-            f"rank {row.get('final_rank')}, silhouette {_fmt_metric(row.get('silhouette'))}, "
-            f"Davies-Bouldin {_fmt_metric(row.get('davies_bouldin'))}, "
+            f"rank {row.get('final_rank')}, "
             f"noise {_fmt_metric(row.get('noise_pct'), suffix='%')}, "
             f"interpretability: {row.get('interpretability_summary')}."
         )
@@ -427,12 +423,12 @@ def write_decision_log(
             "",
             "## Evidence Used",
             "",
-            "- Model comparison metrics: silhouette, Davies-Bouldin, Calinski-Harabasz where available.",
+            "- Representation and assignment diagnostics: UMAP local fidelity, transparent noise handling, assignment confidence, and stability/readiness checks.",
             "- Cluster size balance: minimum and maximum population share, plus size dispersion.",
             "- Interpretability: product lift, sector lift, and profile completeness.",
             "- Product-theme lift: strategic purchase themes derived from product descriptions.",
-            "- Assignment provenance: core HDBSCAN assignments versus q95 soft-assigned customers.",
-            "- Assignment confidence for probabilistic candidates and distance-percentile soft assignments.",
+            "- Assignment provenance: hard HDBSCAN core members versus post-hoc centroid-rescue activation audiences.",
+            "- Assignment confidence for core members and centroid-rescue audiences.",
             "- Noise share for HDBSCAN candidates.",
             "- Stability evidence should be added from repeated seeds before production rollout if not already cached.",
             "",
@@ -861,7 +857,7 @@ a:hover {{ text-decoration: underline; }}
 <h2>The Story Flow</h2>
 <div class="flow">
 <div class="story-step"><h3><b>1</b>Organic core tribes</h3><p class="muted">The model discovers mutually exclusive product-behavior groups. These are the statistical backbone.</p></div>
-<div class="story-step"><h3><b>2</b>Assignment confidence</h3><p class="muted">Core members are strongest. Soft-assigned customers extend coverage while preserving provenance and confidence.</p></div>
+<div class="story-step"><h3><b>2</b>Assignment confidence</h3><p class="muted">Core members are strongest. Centroid-rescued customers extend activation coverage while preserving provenance and confidence.</p></div>
 <div class="story-step"><h3><b>3</b>Shopping missions</h3><p class="muted">Specific activation audiences are identified from product evidence and can overlap for the same customer.</p></div>
 <div class="story-step"><h3><b>4</b>Evidence backup</h3><p class="muted">The atlas and evidence folder provide the products, themes, terms, and lifts behind every claim.</p></div>
 </div>
@@ -869,7 +865,7 @@ a:hover {{ text-decoration: underline; }}
 <h2>Visual Evidence</h2>
 <div class="visual-grid">
 {_stage9_visual_card("Core tribe size", core_sizes, "Shows the organic tribe count and customer distribution.")}
-{_stage9_visual_card("Assignment confidence", provenance, "Separates HDBSCAN core customers from soft-assigned coverage.")}
+{_stage9_visual_card("Assignment confidence", provenance, "Separates HDBSCAN core customers from centroid-rescued coverage.")}
 {_stage9_visual_card("UMAP 2D customer map", umap_customer_map, "Visual review aid for local neighborhood structure; not an automatic model winner.")}
 {_stage9_visual_card("PCA 2D customer map", pca_customer_map, "Linear projection baseline for comparing whether the selected tribes remain readable.")}
 {_stage9_visual_card("Shopping mission overview", mission_overview, "Shows the size and confidence of each mission audience.")}

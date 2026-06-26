@@ -5848,10 +5848,16 @@ def _stage7_name_info(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, 
 
 
 def _stage7_name_fields(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str, str]:
+    tribe_id = int(row.get("tribe_id") or 0)
     legacy = _stage7_name_info(row, cfg=cfg)
     legacy_name = _normalise_tribe_name(legacy.get("tribe_name") or "")
     technical_name = _normalise_tribe_name(_working_label(row))
-    if _stage7_name_needs_technical_fallback(legacy_name):
+    configured_name = _configured_tribe_business_name(tribe_id, cfg=cfg)
+    if configured_name:
+        business_name = configured_name
+        source = "configured_business_name"
+        issue = "pass"
+    elif _stage7_name_needs_technical_fallback(legacy_name):
         business_name = technical_name
         source = "technical_name_fallback"
         issue = "legacy_name_not_business_safe"
@@ -5868,6 +5874,15 @@ def _stage7_name_fields(row: dict[str, Any], *, cfg: PipelineConfig) -> dict[str
         "legacy_name_source": legacy.get("name_source") or "unknown",
         "name_quality_issue": issue,
     }
+
+
+def _configured_tribe_business_name(tribe_id: int, *, cfg: PipelineConfig) -> str | None:
+    names = cfg.get("official_model_suite.three_stage_hdbscan.tribe_business_names") or {}
+    value = names.get(tribe_id) if isinstance(names, Mapping) else None
+    if value is None and isinstance(names, Mapping):
+        value = names.get(str(tribe_id))
+    cleaned = _normalise_tribe_name(value or "")
+    return cleaned or None
 
 
 def _stage7_name_fields_by_tribe(rows: list[dict[str, Any]], *, cfg: PipelineConfig) -> dict[int, dict[str, str]]:

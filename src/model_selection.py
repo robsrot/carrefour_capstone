@@ -11,7 +11,7 @@ import numpy as np
 import polars as pl
 
 from src.autoencoder import build_autoencoder_latents
-from src.clustering import run_gmm_grid, run_hdbscan, run_pca_kmeans_grid
+from src.clustering import rescue_noise_by_centroid, run_gmm_grid, run_hdbscan, run_pca_kmeans_grid
 from src.config import CONFIG, PipelineConfig
 from src.dimensionality import build_pca_representation, build_umap_representation
 from src.evaluation import cluster_size_summary, evaluate_labels, quality_gate_result
@@ -567,6 +567,8 @@ def three_stage_hdbscan_artifact_paths(
         "unfiltered_profile_path": cfg.outputs / "profiles" / f"tribe_profiles_{output_prefix}_unfiltered.parquet",
         "lift_evidence_path": lift_evidence_path,
         "lift_evidence_csv_path": lift_evidence_path.with_suffix(".csv"),
+        "noise_rescue_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_noise_rescued.parquet",
+        "noise_rescue_core_only_assignment_path": cfg.model_selection_cache / f"cluster_assignments_{output_prefix}_noise_rescued_core_only.parquet",
     }
 
 
@@ -3393,3 +3395,189 @@ def _diagnostic_rank_key(row: dict[str, Any]) -> tuple[float, float, float, floa
         _as_float(row.get("cluster_size_cv"), 999.0),
         str(row.get("candidate_id")),
     )
+
+
+def _make_core_only_assignment(rescued_df: pl.DataFrame) -> pl.DataFrame:
+    """Revert centroid-rescued rows back to noise for core-only profiling.
+
+    Hard HDBSCAN members are untouched. Rescued rows get tribe_id=-1 and a
+    distinct assignment_source so Stage 6.8 product-lift profiles reflect only
+    genuine cluster density members.
+    """
+    is_rescued = pl.col("assignment_source").str.starts_with("noise_rescue_nearest_centroid")
+    return rescued_df.with_columns([
+        pl.when(is_rescued).then(pl.lit(-1, dtype=pl.Int32)).otherwise(pl.col("tribe_id")).alias("tribe_id"),
+        pl.when(is_rescued)
+          .then(pl.lit("noise_rescue_excluded_core_only"))
+          .otherwise(pl.col("assignment_source"))
+          .alias("assignment_source"),
+        pl.when(is_rescued)
+          .then(pl.lit(None, dtype=pl.Float64))
+          .otherwise(pl.col("assignment_confidence_score"))
+          .alias("assignment_confidence_score"),
+        pl.when(is_rescued)
+          .then(pl.lit(None, dtype=pl.Utf8))
+          .otherwise(pl.col("assignment_confidence_type"))
+          .alias("assignment_confidence_type"),
+    ])
+
+
+def apply_noise_rescue_soft_assignment(
+    assignment_path: str | Path,
+    umap_path: str | Path,
+    *,
+    force: bool | None = None,
+    cfg: PipelineConfig = CONFIG,
+) -> tuple[Path, dict[str, Any]]:
+    """Centroid-based rescue pass: assign final noise customers to nearest tribe in UMAP space.
+
+    Runs after all three hard HDBSCAN passes and the product-lift filter. Noise customers
+    (tribe_id=-1) are assigned to the nearest valid tribe centroid in 20-D UMAP space,
+    but only when their distance falls within a quantile threshold derived from intra-cluster
+    distances of the hard-assigned population. Hard-assigned customers are never modified.
+
+    Returns the path to the rescued assignment parquet and a stats dict.
+    """
+    cfg.ensure_directories()
+    force = cfg.get("cache.force", False) if force is None else force
+    settings = official_three_stage_hdbscan_settings(cfg)
+    rescue_cfg = dict(settings["three_stage"].get("noise_rescue", {}) or {})
+    paths = three_stage_hdbscan_artifact_paths(cfg)
+    rescue_path = paths["noise_rescue_assignment_path"]
+    core_only_path = paths["noise_rescue_core_only_assignment_path"]
+
+    if not bool(rescue_cfg.get("enabled", False)):
+        log_event("Stage 6 noise rescue", "disabled in config — skipping", cfg=cfg)
+        return Path(assignment_path), {
+            "enabled": False,
+            "rescued_customers": 0,
+            "still_noise_customers": None,
+            "core_only_path": str(assignment_path),
+        }
+
+    strategy = str(rescue_cfg.get("strategy", "q95"))
+    cache_metadata = {
+        "stage": "noise_rescue_soft_assignment",
+        "mode": cfg.mode,
+        "assignment_path": file_fingerprint(assignment_path),
+        "umap_path": file_fingerprint(umap_path),
+        "strategy": strategy,
+    }
+
+    if should_use_cache(rescue_path, force=force, use_cached=cfg.get("cache.use_cached", True), metadata=cache_metadata):
+        log_event("Stage 6 noise rescue", "cache hit", cfg=cfg, path=rescue_path)
+        rescued_df = pl.read_parquet(rescue_path)
+        n_rescued = int(
+            rescued_df.filter(pl.col("assignment_source").str.starts_with("noise_rescue_nearest_centroid")).height
+        )
+        n_still_noise = int((rescued_df["tribe_id"] < 0).sum())
+        # Derive core-only from cache if not already written
+        if not core_only_path.exists() or force:
+            core_only_df = _make_core_only_assignment(rescued_df)
+            core_only_path.parent.mkdir(parents=True, exist_ok=True)
+            core_only_df.write_parquet(core_only_path)
+        return rescue_path, {
+            "enabled": True,
+            "rescued_customers": n_rescued,
+            "still_noise_customers": n_still_noise,
+            "strategy": strategy,
+            "noise_rescue_path": str(rescue_path),
+            "core_only_path": str(core_only_path),
+        }
+
+    with stage_timer("Stage 6 noise rescue", "centroid soft-assignment for remaining noise", cfg=cfg, strategy=strategy):
+        assignments = pl.read_parquet(Path(assignment_path)).sort("cliente")
+        umap_df = pl.read_parquet(Path(umap_path)).sort("cliente")
+        umap_feature_cols = numeric_feature_columns(umap_df)
+
+        merged = assignments.join(
+            umap_df.select(["cliente"] + umap_feature_cols),
+            on="cliente",
+            how="left",
+        )
+
+        X = frame_to_numpy(merged.select(umap_feature_cols), umap_feature_cols)
+        labels = merged["tribe_id"].to_numpy().astype(np.int32)
+
+        n_noise_before = int(np.sum(labels < 0))
+        n_valid_clusters = int(np.unique(labels[labels >= 0]).shape[0])
+        log_event(
+            "Stage 6 noise rescue",
+            "running centroid soft assignment",
+            cfg=cfg,
+            noise_customers=n_noise_before,
+            valid_clusters=n_valid_clusters,
+            strategy=strategy,
+        )
+
+        if n_noise_before == 0 or n_valid_clusters < 2:
+            log_event("Stage 6 noise rescue", "no rescuable noise or fewer than 2 tribes — skipping", cfg=cfg)
+            rescue_path.parent.mkdir(parents=True, exist_ok=True)
+            assignments.write_parquet(rescue_path)
+            write_artifact_metadata(rescue_path, cache_metadata)
+            core_only_path.parent.mkdir(parents=True, exist_ok=True)
+            assignments.write_parquet(core_only_path)
+            return rescue_path, {
+                "enabled": True,
+                "rescued_customers": 0,
+                "still_noise_customers": n_noise_before,
+                "strategy": strategy,
+                "noise_rescue_path": str(rescue_path),
+                "core_only_path": str(core_only_path),
+            }
+
+        new_labels, assigned_mask, threshold, confidence_scores = rescue_noise_by_centroid(
+            X, labels, strategy=strategy
+        )
+        n_rescued = int(np.sum(assigned_mask))
+        n_still_noise = int(np.sum(new_labels < 0))
+        rescue_label = f"noise_rescue_nearest_centroid_{strategy}"
+        conf_type_label = f"nearest_centroid_distance_percentile_{strategy}"
+
+        sources = merged["assignment_source"].to_list()
+        conf_scores_col = merged["assignment_confidence_score"].to_list()
+        conf_types_col = merged["assignment_confidence_type"].to_list()
+
+        for idx in np.where(assigned_mask)[0]:
+            i = int(idx)
+            sources[i] = rescue_label
+            raw_conf = float(confidence_scores[i])
+            conf_scores_col[i] = raw_conf if np.isfinite(raw_conf) else None
+            conf_types_col[i] = conf_type_label
+
+        rescued_df = merged.with_columns([
+            pl.Series("tribe_id", new_labels.tolist()).cast(pl.Int32),
+            pl.Series("assignment_source", sources),
+            pl.Series("assignment_confidence_score", conf_scores_col),
+            pl.Series("assignment_confidence_type", conf_types_col),
+        ]).select(assignments.columns)
+
+        rescue_path.parent.mkdir(parents=True, exist_ok=True)
+        rescued_df.write_parquet(rescue_path)
+        write_artifact_metadata(rescue_path, cache_metadata)
+
+        # Core-only: revert rescued rows to noise so profiling uses only hard HDBSCAN members
+        core_only_df = _make_core_only_assignment(rescued_df)
+        core_only_path.parent.mkdir(parents=True, exist_ok=True)
+        core_only_df.write_parquet(core_only_path)
+
+        log_event(
+            "Stage 6 noise rescue",
+            "centroid rescue complete",
+            cfg=cfg,
+            noise_before=n_noise_before,
+            rescued=n_rescued,
+            still_noise=n_still_noise,
+            rescue_rate_pct=round(100.0 * n_rescued / max(n_noise_before, 1), 1),
+            distance_threshold=threshold,
+        )
+
+    return rescue_path, {
+        "enabled": True,
+        "rescued_customers": n_rescued,
+        "still_noise_customers": n_still_noise,
+        "strategy": strategy,
+        "distance_threshold": threshold,
+        "noise_rescue_path": str(rescue_path),
+        "core_only_path": str(core_only_path),
+    }

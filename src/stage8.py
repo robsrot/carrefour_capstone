@@ -149,6 +149,9 @@ def stage8_input_paths(*, cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
     supporting = handoff / "supporting_tables"
     features = cfg.outputs / "features"
     model_cache = cfg.model_selection_cache
+    hard_assignments = model_cache / "cluster_assignments_model_e_three_stage_hdbscan_lift_core.parquet"
+    rescued_assignments = model_cache / "cluster_assignments_model_e_three_stage_hdbscan_lift_core_noise_rescued.parquet"
+    assignment_source = rescued_assignments if rescued_assignments.exists() else hard_assignments
     return {
         "stage68_manifest": evidence / f"stage68_manifest_{cfg.mode}.json",
         "stage68_product_lifts": evidence / f"product_lifts_{cfg.mode}.parquet",
@@ -163,7 +166,9 @@ def stage8_input_paths(*, cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
         "stage6_readiness": stage6 / f"stage6_6_cluster_stability_readiness_clusters_summary.csv",
         "stage3_embedding_validation": cfg.artifacts / "stage3" / "embedding_validation.csv",
         "stage3_embedding_hubness": cfg.artifacts / "stage3" / "embedding_hubness.csv",
-        "assignments": model_cache / "cluster_assignments_model_e_three_stage_hdbscan_lift_core.parquet",
+        "official_hard_assignments": hard_assignments,
+        "rescued_assignments": rescued_assignments,
+        "assignments": assignment_source,
         "umap_features": features / str(cfg.get("official_model_suite.umap_hdbscan.umap.output", "feature_set_umap_pca64_u20_n75.parquet")),
         "pca_features": features / "feature_set_pca_for_umap.parquet",
         "behavior_features": features / str(cfg.get("behavioral_features.output", "customer_behavior_features.parquet")),
@@ -219,6 +224,7 @@ def write_stage8_dashboard_pack(
         product_summary = _read_csv(inputs["stage7_product_summary_long"])
         relationships = _read_csv(inputs["stage7_relationships"])
         stage6_readiness = _read_csv(inputs["stage6_readiness"])
+        stage7_index = _read_csv(inputs["stage7_final_index"]) if inputs["stage7_final_index"].exists() else pl.DataFrame()
 
         tribe_master = _build_tribe_master(all_profiles, stage6_readiness=stage6_readiness)
         tribe_master.write_parquet(paths["tribe_master"])
@@ -235,7 +241,7 @@ def write_stage8_dashboard_pack(
         tribe_similarity = _build_tribe_similarity(relationships)
         tribe_similarity.write_parquet(paths["tribe_similarity"])
 
-        tribe_name_proposals = _build_tribe_name_proposals(tribe_master)
+        tribe_name_proposals = _build_tribe_name_proposals(tribe_master, cfg=cfg)
         tribe_name_proposals.write_parquet(paths["tribe_name_proposals"])
 
         remaining_customer_segments = _build_remaining_segments(remaining_segments)
@@ -398,6 +404,7 @@ def write_stage8_dashboard_pack(
             embedding_3d_pca=embedding_3d_pca,
             embedding_3d_pca_sample=embedding_3d_pca_sample,
             centroids=centroids,
+            stage7_index=stage7_index,
         )
         for table_name, table in relational_tables.items():
             table.write_parquet(paths[table_name])
@@ -741,8 +748,22 @@ def _build_tribe_similarity(relationships: pl.DataFrame) -> pl.DataFrame:
     return relationships.with_columns(cast_cols)
 
 
-def _build_tribe_name_proposals(tribe_master: pl.DataFrame) -> pl.DataFrame:
-    """Publish external LLM naming suggestions as proposals, not truth labels."""
+def _stage8_configured_tribe_business_name(tribe_id: int | None, *, cfg: PipelineConfig) -> str:
+    """Return the configured presentation business name for a tribe, if present."""
+
+    if tribe_id is None:
+        return ""
+    names = cfg.get("official_model_suite.three_stage_hdbscan.tribe_business_names") or {}
+    value = None
+    if isinstance(names, Mapping):
+        value = names.get(tribe_id)
+        if value is None:
+            value = names.get(str(tribe_id))
+    return _as_text(value).strip()
+
+
+def _build_tribe_name_proposals(tribe_master: pl.DataFrame, *, cfg: PipelineConfig = CONFIG) -> pl.DataFrame:
+    """Publish display names with configured business names as the approved source of truth."""
 
     proposals = _external_llm_name_proposals()
     rows = []
@@ -750,17 +771,20 @@ def _build_tribe_name_proposals(tribe_master: pl.DataFrame) -> pl.DataFrame:
         tribe_id = _to_int(row.get("tribe_id"))
         proposal = proposals.get(tribe_id, {})
         has_proposal = bool(proposal)
+        configured_name = _stage8_configured_tribe_business_name(tribe_id, cfg=cfg)
         technical_name = _as_text(row.get("technical_name") or row.get("business_name") or row.get("tribe_name"))
+        fallback_business_name = _as_text(row.get("business_name") or row.get("tribe_name"))
         proposed_name = _as_text(proposal.get("proposed_business_name"))
-        confidence_label = _as_text(proposal.get("proposal_confidence_label") or "missing")
+        confidence_label = _as_text(proposal.get("proposal_confidence_label") or ("approved" if configured_name else "missing"))
+        recommended_business_name = configured_name or proposed_name or fallback_business_name
         rows.append(
             {
                 "tribe_id": tribe_id,
                 "current_tribe_name": _as_text(row.get("tribe_name")),
-                "current_business_name": _as_text(row.get("business_name")),
+                "current_business_name": fallback_business_name,
                 "current_technical_name": _as_text(row.get("technical_name")),
                 "recommended_technical_name": technical_name,
-                "recommended_business_name": proposed_name or _as_text(row.get("business_name") or row.get("tribe_name")),
+                "recommended_business_name": recommended_business_name,
                 "promotion_decision": _as_text(row.get("promotion_decision")),
                 "tribe_status": _as_text(row.get("tribe_status")),
                 "proposed_business_name": proposed_name,
@@ -768,14 +792,18 @@ def _build_tribe_name_proposals(tribe_master: pl.DataFrame) -> pl.DataFrame:
                 "proposal_confidence_label": confidence_label,
                 "proposal_rationale": _as_text(proposal.get("proposal_rationale")),
                 "proposal_stat_highlights": _as_text(proposal.get("proposal_stat_highlights")),
-                "proposal_source": "user_provided_independent_llm_html" if has_proposal else "",
-                "proposal_status": "candidate_needs_business_review" if has_proposal else "no_external_proposal",
-                "business_name_readiness": _business_name_readiness(confidence_label, has_proposal),
-                "evidence_alignment": "supported_by_stage8_product_and_behavior_evidence" if has_proposal else "missing_external_name_review",
+                "proposal_source": "configured_business_name" if configured_name else ("user_provided_independent_llm_html" if has_proposal else ""),
+                "proposal_status": "approved_business_name" if configured_name else ("candidate_needs_business_review" if has_proposal else "no_external_proposal"),
+                "business_name_readiness": "business_ready_approved" if configured_name else _business_name_readiness(confidence_label, has_proposal),
+                "evidence_alignment": "configured_business_name_source_of_truth" if configured_name else ("supported_by_stage8_product_and_behavior_evidence" if has_proposal else "missing_external_name_review"),
                 "recommended_use": (
-                    "Use recommended_business_name for executive display after final human sign-off; keep recommended_technical_name for traceability."
-                    if has_proposal
-                    else "Keep Stage 7 name until a reviewed business name is supplied."
+                    "Use configured business name for executive display; keep tribe_id and technical labels for traceability."
+                    if configured_name
+                    else (
+                        "Use recommended_business_name for executive display after final human sign-off; keep recommended_technical_name for traceability."
+                        if has_proposal
+                        else "Keep Stage 7 name until a reviewed business name is supplied."
+                    )
                 ),
                 "naming_warning": (
                     "Business names are interpretation layers; never overwrite tribe_id, technical labels, or evidence fields."
@@ -820,10 +848,15 @@ def _build_tribe_deep_dive(
     """Create a dashboard-ready one-row-per-tribe deep-dive table and nested JSON."""
 
     total_customers = max(customer_coverage.height, 1)
-    hard_customers = (
+    assigned_customers = (
         customer_coverage.filter(pl.col("tribe_id") >= 0).height
         if not customer_coverage.is_empty() and "tribe_id" in customer_coverage.columns
         else 0
+    )
+    hard_customers = (
+        customer_coverage.filter(pl.col("assignment_source_group") == "hard_hdbscan_core").height
+        if not customer_coverage.is_empty() and "assignment_source_group" in customer_coverage.columns
+        else assigned_customers
     )
     total_revenue = _sum_float_column(customer_coverage, "total_spend") or _sum_float_column(customer_coverage, "customer_value")
     coverage_metrics = _customer_metrics_by_tribe(customer_coverage, total_customers, max(hard_customers, 1), total_revenue)
@@ -888,6 +921,10 @@ def _build_tribe_deep_dive(
             "tribe_status": _as_text(row.get("tribe_status")),
             "coverage_group": _as_text(row.get("coverage_group")),
             "assigned_customers": _to_int(metrics.get("assigned_customers")) or _to_int(row.get("customers")) or 0,
+            "hard_assigned_customers": _to_int(metrics.get("hard_assigned_customers")) or _to_int(row.get("customers")) or 0,
+            "soft_assigned_customers": _to_int(metrics.get("soft_assigned_customers")) or 0,
+            "hard_assigned_share_pct": _to_float(metrics.get("hard_assigned_share_pct")),
+            "soft_assigned_share_pct": _to_float(metrics.get("soft_assigned_share_pct")),
             "share_of_total_customers_pct": _to_float(metrics.get("share_of_total_customers_pct"))
             or _to_float(row.get("population_share_pct")),
             "share_of_hard_assigned_customers_pct": _to_float(metrics.get("share_of_hard_assigned_customers_pct")),
@@ -944,7 +981,7 @@ def _build_tribe_deep_dive(
         "stage": "8_tribe_deep_dive",
         "schema_version": STAGE8_SCHEMA_VERSION,
         "grain": "one record per retained hard tribe",
-        "warning": "Use proposed business names as review candidates only; tribe_id remains the authoritative model key.",
+        "warning": "Use configured business names for display; tribe_id remains the authoritative model key.",
         "tribes": nested,
     }
     return frame, payload
@@ -962,11 +999,25 @@ def _customer_metrics_by_tribe(
     if frame.is_empty():
         return pl.DataFrame()
 
+    has_source_group = "assignment_source_group" in frame.columns
     aggs = [
         pl.len().alias("assigned_customers"),
         (pl.len() * 100.0 / max(total_customers, 1)).alias("share_of_total_customers_pct"),
-        (pl.len() * 100.0 / max(hard_customers, 1)).alias("share_of_hard_assigned_customers_pct"),
     ]
+    if has_source_group:
+        aggs.extend(
+            [
+                (pl.col("assignment_source_group") == "hard_hdbscan_core").sum().cast(pl.Int64).alias("hard_assigned_customers"),
+                (pl.col("assignment_source_group") == "centroid_rescue").sum().cast(pl.Int64).alias("soft_assigned_customers"),
+            ]
+        )
+    else:
+        aggs.extend(
+            [
+                pl.len().cast(pl.Int64).alias("hard_assigned_customers"),
+                pl.lit(0, dtype=pl.Int64).alias("soft_assigned_customers"),
+            ]
+        )
     numeric_aggs = {
         "total_spend": [
             pl.col("total_spend").cast(pl.Float64, strict=False).sum().alias("total_revenue"),
@@ -989,7 +1040,13 @@ def _customer_metrics_by_tribe(
         if column in frame.columns:
             aggs.extend(exprs)
 
-    grouped = frame.group_by("tribe_id").agg(aggs)
+    grouped = frame.group_by("tribe_id").agg(aggs).with_columns(
+        [
+            (pl.col("hard_assigned_customers") * 100.0 / max(hard_customers, 1)).alias("share_of_hard_assigned_customers_pct"),
+            (pl.col("hard_assigned_customers") * 100.0 / pl.col("assigned_customers")).alias("hard_assigned_share_pct"),
+            (pl.col("soft_assigned_customers") * 100.0 / pl.col("assigned_customers")).alias("soft_assigned_share_pct"),
+        ]
+    )
     if "total_revenue" in grouped.columns:
         grouped = grouped.with_columns(
             (pl.col("total_revenue").cast(pl.Float64, strict=False) * 100.0 / max(total_revenue, 1e-9)).alias("revenue_share_pct")
@@ -1163,6 +1220,14 @@ def _customer_coverage_summary(customer_coverage: pl.DataFrame) -> pl.DataFrame:
         pl.len().alias("customers"),
         (pl.len() * 100.0 / total_customers).alias("customer_share_pct"),
     ]
+    if "assignment_source_group" in customer_coverage.columns:
+        aggs.extend(
+            [
+                (pl.col("assignment_source_group") == "hard_hdbscan_core").sum().cast(pl.Int64).alias("hard_assigned_customers"),
+                (pl.col("assignment_source_group") == "centroid_rescue").sum().cast(pl.Int64).alias("soft_assigned_customers"),
+                (pl.col("assignment_source_group") == "unassigned_noise").sum().cast(pl.Int64).alias("unassigned_customers"),
+            ]
+        )
     for source, alias in [
         ("total_spend", "revenue"),
         ("customer_value", "customer_value"),
@@ -1178,6 +1243,9 @@ def _customer_coverage_summary(customer_coverage: pl.DataFrame) -> pl.DataFrame:
             expr = pl.col(source).cast(pl.Float64, strict=False)
             aggs.append((expr.sum() if alias in {"revenue", "customer_value"} else expr.mean()).alias(alias))
     frame = customer_coverage.group_by("coverage_group").agg(aggs)
+    for count_col in ["hard_assigned_customers", "soft_assigned_customers", "unassigned_customers"]:
+        if count_col not in frame.columns:
+            frame = frame.with_columns(pl.lit(None, dtype=pl.Int64).alias(count_col))
     if "revenue" in frame.columns:
         frame = frame.with_columns((pl.col("revenue") * 100.0 / max(total_revenue, 1e-9)).alias("revenue_share_pct"))
     else:
@@ -1196,6 +1264,9 @@ def _coverage_summary_schema() -> dict[str, pl.DataType]:
     return {
         "coverage_group": pl.Utf8,
         "customers": pl.Int64,
+        "hard_assigned_customers": pl.Int64,
+        "soft_assigned_customers": pl.Int64,
+        "unassigned_customers": pl.Int64,
         "customer_share_pct": pl.Float64,
         "revenue": pl.Float64,
         "revenue_share_pct": pl.Float64,
@@ -1463,6 +1534,7 @@ def _build_relational_tables(
     embedding_3d_pca: pl.DataFrame,
     embedding_3d_pca_sample: pl.DataFrame,
     centroids: pl.DataFrame,
+    stage7_index: pl.DataFrame | None = None,
 ) -> dict[str, pl.DataFrame]:
     """Build a normalized star-schema layer beside the wide dashboard tables."""
 
@@ -1475,7 +1547,7 @@ def _build_relational_tables(
         "rel_dim_product": _rel_dim_product(tribe_products),
         "rel_dim_category": _rel_dim_category(tribe_products, tribe_categories),
         "rel_dim_action_target": _rel_dim_action_target(segment_actions),
-        "rel_fact_tribe_metrics": _rel_fact_tribe_metrics(tribe_master, tribe_deep_dive),
+        "rel_fact_tribe_metrics": _rel_fact_tribe_metrics(tribe_master, tribe_deep_dive, stage7_index if stage7_index is not None else pl.DataFrame()),
         "rel_fact_tribe_profile_text": _rel_fact_tribe_profile_text(tribe_profiles, tribe_deep_dive),
         "rel_fact_coverage_group_metrics": _rel_fact_coverage_group_metrics(customer_coverage_summary),
         "rel_fact_remaining_segment_metrics": _rel_fact_remaining_segment_metrics(remaining_customer_segments),
@@ -1737,13 +1809,17 @@ def _rel_dim_action_target(segment_actions: pl.DataFrame) -> pl.DataFrame:
     ).unique("target_id").sort("target_id")
 
 
-def _rel_fact_tribe_metrics(tribe_master: pl.DataFrame, tribe_deep_dive: pl.DataFrame) -> pl.DataFrame:
+def _rel_fact_tribe_metrics(
+    tribe_master: pl.DataFrame,
+    tribe_deep_dive: pl.DataFrame,
+    stage7_index: pl.DataFrame | None = None,
+) -> pl.DataFrame:
     if tribe_master.is_empty():
         return pl.DataFrame()
     master = tribe_master.select(
         [
             _rel_col(tribe_master, "tribe_id", pl.Int64),
-            _rel_col(tribe_master, "customers", pl.Int64).alias("hard_assigned_customers"),
+            _rel_col(tribe_master, "customers", pl.Int64).alias("core_profile_customers"),
             _rel_col(tribe_master, "population_share_pct", pl.Float64),
             _rel_col(tribe_master, "mean_assignment_confidence", pl.Float64),
             _rel_col(tribe_master, "p10_assignment_confidence", pl.Float64),
@@ -1751,28 +1827,50 @@ def _rel_fact_tribe_metrics(tribe_master: pl.DataFrame, tribe_deep_dive: pl.Data
         ]
     )
     if tribe_deep_dive.is_empty():
-        return master.sort("tribe_id")
-    metrics = tribe_deep_dive.select(
-        [
-            _rel_col(tribe_deep_dive, "tribe_id", pl.Int64),
-            _rel_col(tribe_deep_dive, "assigned_customers", pl.Int64),
-            _rel_col(tribe_deep_dive, "share_of_total_customers_pct", pl.Float64),
-            _rel_col(tribe_deep_dive, "share_of_hard_assigned_customers_pct", pl.Float64),
-            _rel_col(tribe_deep_dive, "total_revenue", pl.Float64),
-            _rel_col(tribe_deep_dive, "revenue_share_pct", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_revenue_per_customer", pl.Float64),
-            _rel_col(tribe_deep_dive, "median_revenue_per_customer", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_ticket_count", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_basket_value", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_items_per_basket", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_promo_share", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_unique_products", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_unique_sectors", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_recency_days", pl.Float64),
-            _rel_col(tribe_deep_dive, "avg_frequency_per_30d", pl.Float64),
-        ]
-    )
-    return master.join(metrics, on="tribe_id", how="left").sort("tribe_id")
+        base = master.sort("tribe_id")
+    else:
+        metrics = tribe_deep_dive.select(
+            [
+                _rel_col(tribe_deep_dive, "tribe_id", pl.Int64),
+                _rel_col(tribe_deep_dive, "assigned_customers", pl.Int64),
+                _rel_col(tribe_deep_dive, "hard_assigned_customers", pl.Int64),
+                _rel_col(tribe_deep_dive, "soft_assigned_customers", pl.Int64),
+                _rel_col(tribe_deep_dive, "hard_assigned_share_pct", pl.Float64),
+                _rel_col(tribe_deep_dive, "soft_assigned_share_pct", pl.Float64),
+                _rel_col(tribe_deep_dive, "share_of_total_customers_pct", pl.Float64),
+                _rel_col(tribe_deep_dive, "share_of_hard_assigned_customers_pct", pl.Float64),
+                _rel_col(tribe_deep_dive, "total_revenue", pl.Float64),
+                _rel_col(tribe_deep_dive, "revenue_share_pct", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_revenue_per_customer", pl.Float64),
+                _rel_col(tribe_deep_dive, "median_revenue_per_customer", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_ticket_count", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_basket_value", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_items_per_basket", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_promo_share", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_unique_products", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_unique_sectors", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_recency_days", pl.Float64),
+                _rel_col(tribe_deep_dive, "avg_frequency_per_30d", pl.Float64),
+            ]
+        )
+        base = master.join(metrics, on="tribe_id", how="left").sort("tribe_id")
+
+    # Join three analytical layers from Stage 7 index (promoted tribes only; review tribes get nulls)
+    if stage7_index is not None and not stage7_index.is_empty() and "tribe_id" in stage7_index.columns:
+        idx_cols = ["tribe_id"]
+        for col in ["spend_p25_eur", "spend_p50_eur", "spend_p75_eur", "spend_p90_eur"]:
+            if col in stage7_index.columns:
+                idx_cols.append(col)
+        for col in ["active_customer_pct", "at_risk_customer_pct", "lapsed_customer_pct"]:
+            if col in stage7_index.columns:
+                idx_cols.append(col)
+        for col in ["dominant_shopping_day", "dominant_shopping_time"]:
+            if col in stage7_index.columns:
+                idx_cols.append(col)
+        idx = stage7_index.select(idx_cols).with_columns(pl.col("tribe_id").cast(pl.Int64))
+        base = base.join(idx, on="tribe_id", how="left")
+
+    return base
 
 
 def _rel_fact_tribe_profile_text(tribe_profiles: pl.DataFrame, tribe_deep_dive: pl.DataFrame) -> pl.DataFrame:
@@ -1802,6 +1900,9 @@ def _rel_fact_coverage_group_metrics(customer_coverage_summary: pl.DataFrame) ->
     cols = [
         "coverage_group",
         "customers",
+        "hard_assigned_customers",
+        "soft_assigned_customers",
+        "unassigned_customers",
         "customer_share_pct",
         "revenue",
         "customer_value",
@@ -1857,6 +1958,9 @@ def _rel_fact_customer_assignment(customer_context: pl.DataFrame) -> pl.DataFram
             _rel_col(customer_context, "assignment_confidence_score", pl.Float64),
             _rel_col(customer_context, "assignment_confidence_type", pl.Utf8),
             _rel_col(customer_context, "assignment_source", pl.Utf8),
+            _rel_col(customer_context, "assignment_source_group", pl.Utf8),
+            _rel_col(customer_context, "is_core_profile_member", pl.Boolean),
+            _rel_col(customer_context, "is_soft_rescued_member", pl.Boolean),
         ]
     )
 
@@ -2028,9 +2132,11 @@ def _rel_col(frame: pl.DataFrame, column: str, dtype: pl.DataType, *, alias: str
 def _rel_dtype(column: str) -> pl.DataType:
     if column.endswith("_id") and column not in {"product_id", "segment_id", "target_id"}:
         return pl.Int64
+    if column.endswith("_customers"):
+        return pl.Int64
     if column in {"rank", "customers", "line_count", "customer_count", "ticket_count", "total_units", "unique_products", "unique_sectors", "recency_days", "assigned_customers"}:
         return pl.Int64
-    if column in {"is_actionable", "is_final_tribe", "is_review_tribe"}:
+    if column in {"is_actionable", "is_final_tribe", "is_review_tribe", "is_core_profile_member", "is_soft_rescued_member"}:
         return pl.Boolean
     if any(token in column for token in ["pct", "score", "share", "revenue", "spend", "value", "affinity", "margin", "confidence", "basket", "promo", "frequency", "avg_", "median", "lift", "q_value"]):
         return pl.Float64
@@ -2104,6 +2210,33 @@ def _build_segment_actions(action_playbook: pl.DataFrame) -> pl.DataFrame:
     return pl.DataFrame(rows, infer_schema_length=None)
 
 
+def _with_assignment_source_fields(frame: pl.DataFrame) -> pl.DataFrame:
+    """Normalize assignment source into explicit core/rescue/noise flags."""
+
+    if frame.is_empty():
+        return frame
+    if "tribe_id" not in frame.columns:
+        frame = frame.with_columns(pl.lit(None, dtype=pl.Int64).alias("tribe_id"))
+    if "assignment_source" not in frame.columns:
+        frame = frame.with_columns(pl.lit("", dtype=pl.Utf8).alias("assignment_source"))
+    assigned = (pl.col("tribe_id").cast(pl.Int64, strict=False) >= 0).fill_null(False)
+    rescued = pl.col("assignment_source").cast(pl.Utf8).fill_null("").str.starts_with("noise_rescue").fill_null(False)
+    return frame.with_columns(
+        [
+            pl.when(assigned & rescued)
+            .then(pl.lit("centroid_rescue"))
+            .when(assigned)
+            .then(pl.lit("hard_hdbscan_core"))
+            .when(~assigned)
+            .then(pl.lit("unassigned_noise"))
+            .otherwise(pl.lit("unknown"))
+            .alias("assignment_source_group"),
+            (assigned & ~rescued).alias("is_core_profile_member"),
+            (assigned & rescued).alias("is_soft_rescued_member"),
+        ]
+    )
+
+
 def _build_customer_assignments(assignments_path: Path, tribe_master: pl.DataFrame) -> pl.DataFrame:
     assignments = pl.read_parquet(assignments_path)
     keep = [
@@ -2123,6 +2256,7 @@ def _build_customer_assignments(assignments_path: Path, tribe_master: pl.DataFra
         if column in assignments.columns
     ]
     frame = assignments.select(keep).with_columns(_cast_if_present("tribe_id", pl.Int64))
+    frame = _with_assignment_source_fields(frame)
     context = tribe_master.select(
         [
             "tribe_id",
@@ -2168,8 +2302,9 @@ def _build_customer_coverage(
         "assignment_confidence_type",
         "assignment_source",
     ]
-    assignments = pl.read_parquet(assignments_path).select([col for col in assignment_cols if col in pl.read_parquet(assignments_path, n_rows=0).columns])
-    assignments = assignments.with_columns(_cast_if_present("tribe_id", pl.Int64))
+    assignment_schema = pl.read_parquet(assignments_path, n_rows=0).columns
+    assignments = pl.read_parquet(assignments_path).select([col for col in assignment_cols if col in assignment_schema])
+    assignments = _with_assignment_source_fields(assignments.with_columns(_cast_if_present("tribe_id", pl.Int64)))
     behavior = _read_behavior_for_coverage(behavior_path)
     frame = assignments.join(behavior, on="cliente", how="left") if not behavior.is_empty() else assignments
 
@@ -3515,12 +3650,16 @@ CREATE TABLE rel_dim_action_target (
 
 CREATE TABLE rel_fact_tribe_metrics (
     tribe_id INTEGER PRIMARY KEY REFERENCES rel_dim_tribe(tribe_id),
-    hard_assigned_customers INTEGER,
+    core_profile_customers INTEGER,
     population_share_pct REAL,
     mean_assignment_confidence REAL,
     p10_assignment_confidence REAL,
     jitter_label_recovery_accuracy REAL,
     assigned_customers INTEGER,
+    hard_assigned_customers INTEGER,
+    soft_assigned_customers INTEGER,
+    hard_assigned_share_pct REAL,
+    soft_assigned_share_pct REAL,
     share_of_total_customers_pct REAL,
     share_of_hard_assigned_customers_pct REAL,
     total_revenue REAL,
@@ -3548,7 +3687,10 @@ CREATE TABLE rel_fact_customer_assignment (
     assignment_probability REAL,
     assignment_confidence_score REAL,
     assignment_confidence_type TEXT,
-    assignment_source TEXT
+    assignment_source TEXT,
+    assignment_source_group TEXT,
+    is_core_profile_member BOOLEAN,
+    is_soft_rescued_member BOOLEAN
 );
 
 CREATE TABLE rel_fact_customer_value_behavior (
@@ -3630,6 +3772,9 @@ PRESENTATION_MART_COLUMNS: dict[str, list[str]] = {
         "tribe_status_label",
         "coverage_group",
         "customer_count",
+        "hard_assigned_customers",
+        "soft_assigned_customers",
+        "soft_assigned_share_pct",
         "customer_share_pct",
         "revenue",
         "revenue_share_pct",
@@ -3637,6 +3782,15 @@ PRESENTATION_MART_COLUMNS: dict[str, list[str]] = {
         "avg_frequency_per_30d",
         "avg_recency_days",
         "retention_rate",
+        "active_customer_pct",
+        "at_risk_customer_pct",
+        "lapsed_customer_pct",
+        "spend_p25_eur",
+        "spend_p50_eur",
+        "spend_p75_eur",
+        "spend_p90_eur",
+        "dominant_shopping_day",
+        "dominant_shopping_time",
         "churn_risk",
         "top_product",
         "top_category",
@@ -4053,13 +4207,25 @@ def _mart_tribe_scorecard(tables: Mapping[str, pl.DataFrame], product_evidence: 
                 "tribe_status_label": tribe.get("tribe_status_label"),
                 "coverage_group": tribe.get("coverage_group"),
                 "customer_count": _to_int(metric.get("assigned_customers") or metric.get("hard_assigned_customers")),
+                "hard_assigned_customers": _to_int(metric.get("hard_assigned_customers")),
+                "soft_assigned_customers": _to_int(metric.get("soft_assigned_customers")),
+                "soft_assigned_share_pct": _to_float(metric.get("soft_assigned_share_pct")),
                 "customer_share_pct": _to_float(metric.get("share_of_total_customers_pct") or metric.get("population_share_pct")),
                 "revenue": _to_float(metric.get("total_revenue")),
                 "revenue_share_pct": _to_float(metric.get("revenue_share_pct")),
                 "avg_basket_value": _to_float(metric.get("avg_basket_value")),
                 "avg_frequency_per_30d": _to_float(metric.get("avg_frequency_per_30d")),
                 "avg_recency_days": _to_float(metric.get("avg_recency_days")),
-                "retention_rate": None,
+                "retention_rate": _to_float(metric.get("active_customer_pct")),
+                "active_customer_pct": _to_float(metric.get("active_customer_pct")),
+                "at_risk_customer_pct": _to_float(metric.get("at_risk_customer_pct")),
+                "lapsed_customer_pct": _to_float(metric.get("lapsed_customer_pct")),
+                "spend_p25_eur": _to_float(metric.get("spend_p25_eur")),
+                "spend_p50_eur": _to_float(metric.get("spend_p50_eur")),
+                "spend_p75_eur": _to_float(metric.get("spend_p75_eur")),
+                "spend_p90_eur": _to_float(metric.get("spend_p90_eur")),
+                "dominant_shopping_day": _as_text(metric.get("dominant_shopping_day")),
+                "dominant_shopping_time": _as_text(metric.get("dominant_shopping_time")),
                 "churn_risk": _recency_risk(metric.get("avg_recency_days")),
                 "top_product": top_product.get("product_name_original"),
                 "top_category": (top_category[0] if top_category else {}).get("category"),
@@ -5163,10 +5329,10 @@ Facts and bridges should carry IDs and measures, not repeated labels.
 
 | Table | Primary Key / Grain | Purpose |
 |---|---|---|
-| `rel_fact_customer_assignment_{cfg.mode}.parquet` | `cliente` | Customer assignment, coverage group, confidence, and source model. |
+| `rel_fact_customer_assignment_{cfg.mode}.parquet` | `cliente` | Customer assignment, coverage group, confidence, and explicit core/rescue/noise source flags. |
 | `rel_fact_customer_value_behavior_{cfg.mode}.parquet` | `cliente` | Customer value and behavior measures. |
 | `rel_fact_customer_nearest_tribe_{cfg.mode}.parquet` | `cliente` | Nearest-tribe affinity fields for remaining/noise customers. |
-| `rel_fact_tribe_metrics_{cfg.mode}.parquet` | `tribe_id` | Tribe counts, revenue, behavior, confidence, and jitter metrics. |
+| `rel_fact_tribe_metrics_{cfg.mode}.parquet` | `tribe_id` | Tribe counts, hard-vs-soft audience sizes, revenue, behavior, confidence, and jitter metrics. |
 | `rel_fact_tribe_profile_text_{cfg.mode}.parquet` | `tribe_id` | Tribe interpretation text and profile narrative fields. |
 | `rel_fact_coverage_group_metrics_{cfg.mode}.parquet` | `coverage_group` | Coverage counts, shares, revenue, and behavior averages. |
 | `rel_fact_remaining_segment_metrics_{cfg.mode}.parquet` | `segment_id` | Remaining-segment sizing, affinity, and behavior metrics. |
@@ -5807,10 +5973,10 @@ def _external_llm_name_proposals() -> dict[int, dict[str, str]]:
             "Gourmet/Felix/Sheba-led; low promo use; broad basket.",
         ),
         1: (
-            "In-Store Cafe Regulars",
+            "On-the-Go Food & Drink",
             "review",
-            "The product evidence centers on employee breakfast/cafe items, tostadas, coffee, pizza, and snack combos; this is better framed as a captive cafe visit mission than as grocery behavior.",
-            "EUR22 basket; 19.4 tickets; weekday dominant; loyalty/churn caveat.",
+            "The product evidence centers on ready-to-eat food, drinks, cafe-adjacent items, pizza, and snack combos; this is better framed as an immediate-consumption mission than as a weekly grocery behavior.",
+            "Small baskets; high ticket frequency; weekday dominant; loyalty/churn caveat.",
         ),
         2: (
             "Travel-Format Personal Care Shoppers",
