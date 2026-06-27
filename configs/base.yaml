@@ -348,6 +348,33 @@ official_model_suite:
     lift_filter:
       min_strong_product_lifts: 2
       require_significant_product_lift: true
+    noise_rescue:
+      enabled: true
+      strategy: q75
+    # Human-authored business names (source of truth for all presentation outputs)
+    tribe_business_names:
+      0: "Cat Food"
+      1: "On-the-Go Food & Drink"
+      2: "Personal Care"
+      3: "Homeware"
+      4: "Baby & Toddler"
+      5: "Latin Diaspora"
+      6: "Fresh Counter & Bakery"
+      7: "Bio Produce-Led"
+      8: "Gluten-Free"
+      9: "Kids Apparel"
+      10: "In-Store Café"
+      11: "Quick Meals"
+      12: "Premium Alcohol"
+      13: "Fresh Poultry & Staples"
+      14: "Family Snacking"
+      15: "Health & Conscious"
+      16: "Party & Impulse"
+      17: "Family Basics"
+      18: "Traditional Home Cooking"
+      19: "Regional Charcuterie"
+      20: "Alcohol (Private-Label)"
+      21: "Children's Party"
 
 stability:
   sample_size: 10000

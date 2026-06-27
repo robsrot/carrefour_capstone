@@ -65,11 +65,12 @@ class PipelineConfig:
     @property
     def data_processed(self) -> Path:
         key = "paths.dev" if self.mode == "dev" else "paths.processed"
-        return self.root / self.get(key)
+        default = "data/dev" if self.mode == "dev" else "data/processed"
+        return self.root / str(self.get(key, default))
 
     @property
     def data_prod(self) -> Path:
-        return self.root / self.get("paths.processed")
+        return self.root / str(self.get("paths.processed", "data/processed"))
 
     @property
     def raw_parquet(self) -> Path:

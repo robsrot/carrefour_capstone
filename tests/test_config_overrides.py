@@ -156,14 +156,14 @@ def test_official_stage6_config_is_hard_umap_hdbscan_core_discovery():
     prod_three_stage = prod["official_model_suite"]["three_stage_hdbscan"]
     prod_two_stage_overrides = prod_overrides["official_model_suite"]["two_stage_hdbscan"]
     prod_three_stage_overrides = prod_overrides["official_model_suite"]["three_stage_hdbscan"]
-    assert "leaf_mcs3000_ms6" in prod_promoted["trial_name"]
-    assert "leaf_mcs3000_ms6" in prod_promoted["variant_prefix"]
+    assert "leaf_mcs3500_ms8" in prod_promoted["trial_name"]
+    assert "leaf_mcs3500_ms8" in prod_promoted["variant_prefix"]
     assert "leaf_mcs3000_ms6" in prod_two_stage["trial_name"]
     assert "leaf_mcs3000_ms6" in prod_two_stage["variant_prefix"]
     assert "leaf_mcs3000_ms6" in prod_three_stage["trial_name"]
     assert "leaf_mcs3000_ms6" in prod_three_stage["variant_prefix"]
-    assert prod_promoted["hdbscan"]["min_cluster_size"] == 3000
-    assert prod_promoted["hdbscan"]["min_samples"] == 6
+    assert prod_promoted["hdbscan"]["min_cluster_size"] == 3500
+    assert prod_promoted["hdbscan"]["min_samples"] == 8
     assert "balanced" in prod_two_stage["trial_name"]
     assert "balanced" in prod_three_stage["trial_name"]
     assert prod_two_stage["second_stage_hdbscan"]["min_cluster_size"] == 3000

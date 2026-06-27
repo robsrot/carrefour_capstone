@@ -185,6 +185,20 @@ def _soft_assignment_metadata(
     return probability_values, confidence_score_values, confidence_values, source_values
 
 
+def rescue_noise_by_centroid(
+    X: np.ndarray,
+    labels: np.ndarray,
+    strategy: str = "q95",
+) -> tuple[np.ndarray, np.ndarray, float | None, np.ndarray]:
+    """Post-hoc centroid assignment for noise points remaining after any clustering step.
+
+    Returns (new_labels, assigned_mask, distance_threshold, per-point confidence_scores).
+    Noise points (label=-1) are assigned to the nearest valid cluster centroid only when
+    their distance falls within the quantile-based threshold; others remain -1.
+    """
+    return _soft_assign_noise_labels(X, labels, strategy=strategy)
+
+
 def run_gmm_grid(
     feature_path: str | Path,
     output_prefix: str = "gmm",
