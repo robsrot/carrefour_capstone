@@ -1363,7 +1363,7 @@ def _coverage_funnel(customer_coverage_summary: pl.DataFrame) -> pl.DataFrame:
                 "customer_share_pct": _to_float(row.get("customer_share_pct")),
                 "revenue": _to_float(row.get("revenue")),
                 "revenue_share_pct": _to_float(row.get("revenue_share_pct")),
-                "funnel_role": "hard_assigned" if _as_text(row.get("coverage_group")) in {"core_promoted_tribe", "review_tribe"} else "remaining_explained",
+                "funnel_role": "tribe_assigned" if _as_text(row.get("coverage_group")) in {"core_promoted_tribe", "review_tribe"} else "remaining_explained",
                 "recommended_treatment": _as_text(row.get("recommended_treatment")),
             }
         )

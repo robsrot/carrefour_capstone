@@ -3272,12 +3272,19 @@ def stage68_artifact_paths(cfg: PipelineConfig = CONFIG) -> dict[str, Path]:
 def build_stage68_tribe_evidence(
     assignments_path: str | Path,
     *,
+    rescue_assignments_path: str | Path | None = None,
     cluster_readiness_path: str | Path | None = None,
     behavior_path: str | Path | None = None,
     force: bool | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> dict[str, Any]:
-    """Stage 6.8: precompute all raw-data tribe evidence for Stage 7 interpretation."""
+    """Stage 6.8: precompute all raw-data tribe evidence for Stage 7 interpretation.
+
+    assignments_path        — core-only assignment (hard HDBSCAN, used for profiling).
+    rescue_assignments_path — full rescue assignment (hard + centroid-rescued); used to
+                              identify the truly-remaining customers (tribe_id < 0 after
+                              rescue).  Falls back to assignments_path if not supplied.
+    """
 
     cfg.ensure_directories()
     paths = stage68_artifact_paths(cfg)
@@ -3379,8 +3386,12 @@ def build_stage68_tribe_evidence(
             _empty_customer_metric_tests().write_csv(paths["customer_metric_tests_csv"])
             _empty_noise_vs_core_metric_tests().write_csv(paths["noise_vs_core_customer_metrics_csv"])
 
+        # Use rescue file to get truly-remaining customers (post-centroid-rescue noise).
+        # Falls back to core assignments if no rescue file was provided.
+        _rescue_file = Path(rescue_assignments_path) if rescue_assignments_path else None
+        _remaining_source = (_rescue_file if _rescue_file and _rescue_file.exists() else assignments_file)
         remaining_customer_paths = write_remaining_customer_segment_artifacts(
-            assignments_file,
+            _remaining_source,
             behavior_path=candidate_behavior_path if candidate_behavior_path.exists() else None,
             output_csv=paths["remaining_customer_segments_csv"],
             output_md=paths["remaining_customer_segments_md"],
