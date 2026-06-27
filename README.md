@@ -177,3 +177,4 @@ outputs/<mode>/
 - [AGENTS.md](AGENTS.md) is the agent/operator guide for this repo.
 - [data/README.md](data/README.md) documents local data expectations.
 - [docs/internal_technical_report.md](docs/internal_technical_report.md) summarizes the current production pipeline, artifacts, results, and limitations.
+- `outputs/prod/artifacts/stage8/PRESENTATION_PRD.md` — executive presentation PRD (scene specs, data binding, HTML build guide); lives with Stage 8 artifacts as it is built directly from them.
