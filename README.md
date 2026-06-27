@@ -13,7 +13,7 @@ As of 2026-06-27:
 - Stage 6 is now a hard three-stage UMAP-HDBSCAN flow: PCA pre-reduction, UMAP representation, first HDBSCAN pass, stricter second pass over first-pass noise, third pass over remaining noise, three-pass merge, product-lift filtering, a flagged Stage 6.5a centroid-rescue activation layer, density evidence, readiness checks, remaining-customer evidence, and Stage 6.8 core-only evidence assembly.
 - Stage 6.6 readiness uses jitter recovery as the stability gate: `strong` requires no blockers and jitter recovery >= 0.80; `usable` has no blockers but is below the strong target; `review` is used for blockers such as jitter recovery < 0.60 or assignment-confidence issues.
 - HDBSCAN hard-core noise stays honest as `tribe_id = -1`. Stage 6.5a may create flagged centroid-rescued activation assignments, and Stage 6.7 describes the 107,634 customers still unassigned after that rescue; neither step mutates the core discovery/profile assignment.
-- Stage 7 is a read-only stakeholder segmentation architecture. It consumes the Stage 6.8 evidence bundle, preserves Stage 6.6 promoted/review membership, exposes advisory business checks, writes the Stage 7.1-7.7 handoff artifacts, and can publish soft-audience opportunities without changing official assignments.
+- Stage 7 is a read-only stakeholder segmentation architecture. It consumes the Stage 6.8 evidence bundle, preserves Stage 6.6 promoted/review membership, exposes advisory business checks, writes the final handoff/supporting artifacts, and can publish soft-audience opportunities without changing official assignments.
 - Stage 8 is the current final publishing layer: it writes a 58-artifact dashboard-ready relational semantic contract under `outputs/prod/artifacts/stage8/`, with no Markdown input dependencies and passing critical readiness checks.
 - UMAP is a clustering representation aid, not automatic proof. The 10-15 tribe range is a client hypothesis, not a hard clustering constraint.
 - Cache metadata is centralized in `outputs/<mode>/.artifact_metadata.json`. Existing artifacts are reused when caching is enabled and `force=False`; metadata status is diagnostic, so use `force=True`, disable cache, or delete targeted generated files when rebuilding after logic/config changes.
@@ -89,11 +89,11 @@ jupyter notebook notebooks/04_experiment_sandbox.ipynb
 Promote only evidence-backed settings into YAML. Then run the official ML pipeline:
 
 ```powershell
-$env:CARREFOUR_MODE = "dev"
+$env:CARREFOUR_MODE = "prod"
 jupyter notebook notebooks/03_ml_pipeline.ipynb
 ```
 
-Use `CARREFOUR_MODE=prod` for the full production run. Prod mode is the default when `CARREFOUR_MODE` is unset.
+Use `CARREFOUR_MODE=dev` only for fast smoke runs. Prod mode is the default when `CARREFOUR_MODE` is unset.
 
 After pulling the current repo or changing vectorization/modeling code, rerun from the affected upstream stage before interpreting Stage 6+ or Stage 8 outputs. The current Stage 4 `quantity_idf` recipe requires rebuilding Stage 4 onward when changed.
 
@@ -142,7 +142,6 @@ outputs/<mode>/
     stage5/
     stage6/
       stage6_8_evidence/
-+
       final_handoff/
   embeddings/   Basket sentences and product embedding tables
   features/     Customer vectors, feature sets, PCA/UMAP representations
@@ -169,7 +168,7 @@ outputs/<mode>/
 - Official clustering should remain on `embeddings_only`. Behavior/spend-derived columns are allowed for profiling and business interpretation after clustering.
 - Stage 6 working files such as hard-core, rescue, and core-only profiling assignments live under `outputs/<mode>/models/model_selection/`; diagnostics live under `outputs/<mode>/artifacts/stage6/`.
 - Stage 6.8 is the core-only raw-evidence boundary. After it runs, Stage 7 should read the saved evidence bundle and per-tribe exports; the rescued assignment is for activation coverage/customer lookup, not product-lift profiling.
-- Stage 7 preserves Stage 6.6 promotion/review membership, reports advisory checks for reach, behavioral distinctiveness, business relevance, and naming quality, and writes Stage 7.1 Tribe Promotion Report, Stage 7.2 Tribe Identity Dossier, Stage 7.3 Tribe Handbook, Stage 7.4 Customer Coverage Report, Stage 7.5 Segment Action Playbook, Stage 7.6 Customer Segmentation Framework, and Stage 7.7 Final Segmentation Report.
+- Stage 7 preserves Stage 6.6 promotion/review membership, reports advisory checks for reach, behavioral distinctiveness, business relevance, and naming quality, and writes the redesigned Stage 7 reports, all-tribe evidence views, relationship atlas, campaign playbook, stakeholder readiness checks, and final handoff pack.
 - Stage 8 is a publishing layer only. Dashboards should consume the published `rel_*` tables, manifests, data dictionary, SQL schema, and readiness reports under `outputs/<mode>/artifacts/stage8/`; they should not parse Markdown reports or recompute model decisions.
 - Always join customer-level data with `join(on="cliente")`; do not rely on positional row order.
 

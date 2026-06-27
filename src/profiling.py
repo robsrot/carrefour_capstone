@@ -5892,8 +5892,9 @@ def _configured_tribe_business_name(tribe_id: int, *, cfg: PipelineConfig) -> st
     value = names.get(tribe_id) if isinstance(names, Mapping) else None
     if value is None and isinstance(names, Mapping):
         value = names.get(str(tribe_id))
-    cleaned = _normalise_tribe_name(value or "")
-    return cleaned or None
+    if value is None or not str(value).strip():
+        return None
+    return _normalise_tribe_name(str(value))
 
 
 def _stage7_name_fields_by_tribe(rows: list[dict[str, Any]], *, cfg: PipelineConfig) -> dict[int, dict[str, str]]:
