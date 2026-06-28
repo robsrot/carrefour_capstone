@@ -1,8 +1,13 @@
 # DATA — never commit
 data/raw/*
 data/processed/*
-!data/raw/.gitkeep
+data/dev/*
+!data/raw/csv/
+!data/raw/csv/.gitkeep
+!data/raw/parquet/
+!data/raw/parquet/.gitkeep
 !data/processed/.gitkeep
+!data/dev/.gitkeep
 
 # Common data formats (safety net anywhere in repo)
 *.csv
@@ -15,11 +20,11 @@ data/processed/*
 *.tar.gz
 *.gz
 
-# MODELS — too large for git
-models/*
-!models/.gitkeep
 
-# OUTPUTS
+# Legacy local artifacts from the old root-level model path
+models/
+
+# Generated pipeline artifacts, including mode-scoped models and experiments
 outputs/*
 !outputs/.gitkeep
 
@@ -27,9 +32,11 @@ outputs/*
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pt/
 .venv/
 venv/
 .env
+.tmp/
 
 # JUPYTER
 .ipynb_checkpoints/

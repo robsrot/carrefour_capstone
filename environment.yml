@@ -1,12 +1,27 @@
 name: carrefour
 channels:
-  - defaults
   - conda-forge
 dependencies:
-  - python=3.11
-  - pandas>=2.1
-  - numpy>=1.26
-  - matplotlib>=3.8
-  - seaborn>=0.13
-  - jupyter>=1.0
-  - ipykernel
+  - python=3.11.15
+  - libblas=*=*openblas
+  - pandas=3.0.3
+  - numpy=1.26.4
+  - matplotlib=3.10.9
+  - seaborn=0.13.2
+  - jupyter=1.1.1
+  - ipykernel=7.2.0
+  - pyarrow=24.0.0
+  - pyyaml=6.0.3
+  - scikit-learn=1.7.2    # hdbscan 0.8.40 still calls force_all_finite, removed in sklearn 1.8
+  - scipy=1.17.1          # ks_2samp for dev subset validation
+  - plotly=5.22.0
+  - pip=26.1.1
+  - pip:
+    - dash>=2.17,<3
+    - polars==1.40.1
+    - torch==2.12.0
+    - gensim==4.4.0
+    - umap-learn==0.5.12
+    - hdbscan==0.8.40
+    - python-dotenv==1.2.2
+    - pytest==9.0.3
