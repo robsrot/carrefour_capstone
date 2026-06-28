@@ -2171,11 +2171,12 @@ def plot_stage6_hdbscan_assignment_map(
     cfg.ensure_directories()
     output = Path(output_path) if output_path else cfg.figures / "stage_06_2_hdbscan_assignment_map.png"
     umap_df = pl.read_parquet(umap_path)
-    assignments = pl.read_parquet(assignment_path).select(["cliente", "tribe_id"])
+    _assign_raw = pl.read_parquet(assignment_path)
+    _select_cols = [c for c in ["cliente", "tribe_id", "assignment_source"] if c in _assign_raw.columns]
+    assignments = _assign_raw.select(_select_cols)
     umap_cols = [col for col in numeric_feature_columns(umap_df) if col.startswith("umap_")]
     if len(umap_cols) < 2:
         raise ValueError(f"UMAP representation needs at least two numeric components for plotting: {umap_path}")
-
     plot_df = umap_df.select(["cliente", umap_cols[0], umap_cols[1]]).join(assignments, on="cliente", how="inner")
     sample = _sample_frame(plot_df, int(cfg.get("visualization.max_scatter_points", 50000)), cfg)
     coords = sample.select([umap_cols[0], umap_cols[1]]).to_numpy().astype(np.float32, copy=False)
@@ -2198,12 +2199,13 @@ def plot_stage6_noise_rescue_provenance(
     title: str | None = None,
     cfg: PipelineConfig = CONFIG,
 ) -> Path:
-    """Two-panel UMAP figure for the noise rescue step.
+    """Three-panel UMAP figure for the noise rescue step.
 
-    Left panel: each customer coloured by assignment source
+    Left panel: before/after rescue table (core, +rescued, total, share per tribe).
+    Middle panel: customers coloured by assignment source
     (Pass 1 core / Pass 2 noise / Pass 3 noise / centroid rescue / still unassigned).
     Right panel: same points coloured by final tribe_id.
-    Both panels share the same 50 k-customer sample for direct comparison.
+    UMAP panels share the same 50 k-customer sample for direct comparison.
     """
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -2216,6 +2218,44 @@ def plot_stage6_noise_rescue_provenance(
     umap_cols = [c for c in numeric_feature_columns(umap_df) if c.startswith("umap_")]
     if len(umap_cols) < 2:
         raise ValueError("UMAP parquet needs at least two components for plotting.")
+
+    # --- Build before/after summary for the table panel ---
+    _CORE_SOURCES = {
+        "three_stage_hdbscan_stage1_core",
+        "three_stage_hdbscan_stage2_noise_core",
+        "three_stage_hdbscan_stage3_remaining_noise_core",
+    }
+    _total_pop = rescued_df.height
+    _core_by_tribe = (
+        rescued_df
+        .filter(pl.col("assignment_source").is_in(list(_CORE_SOURCES)))
+        .group_by("tribe_id")
+        .agg(pl.len().alias("core"))
+    )
+    _total_by_tribe = (
+        rescued_df
+        .filter(pl.col("tribe_id") >= 0)
+        .group_by("tribe_id")
+        .agg(pl.len().alias("total"))
+    )
+    _rescue_summary_df = (
+        _total_by_tribe
+        .join(_core_by_tribe, on="tribe_id", how="left")
+        .with_columns(pl.col("core").fill_null(0))
+        .with_columns((pl.col("total") - pl.col("core")).alias("rescued"))
+        .with_columns((pl.col("total") / _total_pop * 100).round(1).alias("share_pct"))
+        .sort("tribe_id")
+    )
+    rescue_panel_data = [
+        {
+            "tribe_id": int(r["tribe_id"]),
+            "core":      int(r["core"]),
+            "rescued":   int(r["rescued"]),
+            "total":     int(r["total"]),
+            "share_pct": float(r["share_pct"]),
+        }
+        for r in _rescue_summary_df.iter_rows(named=True)
+    ]
 
     merged = (
         umap_df.select(["cliente", umap_cols[0], umap_cols[1]])
@@ -2251,9 +2291,15 @@ def plot_stage6_noise_rescue_provenance(
         else:
             source_colors.append(default_noise_color)
 
-    fig, (ax_src, ax_tribe) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax_panel, ax_src, ax_tribe) = plt.subplots(
+        1, 3, figsize=(20, 7),
+        gridspec_kw={"width_ratios": [1.1, 2.0, 2.0], "wspace": 0.12},
+    )
 
-    # Left: assignment source
+    # Left: before/after rescue table
+    _draw_rescue_before_after_panel(ax_panel, rescue_panel_data, cfg=cfg)
+
+    # Middle: assignment source
     ax_src.scatter(x, y, s=3, c=source_colors, alpha=0.4, linewidths=0, rasterized=True)
     ax_src.set_title("Assignment Source", pad=8, fontsize=12)
     ax_src.set_xlabel("UMAP Component 1")
@@ -2286,7 +2332,6 @@ def plot_stage6_noise_rescue_provenance(
     ax_tribe.set_xlabel("UMAP Component 1")
     ax_tribe.set_ylabel("UMAP Component 2")
 
-    # Tribe count annotation
     n_tribes = int(np.unique(tribe_ids[valid_mask]).shape[0]) if valid_mask.any() else 0
     n_noise = int(noise_mask.sum())
     noise_pct = 100.0 * n_noise / max(len(tribe_ids), 1)
@@ -2300,7 +2345,7 @@ def plot_stage6_noise_rescue_provenance(
     )
 
     fig.suptitle(title or "Stage 6.5a Coverage Rescue - Assignment Provenance vs Final Tribes", fontsize=13, y=1.01)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.03, right=0.98, top=0.90, bottom=0.15)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -2542,7 +2587,14 @@ def plot_noise_rescue_tribe_breakdown(
     hard_vals  = [int(v) for v in pivot["hard"].to_list()]
     resc_vals  = [int(v) for v in pivot["rescued"].to_list()]
     total_vals = [int(v) for v in pivot["total"].to_list()]
-    x_labels   = [f"T{tid}" for tid in tribe_ids]
+
+    _tribe_name_map: dict[int, str] = {}
+    _promo_path = cfg.artifacts / "stage7" / f"stage7_1_tribe_promotion_report_{cfg.mode}.csv"
+    if _promo_path.exists():
+        for _r in pl.read_csv(_promo_path).select(["tribe_id", "business_name"]).iter_rows(named=True):
+            _tribe_name_map[int(_r["tribe_id"])] = str(_r["business_name"])
+
+    x_labels   = [_tribe_name_map.get(tid, f"T{tid}") for tid in tribe_ids]
     all_labels = x_labels + ["Unassigned"]
 
     # Taller figure + more bottom margin to avoid x-label clash with %
@@ -2593,6 +2645,7 @@ def plot_noise_rescue_tribe_breakdown(
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{int(v):,}"))
     ax.grid(axis="y", alpha=0.25, zorder=0)
     ax.set_xlim(-0.6, len(all_labels) - 0.4)
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=160, bbox_inches="tight")
@@ -4429,17 +4482,35 @@ def _tribe_allocation_summary(assignments: pl.DataFrame) -> list[dict[str, Any]]
     if any(tribe_id < 0 for tribe_id in observed):
         tribe_ids.append(-1)
 
+    _PASS_SOURCE_MAP = {
+        "three_stage_hdbscan_stage1_core": "Pass 1",
+        "three_stage_hdbscan_stage2_noise_core": "Pass 2",
+        "three_stage_hdbscan_stage3_remaining_noise_core": "Pass 3",
+    }
+    pass_by_tribe: dict[int, str] = {}
+    if "assignment_source" in assignments.columns:
+        for r in (
+            assignments.filter(pl.col("tribe_id") >= 0)
+            .select(["tribe_id", "assignment_source"])
+            .unique()
+            .iter_rows(named=True)
+        ):
+            src = r.get("assignment_source") or ""
+            if src in _PASS_SOURCE_MAP:
+                pass_by_tribe[int(r["tribe_id"])] = _PASS_SOURCE_MAP[src]
+
     rows: list[dict[str, Any]] = []
     for tribe_id in tribe_ids:
         customers = sum(count for key, count in observed.items() if key < 0) if tribe_id < 0 else observed.get(tribe_id, 0)
-        rows.append(
-            {
-                "tribe_id": tribe_id,
-                "label": "Noise" if tribe_id < 0 else f"T{tribe_id}",
-                "customers": customers,
-                "share_pct": 100.0 * customers / total_customers,
-            }
-        )
+        entry: dict[str, Any] = {
+            "tribe_id": tribe_id,
+            "label": "Noise" if tribe_id < 0 else f"T{tribe_id}",
+            "customers": customers,
+            "share_pct": 100.0 * customers / total_customers,
+        }
+        if pass_by_tribe:
+            entry["hdbscan_pass"] = pass_by_tribe.get(tribe_id, "")
+        rows.append(entry)
     return rows
 
 
@@ -4476,14 +4547,23 @@ def _draw_tribe_allocation_panel(ax, allocation_summary: Sequence[Mapping[str, A
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
 
-    ax.text(0.0, 0.98, "Tribe Allocation", fontsize=12, fontweight="bold", va="top")
-    ax.text(0.0, 0.915, "Tribe", fontsize=8.5, color=_color("subtle_text"), va="top")
-    ax.text(0.38, 0.915, "Customers", fontsize=8.5, color=_color("subtle_text"), va="top")
-    ax.text(0.78, 0.915, "Share", fontsize=8.5, color=_color("subtle_text"), va="top")
-    ax.plot([0.0, 0.98], [0.89, 0.89], color=_color("grid"), linewidth=0.8)
-
+    has_pass = any(row.get("hdbscan_pass") for row in allocation_summary)
     row_count = max(len(allocation_summary), 1)
     row_gap = min(0.058, 0.82 / row_count)
+    font_size = 9.5 if row_count <= 15 else 8.0
+
+    ax.text(0.0, 0.98, "Tribe Allocation", fontsize=12, fontweight="bold", va="top")
+    if has_pass:
+        ax.text(0.0, 0.915, "Tribe", fontsize=8.5, color=_color("subtle_text"), va="top")
+        ax.text(0.30, 0.915, "Pass", fontsize=8.5, color=_color("subtle_text"), va="top")
+        ax.text(0.50, 0.915, "Customers", fontsize=8.5, color=_color("subtle_text"), va="top")
+        ax.text(0.82, 0.915, "Share", fontsize=8.5, color=_color("subtle_text"), va="top")
+    else:
+        ax.text(0.0, 0.915, "Tribe", fontsize=8.5, color=_color("subtle_text"), va="top")
+        ax.text(0.38, 0.915, "Customers", fontsize=8.5, color=_color("subtle_text"), va="top")
+        ax.text(0.78, 0.915, "Share", fontsize=8.5, color=_color("subtle_text"), va="top")
+    ax.plot([0.0, 0.98], [0.89, 0.89], color=_color("grid"), linewidth=0.8)
+
     y = 0.855
     for row in allocation_summary:
         tribe_id = int(row.get("tribe_id", -1))
@@ -4493,9 +4573,63 @@ def _draw_tribe_allocation_panel(ax, allocation_summary: Sequence[Mapping[str, A
         share_pct = float(row.get("share_pct", 0.0) or 0.0)
 
         ax.scatter([0.025], [y], s=42, color=color, alpha=0.9, linewidths=0)
-        ax.text(0.07, y, label, fontsize=9.5, va="center")
-        ax.text(0.38, y, f"{customers:,}", fontsize=9.5, va="center")
-        ax.text(0.78, y, f"{share_pct:.1f}%", fontsize=9.5, va="center")
+        ax.text(0.07, y, label, fontsize=font_size, va="center")
+        if has_pass:
+            ax.text(0.30, y, str(row.get("hdbscan_pass", "")), fontsize=font_size, va="center")
+            ax.text(0.50, y, f"{customers:,}", fontsize=font_size, va="center")
+            ax.text(0.82, y, f"{share_pct:.1f}%", fontsize=font_size, va="center")
+        else:
+            ax.text(0.38, y, f"{customers:,}", fontsize=font_size, va="center")
+            ax.text(0.78, y, f"{share_pct:.1f}%", fontsize=font_size, va="center")
+        y -= row_gap
+
+
+def _draw_rescue_before_after_panel(ax, summary: list[dict], cfg=None) -> None:
+    """Left-panel table for the noise-rescue provenance figure.
+
+    Columns: Tribe | Core (before) | +Rescued | Total (after) | Share %
+    """
+    ax.set_axis_off()
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+    tribe_names: dict[int, str] = {}
+    if cfg is not None:
+        _promo_path = cfg.artifacts / "stage7" / f"stage7_1_tribe_promotion_report_{cfg.mode}.csv"
+        if _promo_path.exists():
+            for _r in pl.read_csv(_promo_path).select(["tribe_id", "business_name"]).iter_rows(named=True):
+                tribe_names[int(_r["tribe_id"])] = str(_r["business_name"])
+
+    row_count = max(len(summary), 1)
+    row_gap = min(0.058, 0.82 / row_count)
+    fs = 9.5 if row_count <= 12 else 8.0
+
+    ax.text(0.0, 0.98, "Before vs After Rescue", fontsize=11, fontweight="bold", va="top")
+    ax.text(0.0,  0.915, "Tribe",     fontsize=7.5, color=_color("subtle_text"), va="top")
+    ax.text(0.36, 0.915, "Core",      fontsize=7.5, color=_color("subtle_text"), va="top")
+    ax.text(0.54, 0.915, "+Rescued",  fontsize=7.5, color=_color("subtle_text"), va="top")
+    ax.text(0.73, 0.915, "Total",     fontsize=7.5, color=_color("subtle_text"), va="top")
+    ax.text(0.89, 0.915, "Share",     fontsize=7.5, color=_color("subtle_text"), va="top")
+    ax.plot([0.0, 0.98], [0.89, 0.89], color=_color("grid"), linewidth=0.8)
+
+    y = 0.855
+    for row in summary:
+        tribe_id = int(row.get("tribe_id", -1))
+        color = _tribe_color(tribe_id)
+        raw_name = tribe_names.get(tribe_id, f"T{tribe_id}" if tribe_id >= 0 else "Noise")
+        label = raw_name[:17] + ".." if len(raw_name) > 17 else raw_name
+        core     = int(row.get("core", 0) or 0)
+        rescued  = int(row.get("rescued", 0) or 0)
+        total    = int(row.get("total", 0) or 0)
+        share_pct = float(row.get("share_pct", 0.0) or 0.0)
+        rescue_color = "#C027CC" if rescued > 0 else _color("subtle_text")
+
+        ax.scatter([0.015], [y], s=36, color=color, alpha=0.9, linewidths=0)
+        ax.text(0.05,  y, label,           fontsize=fs - 0.5, va="center")
+        ax.text(0.36,  y, f"{core:,}",     fontsize=fs,       va="center")
+        ax.text(0.54,  y, f"+{rescued:,}", fontsize=fs,       va="center", color=rescue_color)
+        ax.text(0.73,  y, f"{total:,}",    fontsize=fs,       va="center")
+        ax.text(0.89,  y, f"{share_pct:.1f}%", fontsize=fs,  va="center")
         y -= row_gap
 
 
