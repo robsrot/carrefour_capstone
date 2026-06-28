@@ -35,8 +35,6 @@ Generated data and model outputs are local artifacts and are not committed to Gi
 | Artifact | Location | Purpose |
 |---|---|---|
 | Stage 7 final handoff | `outputs/prod/artifacts/stage7/final_handoff/` | Final tribe index, story, manifests, cards, and supporting evidence tables |
-| Stage 8 dashboard contract | `outputs/prod/artifacts/stage8/` | Dashboard-ready relational model, presentation marts, data dictionary, schema, and readiness reports |
-| Final presentation HTML | `outputs/prod/artifacts/stage8/deliverable/carrefour_presentation.html` | Local presentation deliverable built from final evidence |
 | Cache metadata | `outputs/<mode>/.artifact_metadata.json` | Cache provenance for generated artifacts |
 
 Dashboards should consume Stage 8 structured files, especially `dashboard_manifest_prod.json`, `relational_manifest_prod.json`, `rel_dim_*`, `rel_fact_*`, `rel_bridge_*`, and `rel_mart_*`. They should not parse Markdown reports or recompute model decisions.
@@ -128,7 +126,7 @@ tests/            Unit tests for config, caching, embeddings, model selection, p
 
 Do not commit raw data, processed data, dev subsets, Parquet caches, generated JSON metadata, model binaries, figures, reports, dashboard outputs, `.env`, or secrets.
 
-Only `.gitkeep` files and documentation should be tracked under `data/`. 
+Only `.gitkeep` files and documentation should be tracked under `data/`. git commit -m "Finalize README and stop tracking generated data metadata"
 
 Generated project outputs belong under `outputs/<mode>/` and stay local. If a data or output artifact is needed for review, share it outside the Git repo or regenerate it from the pipeline.
 
